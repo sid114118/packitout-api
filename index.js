@@ -7,8 +7,8 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-// ⚠️ PASTE YOUR SRV LINK HERE (Replace <password>!) ⚠️
-const MONGO_URI = "mongodb+srv://packit_admin:<password>@cluster0.xxxx.mongodb.net/packitout_db?retryWrites=true&w=majority";
+// ⚠️ FIXED: Lowercase const, added quotation marks, removed <>, and safely encoded the # and @ in your password!
+const MONGO_URI = "mongodb+srv://packitout_db:%23Sid07%400712@cluster0.bceowku.mongodb.net/packitout_db?retryWrites=true&w=majority&appName=Cluster0";
 
 mongoose.connect(MONGO_URI)
   .then(() => console.log("✅ SUCCESS: Connected to MongoDB!"))
