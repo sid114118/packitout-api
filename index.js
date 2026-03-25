@@ -83,6 +83,15 @@ app.post("/master-products", async (req, res) => {
   }
 });
 
+// Get all product requests for the Admin to see
+app.get("/product-requests", async (req, res) => {
+  try {
+    const requests = await ProductRequest.find().populate('shopId');
+    res.json(requests);
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+
 // A Shop adds an item from the Master Catalog to their shelf
 app.post("/shop-inventory", async (req, res) => {
   try {
