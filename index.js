@@ -1,4 +1,4 @@
-const express = require("express");
+const express = require("express"); // 👈 Fixed the capital C typo here!
 const mongoose = require("mongoose");
 const cors = require("cors");
 
@@ -63,28 +63,44 @@ app.post("/shops", async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
+// 🌟 NEW: Add a Master Product from the Admin Dashboard!
+app.post("/master-products", async (req, res) => {
+  try {
+    const newProduct = new MasterProduct({
+      name: req.body.name,
+      brand: req.body.brand,
+      category: req.body.category,
+      mrp: req.body.mrp,
+      qnty: req.body.qnty,
+      emoji: req.body.emoji,
+      // Converts a string like "snack, sweet" into a proper array format for the database
+      searchTags: req.body.searchTags ? req.body.searchTags.split(',').map(tag => tag.trim()) : []
+    });
+    await newProduct.save();
+    res.json(newProduct);
+  } catch (err) { 
+    res.status(500).json({ error: err.message }); 
+  }
+});
+
 // A Shop adds an item from the Master Catalog to their shelf
 app.post("/shop-inventory", async (req, res) => {
   try {
-    // 1. Find the Master Product to check the true MRP
     const master = await MasterProduct.findById(req.body.masterProductId);
-    
-    // 2. Automatically calculate the discount!
     const discount = Math.round(((master.mrp - req.body.sellingPrice) / master.mrp) * 100);
 
-    // 3. Save it to the Shop's specific inventory
     const newItem = new ShopInventory({
       shopId: req.body.shopId,
       masterProductId: req.body.masterProductId,
       sellingPrice: req.body.sellingPrice,
-      discountPercentage: discount // Perfect math, no human error!
+      discountPercentage: discount 
     });
     await newItem.save();
     res.json(newItem);
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// A Shop requests a Custom Product that isn't in the Master List yet
+// A Shop requests a Custom Product
 app.post("/product-requests", async (req, res) => {
   try {
     const newReq = new ProductRequest({
@@ -103,25 +119,20 @@ app.post("/product-requests", async (req, res) => {
 // ==========================================
 app.get("/seed", async (req, res) => {
   try {
-    // 1. Wipe old data
     await Shop.deleteMany({}); await MasterProduct.deleteMany({}); 
     await ShopInventory.deleteMany({}); await ProductRequest.deleteMany({});
 
-    // 2. Create 1 Shop
     const sharmaShop = await Shop.create({ name: "Sharma Groceries", pincode: "110001" });
 
-    // 3. Create the Master Dictionary
     const maggiMaster = await MasterProduct.create({ name: "Maggi 2-Min Noodles", brand: "Nestle", category: "Snacks", mrp: 14, qnty: "70g", emoji: "🍜", searchTags: ["noodles", "instant", "snack"] });
     const attaMaster = await MasterProduct.create({ name: "Aashirvaad Atta", brand: "ITC", category: "Grocery", mrp: 250, qnty: "5kg", emoji: "🌾", searchTags: ["flour", "wheat", "roti"] });
 
-    // 4. Link them to Sharma's Inventory (With auto-calculated discounts!)
     await ShopInventory.create({ shopId: sharmaShop._id, masterProductId: maggiMaster._id, sellingPrice: 12, discountPercentage: Math.round(((14-12)/14)*100) });
     await ShopInventory.create({ shopId: sharmaShop._id, masterProductId: attaMaster._id, sellingPrice: 220, discountPercentage: Math.round(((250-220)/250)*100) });
 
-    // 5. Create 1 Pending Request (Sharma wants to sell a local biscuit)
     await ProductRequest.create({ shopId: sharmaShop._id, requestedName: "Kanpur Special Namkeen", requestedSellingPrice: 45 });
 
-    res.send("✅ ENTERPRISE UPGRADE COMPLETE! Check your MongoDB database to see the Master Catalog, Shop Inventory, and Pending Requests working together seamlessly.");
+    res.send("✅ ENTERPRISE UPGRADE COMPLETE! Database reformatted and Master Product route is live.");
   } catch (err) {
     res.status(500).send("❌ Database Error: " + err.message);
   }
@@ -132,3 +143,4 @@ app.get("/", (req, res) => { res.send("📦 API is live with Enterprise Architec
 
 const PORT = process.env.PORT || 8080;
 app.listen(PORT, () => { console.log(`Server listening on port ${PORT}`); });
+                                          
