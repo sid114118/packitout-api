@@ -48,6 +48,22 @@ app.get("/shops/:pincode", async (req, res) => {
   res.json(shops);
 });
 
+// 🪄 THE MAGIC SEED MAILBOX
+app.get("/seed", async (req, res) => {
+  // 1. Clear out any old test shops first
+  await Shop.deleteMany({}); 
+  
+  // 2. Inject 3 brand new test shops
+  await Shop.insertMany([
+    { name: "Rahul Electronics", pincode: "110001" },
+    { name: "Sharma Groceries", pincode: "110001" },
+    { name: "City Hardware", pincode: "110002" }
+  ]);
+  
+  res.send("✅ Magic Complete! 3 Test Shops successfully injected into MongoDB.");
+});
+
+
 // Mailbox B: Add a new shop to the database
 app.post("/shops", async (req, res) => {
   const newShop = new Shop({
