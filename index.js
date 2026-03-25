@@ -27,57 +27,44 @@ const ShopInventory = mongoose.model("ShopInventory", shopInventorySchema);
 const productRequestSchema = new mongoose.Schema({ shopId: { type: mongoose.Schema.Types.ObjectId, ref: 'Shop' }, requestedName: String, requestedSellingPrice: Number, status: { type: String, default: "Pending" }, createdAt: { type: Date, default: Date.now } });
 const ProductRequest = mongoose.model("ProductRequest", productRequestSchema);
 
-// 👤 NEW: CUSTOMER USER SCHEMA
-const userSchema = new mongoose.Schema({
-  name: String,
-  phone: { type: String, unique: true }, // Ensures no duplicate accounts
-  password: String, 
-  pincode: String,
-  address: String,
+const userSchema = new mongoose.Schema({ name: String, phone: { type: String, unique: true }, password: String, pincode: String, address: String, createdAt: { type: Date, default: Date.now } });
+const User = mongoose.model("User", userSchema);
+
+// 🛒 NEW: THE ORDER SCHEMA (The Digital Parchi)
+const orderSchema = new mongoose.Schema({
+  userId: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
+  shopId: { type: mongoose.Schema.Types.ObjectId, ref: 'Shop' }, 
+  items: Array, // The groceries they bought
+  totalAmount: Number,
+  status: { type: String, default: "Pending" }, // Pending, Accepted, Packing, Delivered
   createdAt: { type: Date, default: Date.now }
 });
-const User = mongoose.model("User", userSchema);
+const Order = mongoose.model("Order", orderSchema);
 
 
 // ==========================================
 // 📮 THE MAILBOXES (API ROUTES)
 // ==========================================
 
-// --- NEW: USER AUTHENTICATION ROUTES ---
-app.post("/register", async (req, res) => {
+// --- NEW: ORDER MAILBOXES ---
+// 1. Customer sends an order
+app.post("/orders", async (req, res) => {
   try {
-    // 1. Check if phone number already exists
-    const existingUser = await User.findOne({ phone: req.body.phone });
-    if (existingUser) return res.status(400).json({ error: "Phone number already registered!" });
-    
-    // 2. Save new user
-    const newUser = new User(req.body);
-    await newUser.save();
-    res.json(newUser);
+    const newOrder = new Order(req.body);
+    await newOrder.save();
+    res.json(newOrder);
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-app.post("/login", async (req, res) => {
+// 2. Shopkeeper fetches their live orders
+app.get("/orders", async (req, res) => {
   try {
-    const user = await User.findOne({ phone: req.body.phone, password: req.body.password });
-    if (!user) return res.status(400).json({ error: "Invalid phone number or password" });
-    res.json(user); // Sends back the user's data so the frontend knows who logged in
+    const orders = await Order.find().populate('userId').sort({ createdAt: -1 }); // Newest first
+    res.json(orders);
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
 // --- EXISTING ROUTES ---
-app.post("/shops", async (req, res) => { try { const newShop = new Shop({ name: req.body.name, pincode: req.body.pincode }); await newShop.save(); res.json(newShop); } catch (err) { res.status(500).json({ error: err.message }); } });
-app.post("/master-products", async (req, res) => { try { const newProduct = new MasterProduct({ name: req.body.name, brand: req.body.brand, category: req.body.category, mrp: req.body.mrp, qnty: req.body.qnty, emoji: req.body.emoji, searchTags: req.body.searchTags ? req.body.searchTags.split(',').map(tag => tag.trim()) : [] }); await newProduct.save(); res.json(newProduct); } catch (err) { res.status(500).json({ error: err.message }); } });
-app.get("/master-products", async (req, res) => { try { const products = await MasterProduct.find(); res.json(products); } catch (err) { res.status(500).json({ error: err.message }); } });
-app.post("/shop-inventory", async (req, res) => { try { const master = await MasterProduct.findById(req.body.masterProductId); const discount = Math.round(((master.mrp - req.body.sellingPrice) / master.mrp) * 100); const newItem = new ShopInventory({ shopId: req.body.shopId, masterProductId: req.body.masterProductId, sellingPrice: req.body.sellingPrice, discountPercentage: discount }); await newItem.save(); res.json(newItem); } catch (err) { res.status(500).json({ error: err.message }); } });
-app.post("/product-requests", async (req, res) => { try { const newReq = new ProductRequest({ shopId: req.body.shopId, requestedName: req.body.requestedName, requestedSellingPrice: req.body.requestedSellingPrice }); await newReq.save(); res.json(newReq); } catch (err) { res.status(500).json({ error: err.message }); } });
-app.get("/product-requests", async (req, res) => { try { const requests = await ProductRequest.find().populate('shopId'); res.json(requests); } catch (err) { res.status(500).json({ error: err.message }); } });
-
-// Enterprise Seed
-app.get("/seed", async (req, res) => { /* Code omitted for length, same as before */ res.send("Seed route active"); });
-
-// Heartbeat
-app.get("/", (req, res) => { res.send("📦 API is live with Enterprise Architecture!"); });
-
-const PORT = process.env.PORT || 8080;
-app.listen(PORT, () => { console.log(`Server listening on port ${PORT}`); });
+app.post("/register", async (req, res) => { try { const existingUser = await User.findOne({ phone: req.body.phone }); if (existingUser) return res.status(400).json({ error: "Phone number already registered!" }); const newUser = new User(req.body); await newUser.save(); res.json(newUser); } catch (err) { res.status(500).json({ error: err.message }); } });
+app.post("/login", async (req, res) => { try { const user = await User.findOne({ phone: req.body.phone, password: req.body.password }); if (!user) return res.status(400).json({ error: "Invalid phone number or password" }); res.json(user); } catch (
+  
