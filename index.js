@@ -13,14 +13,12 @@ mongoose.connect(MONGO_URI).then(() => console.log("✅ DB Connected")).catch(er
 // 🏗️ SCHEMAS
 // ==========================================
 
-// 🏪 SHOP SCHEMA: Upgraded with Custom Inventory
 const shopSchema = new mongoose.Schema({ 
   name: String, 
   pincode: String, 
   phone: { type: String, unique: true }, 
   password: { type: String, required: true }, 
   isOpen: { type: Boolean, default: true },
-  // 🚀 Marketplace Feature: Links Master Product to Custom Price
   inventory: [{ 
     product: { type: mongoose.Schema.Types.ObjectId, ref: 'MasterProduct' },
     sellingPrice: Number, 
@@ -29,7 +27,6 @@ const shopSchema = new mongoose.Schema({
 });
 const Shop = mongoose.model("Shop", shopSchema);
 
-// 🍎 MASTER PRODUCT SCHEMA: With Image Support
 const masterProductSchema = new mongoose.Schema({ 
   name: String, 
   brand: String, 
@@ -42,7 +39,6 @@ const masterProductSchema = new mongoose.Schema({
 });
 const MasterProduct = mongoose.model("MasterProduct", masterProductSchema);
 
-// 👤 USER SCHEMA
 const userSchema = new mongoose.Schema({ 
   name: String, 
   phone: { type: String, unique: true }, 
@@ -56,7 +52,6 @@ const userSchema = new mongoose.Schema({
 });
 const User = mongoose.model("User", userSchema);
 
-// 🛒 ORDER SCHEMA
 const orderSchema = new mongoose.Schema({
   userId: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
   shopId: { type: mongoose.Schema.Types.ObjectId, ref: 'Shop' }, 
@@ -71,7 +66,6 @@ const Order = mongoose.model("Order", orderSchema);
 // 📮 ROUTES
 // ==========================================
 
-// --- 🏪 SHOP ROUTES ---
 app.post("/shops", async (req, res) => {
   try {
     const newShop = new Shop(req.body);
@@ -100,29 +94,28 @@ app.get("/shops/all/:pincode", async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// 🛍️ CUSTOMER: Fetch the Shop's Live Menu
 app.get("/shops/:id/menu", async (req, res) => {
   try {
-    // We populate the product details so the customer sees the image and name
     const shop = await Shop.findById(req.params.id).populate('inventory.product');
     res.json(shop);
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// 👇 FIXED: Shop Inventory Manager (Add/Update Price & Stock)
+// 👇 THE FIX: "item.product &&" prevents crashes from broken items
 app.post("/shops/:shopId/inventory", async (req, res) => {
   try {
     const { productId, sellingPrice, inStock } = req.body;
     const shop = await Shop.findById(req.params.shopId);
 
-    const existingIndex = shop.inventory.findIndex(item => item.product.toString() === productId);
+    const existingIndex = shop.inventory.findIndex(
+      item => item.product && item.product.toString() === productId
+    );
 
     if (existingIndex > -1) {
       if (sellingPrice !== undefined) shop.inventory[existingIndex].sellingPrice = sellingPrice;
       if (inStock !== undefined) shop.inventory[existingIndex].inStock = inStock;
       
-      // 🛡️ THE FIX: Explicitly tell MongoDB that this array was modified!
-      shop.markModified('inventory');
+      shop.markModified('inventory'); // 🛡️ Explicit save
     } else {
       shop.inventory.push({ product: productId, sellingPrice, inStock: true });
     }
@@ -133,7 +126,6 @@ app.post("/shops/:shopId/inventory", async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// 🏪 SHOP: Update Shop Details (like Open/Closed status)
 app.patch("/shops/:id", async (req, res) => {
   try {
     const shop = await Shop.findByIdAndUpdate(req.params.id, req.body, { new: true }).populate('inventory.product');
@@ -141,7 +133,6 @@ app.patch("/shops/:id", async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// --- 🕵️ ADMIN ROUTES ---
 app.get("/admin/shop-analysis/:shopId", async (req, res) => {
   try {
     const masterItems = await MasterProduct.find();
@@ -167,7 +158,6 @@ app.get("/admin/shop-analysis/:shopId", async (req, res) => {
 app.get("/shops", async (req, res) => res.json(await Shop.find()));
 app.get("/users", async (req, res) => res.json(await User.find().sort({createdAt: -1})));
 
-// --- 🍎 PRODUCT ROUTES ---
 app.post("/master-products", async (req, res) => {
   try {
     const p = new MasterProduct({
@@ -182,7 +172,6 @@ app.post("/master-products", async (req, res) => {
 
 app.get("/master-products", async (req, res) => res.json(await MasterProduct.find()));
 
-// --- 🛒 ORDER ROUTES ---
 app.post("/orders", async (req, res) => { 
   try {
     const o = new Order(req.body); 
@@ -209,7 +198,6 @@ app.patch("/orders/:id", async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// --- 👤 USER & AUTH ROUTES ---
 app.post("/register", async (req, res) => {
   try {
     const baseName = req.body.name ? req.body.name.substring(0, 4).toUpperCase().replace(/\s/g, '') : "PACK";
