@@ -24,16 +24,17 @@ const Shop = mongoose.model("Shop", shopSchema);
 const masterProductSchema = new mongoose.Schema({ name: String, brand: String, category: String, mrp: Number, qnty: String, emoji: String, searchTags: [String] });
 const MasterProduct = mongoose.model("MasterProduct", masterProductSchema);
 
-// 👤 USER SCHEMA: Now with Coins & Referral System
+// 👤 USER SCHEMA: Added Primary Shop
 const userSchema = new mongoose.Schema({ 
   name: String, 
   phone: { type: String, unique: true }, 
   password: String, 
   pincode: String, 
   address: String,
-  coins: { type: Number, default: 0 }, // 🪙 PackIt Coins
-  referralCode: { type: String, unique: true }, // 👈 Their personal code to share
-  referredBy: String // 👈 The code they used to sign up
+  coins: { type: Number, default: 0 }, 
+  referralCode: { type: String, unique: true }, 
+  referredBy: String,
+  primaryShop: { type: mongoose.Schema.Types.ObjectId, ref: 'Shop' } // 🏪 NEW: Link to favorite shop
 });
 const User = mongoose.model("User", userSchema);
 
@@ -71,6 +72,14 @@ app.post("/shop-login", async (req, res) => {
 app.get("/shops/find/:pincode", async (req, res) => {
   const shop = await Shop.findOne({ pincode: req.params.pincode });
   shop ? res.json(shop) : res.status(404).json({ error: "No shop here" });
+});
+
+// 👇 NEW: Get ALL shops in a pincode for the user to choose their primary shop
+app.get("/shops/all/:pincode", async (req, res) => {
+  try {
+    const shops = await Shop.find({ pincode: req.params.pincode });
+    res.json(shops);
+  } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
 // --- 🍎 PRODUCT ROUTES ---
@@ -114,35 +123,23 @@ app.patch("/orders/:id", async (req, res) => {
   }
 });
 
-// --- 👤 USER & AUTH ROUTES (WITH REFERRAL SYSTEM) ---
+// --- 👤 USER & AUTH ROUTES (WITH REFERRAL & PROFILE LOGIC) ---
 app.post("/register", async (req, res) => {
   try {
-    // 1. Generate unique referral code (e.g., AMIT8492)
     const baseName = req.body.name ? req.body.name.substring(0, 4).toUpperCase().replace(/\s/g, '') : "PACK";
     const refCode = baseName + Math.floor(1000 + Math.random() * 9000);
 
     let startingCoins = 0;
-
-    // 2. Check if they signed up using a friend's code
     if (req.body.referredBy) {
       const referrer = await User.findOne({ referralCode: req.body.referredBy });
       if (referrer) {
-        // Reward the friend who invited them
         referrer.coins += 50;
         await referrer.save();
-        
-        // Reward the new user
         startingCoins = 50;
       }
     }
 
-    // 3. Save the new user
-    const u = new User({
-      ...req.body,
-      referralCode: refCode,
-      coins: startingCoins
-    }); 
-    
+    const u = new User({ ...req.body, referralCode: refCode, coins: startingCoins }); 
     await u.save(); 
     res.json(u); 
   } catch (err) { 
@@ -150,17 +147,48 @@ app.post("/register", async (req, res) => {
   } 
 });
 
+// 👇 UPGRADED: Auto-generates code for old users on Login
 app.post("/login", async (req, res) => {
-  const u = await User.findOne({ phone: req.body.phone, password: req.body.password });
-  u ? res.json(u) : res.status(400).send("Fail");
+  try {
+    let u = await User.findOne({ phone: req.body.phone, password: req.body.password }).populate('primaryShop');
+    if (u) {
+      if (!u.referralCode) {
+        const baseName = u.name ? u.name.substring(0, 4).toUpperCase().replace(/\s/g, '') : "PACK";
+        u.referralCode = baseName + Math.floor(1000 + Math.random() * 9000);
+        await u.save();
+      }
+      res.json(u);
+    } else {
+      res.status(400).send("Fail");
+    }
+  } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// Fetch fresh user data (to check coin balance)
+// 👇 UPGRADED: Auto-generates code for old users and populates Primary Shop
 app.get("/users/:id", async (req, res) => {
   try {
-    const user = await User.findById(req.params.id);
+    let user = await User.findById(req.params.id).populate('primaryShop');
+    if (user && !user.referralCode) {
+      const baseName = user.name ? user.name.substring(0, 4).toUpperCase().replace(/\s/g, '') : "PACK";
+      user.referralCode = baseName + Math.floor(1000 + Math.random() * 9000);
+      await user.save();
+    }
     res.json(user);
   } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// 👇 NEW: Update User Profile (Name, Pincode, Primary Shop)
+app.patch("/users/:id", async (req, res) => {
+  try {
+    // If they set primaryShop to empty string, set it to null in database
+    const updateData = { ...req.body };
+    if (updateData.primaryShop === "") updateData.primaryShop = null;
+
+    const updatedUser = await User.findByIdAndUpdate(req.params.id, updateData, { new: true }).populate('primaryShop');
+    res.json(updatedUser);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
 app.listen(8080);
