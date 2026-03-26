@@ -1,4 +1,4 @@
-const express = require("express"); // 👈 Fixed the capital 'C'
+const express = require("express");
 const mongoose = require("mongoose");
 const cors = require("cors");
 
@@ -24,7 +24,15 @@ const Shop = mongoose.model("Shop", shopSchema);
 const masterProductSchema = new mongoose.Schema({ name: String, brand: String, category: String, mrp: Number, qnty: String, emoji: String, searchTags: [String] });
 const MasterProduct = mongoose.model("MasterProduct", masterProductSchema);
 
-const userSchema = new mongoose.Schema({ name: String, phone: { type: String, unique: true }, password: String, pincode: String, address: String });
+// 👇 UPGRADED: Added coins to User Schema
+const userSchema = new mongoose.Schema({ 
+  name: String, 
+  phone: { type: String, unique: true }, 
+  password: String, 
+  pincode: String, 
+  address: String,
+  coins: { type: Number, default: 0 } // 🪙 Every new user starts with 0 coins
+});
 const User = mongoose.model("User", userSchema);
 
 const orderSchema = new mongoose.Schema({
@@ -69,11 +77,27 @@ app.post("/master-products", async (req, res) => {
 
 app.get("/master-products", async (req, res) => res.json(await MasterProduct.find()));
 
-// --- 🛒 ORDER ROUTES ---
-app.post("/orders", async (req, res) => { const o = new Order(req.body); await o.save(); res.json(o); });
+// --- 🛒 ORDER ROUTES WITH LOYALTY REWARDS ---
+
+app.post("/orders", async (req, res) => { 
+  try {
+    const o = new Order(req.body); 
+    await o.save(); 
+
+    // 👇 UPGRADED: Loyalty Reward Logic (1 coin per ₹10 spent)
+    if (req.body.userId && req.body.totalAmount) {
+      const earnedCoins = Math.floor(req.body.totalAmount / 10);
+      await User.findByIdAndUpdate(req.body.userId, { $inc: { coins: earnedCoins } });
+    }
+
+    res.json(o); 
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 app.get("/orders", async (req, res) => res.json(await Order.find().populate('userId').populate('shopId').sort({createdAt: -1})));
 
-// 👇 THE NEW ROUTE: Update Order Status
 app.patch("/orders/:id", async (req, res) => {
   try {
     const updatedOrder = await Order.findByIdAndUpdate(
@@ -86,12 +110,22 @@ app.patch("/orders/:id", async (req, res) => {
     res.status(500).json({ error: err.message }); 
   }
 });
-// 👆 --------------------------------------
+
+// --- 👤 USER & AUTH ROUTES ---
 
 app.post("/register", async (req, res) => { const u = new User(req.body); await u.save(); res.json(u); });
+
 app.post("/login", async (req, res) => {
   const u = await User.findOne({ phone: req.body.phone, password: req.body.password });
   u ? res.json(u) : res.status(400).send("Fail");
+});
+
+// 👇 UPGRADED: Fetch fresh user data (specifically to check coin balance)
+app.get("/users/:id", async (req, res) => {
+  try {
+    const user = await User.findById(req.params.id);
+    res.json(user);
+  } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
 app.listen(8080);
