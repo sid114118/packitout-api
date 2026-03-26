@@ -100,6 +100,16 @@ app.get("/shops/all/:pincode", async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
+// 🛍️ CUSTOMER: Fetch the Shop's Live Menu
+app.get("/shops/:id/menu", async (req, res) => {
+  try {
+    // We populate the product details so the customer sees the image and name
+    const shop = await Shop.findById(req.params.id).populate('inventory.product');
+    res.json(shop);
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+
 // 👇 NEW: Shop Inventory Manager (Add/Update Price & Stock)
 app.post("/shops/:shopId/inventory", async (req, res) => {
   try {
