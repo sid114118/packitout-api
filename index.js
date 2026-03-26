@@ -74,9 +74,10 @@ app.post("/shops", async (req, res) => {
   } catch (err) { res.status(500).json({ error: "Phone number already exists!" }); }
 });
 
+// 🛡️ FIX 1: Added populate so refreshing the Shop Dashboard doesn't break data
 app.post("/shop-login", async (req, res) => {
   try {
-    const shop = await Shop.findOne({ phone: req.body.phone, password: req.body.password });
+    const shop = await Shop.findOne({ phone: req.body.phone, password: req.body.password }).populate('inventory.product');
     if (!shop) return res.status(401).json({ error: "Invalid Credentials" });
     res.json(shop);
   } catch (err) { res.status(500).json({ error: err.message }); }
@@ -101,29 +102,40 @@ app.get("/shops/:id/menu", async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// 👇 THE FIX: "item.product &&" prevents crashes from broken items
+// ☢️ FIX 2: THE NUCLEAR DB UPDATE (Bypasses Mongoose Array Bugs entirely)
 app.post("/shops/:shopId/inventory", async (req, res) => {
   try {
     const { productId, sellingPrice, inStock } = req.body;
+    
+    // 1. Find the shop and the exact index of the item
     const shop = await Shop.findById(req.params.shopId);
+    if (!shop) return res.status(404).json({ error: "Shop not found" });
 
     const existingIndex = shop.inventory.findIndex(
       item => item.product && item.product.toString() === productId
     );
 
     if (existingIndex > -1) {
-      if (sellingPrice !== undefined) shop.inventory[existingIndex].sellingPrice = sellingPrice;
-      if (inStock !== undefined) shop.inventory[existingIndex].inStock = inStock;
-      
-      shop.markModified('inventory'); // 🛡️ Explicit save
+      // 2. FORCE UPDATE the database directly using MongoDB $set operator
+      const updateData = {};
+      if (sellingPrice !== undefined) updateData[`inventory.${existingIndex}.sellingPrice`] = Number(sellingPrice);
+      if (inStock !== undefined) updateData[`inventory.${existingIndex}.inStock`] = inStock;
+
+      await Shop.updateOne({ _id: req.params.shopId }, { $set: updateData });
     } else {
-      shop.inventory.push({ product: productId, sellingPrice, inStock: true });
+      // 3. FORCE PUSH new item
+      await Shop.updateOne(
+        { _id: req.params.shopId },
+        { $push: { inventory: { product: productId, sellingPrice: Number(sellingPrice), inStock: true } } }
+      );
     }
 
-    await shop.save();
-    await shop.populate('inventory.product'); 
-    res.json(shop);
-  } catch (err) { res.status(500).json({ error: err.message }); }
+    // 4. Return the fresh, populated shop data
+    const updatedShop = await Shop.findById(req.params.shopId).populate('inventory.product'); 
+    res.json(updatedShop);
+  } catch (err) { 
+    res.status(500).json({ error: err.message }); 
+  }
 });
 
 app.patch("/shops/:id", async (req, res) => {
