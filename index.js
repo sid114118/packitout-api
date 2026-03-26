@@ -1,4 +1,4 @@
-const express = require("express"); // 👈 Fixed the capital 'c'
+const express = require("express");
 const mongoose = require("mongoose");
 const cors = require("cors");
 
@@ -24,13 +24,16 @@ const Shop = mongoose.model("Shop", shopSchema);
 const masterProductSchema = new mongoose.Schema({ name: String, brand: String, category: String, mrp: Number, qnty: String, emoji: String, searchTags: [String] });
 const MasterProduct = mongoose.model("MasterProduct", masterProductSchema);
 
+// 👤 USER SCHEMA: Now with Coins & Referral System
 const userSchema = new mongoose.Schema({ 
   name: String, 
   phone: { type: String, unique: true }, 
   password: String, 
   pincode: String, 
   address: String,
-  coins: { type: Number, default: 0 } // 🪙 Every new user starts with 0 coins
+  coins: { type: Number, default: 0 }, // 🪙 PackIt Coins
+  referralCode: { type: String, unique: true }, // 👈 Their personal code to share
+  referredBy: String // 👈 The code they used to sign up
 });
 const User = mongoose.model("User", userSchema);
 
@@ -48,6 +51,7 @@ const Order = mongoose.model("Order", orderSchema);
 // 📮 ROUTES
 // ==========================================
 
+// --- 🏪 SHOP ROUTES ---
 app.post("/shops", async (req, res) => {
   try {
     const newShop = new Shop(req.body);
@@ -69,6 +73,7 @@ app.get("/shops/find/:pincode", async (req, res) => {
   shop ? res.json(shop) : res.status(404).json({ error: "No shop here" });
 });
 
+// --- 🍎 PRODUCT ROUTES ---
 app.post("/master-products", async (req, res) => {
   const p = new MasterProduct({...req.body, mrp: Number(req.body.mrp), searchTags: req.body.searchTags?.split(',').map(t => t.trim())});
   await p.save(); res.json(p);
@@ -76,9 +81,7 @@ app.post("/master-products", async (req, res) => {
 
 app.get("/master-products", async (req, res) => res.json(await MasterProduct.find()));
 
-// --- 🛒 ORDER ROUTES WITH SECURE LOYALTY REWARDS ---
-
-// 1. Create Order (NO COINS GIVEN YET)
+// --- 🛒 ORDER ROUTES (SECURE LOYALTY LOGIC) ---
 app.post("/orders", async (req, res) => { 
   try {
     const o = new Order(req.body); 
@@ -91,7 +94,6 @@ app.post("/orders", async (req, res) => {
 
 app.get("/orders", async (req, res) => res.json(await Order.find().populate('userId').populate('shopId').sort({createdAt: -1})));
 
-// 2. Update Order Status (🪙 COINS AWARDED HERE)
 app.patch("/orders/:id", async (req, res) => {
   try {
     const order = await Order.findById(req.params.id);
@@ -103,7 +105,6 @@ app.patch("/orders/:id", async (req, res) => {
       await User.findByIdAndUpdate(order.userId, { $inc: { coins: earnedCoins } });
     }
 
-    // Update status and save
     order.status = req.body.status;
     await order.save();
 
@@ -113,9 +114,41 @@ app.patch("/orders/:id", async (req, res) => {
   }
 });
 
-// --- 👤 USER & AUTH ROUTES ---
+// --- 👤 USER & AUTH ROUTES (WITH REFERRAL SYSTEM) ---
+app.post("/register", async (req, res) => {
+  try {
+    // 1. Generate unique referral code (e.g., AMIT8492)
+    const baseName = req.body.name ? req.body.name.substring(0, 4).toUpperCase().replace(/\s/g, '') : "PACK";
+    const refCode = baseName + Math.floor(1000 + Math.random() * 9000);
 
-app.post("/register", async (req, res) => { const u = new User(req.body); await u.save(); res.json(u); });
+    let startingCoins = 0;
+
+    // 2. Check if they signed up using a friend's code
+    if (req.body.referredBy) {
+      const referrer = await User.findOne({ referralCode: req.body.referredBy });
+      if (referrer) {
+        // Reward the friend who invited them
+        referrer.coins += 50;
+        await referrer.save();
+        
+        // Reward the new user
+        startingCoins = 50;
+      }
+    }
+
+    // 3. Save the new user
+    const u = new User({
+      ...req.body,
+      referralCode: refCode,
+      coins: startingCoins
+    }); 
+    
+    await u.save(); 
+    res.json(u); 
+  } catch (err) { 
+    res.status(500).json({ error: "Phone number already registered or server error." }); 
+  } 
+});
 
 app.post("/login", async (req, res) => {
   const u = await User.findOne({ phone: req.body.phone, password: req.body.password });
