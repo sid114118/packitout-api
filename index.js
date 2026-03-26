@@ -121,6 +121,14 @@ app.post("/shops/:shopId/inventory", async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
+// 🏪 SHOP: Update Shop Details (like Open/Closed status)
+app.patch("/shops/:id", async (req, res) => {
+  try {
+    const shop = await Shop.findByIdAndUpdate(req.params.id, req.body, { new: true }).populate('inventory.product');
+    res.json(shop);
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
 // --- 🕵️ ADMIN ROUTES ---
 // 👇 NEW: Gap Analysis for Admin Drawer
 app.get("/admin/shop-analysis/:shopId", async (req, res) => {
