@@ -109,8 +109,7 @@ app.get("/shops/:id/menu", async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-
-// 👇 NEW: Shop Inventory Manager (Add/Update Price & Stock)
+// 👇 FIXED: Shop Inventory Manager (Add/Update Price & Stock)
 app.post("/shops/:shopId/inventory", async (req, res) => {
   try {
     const { productId, sellingPrice, inStock } = req.body;
@@ -121,6 +120,9 @@ app.post("/shops/:shopId/inventory", async (req, res) => {
     if (existingIndex > -1) {
       if (sellingPrice !== undefined) shop.inventory[existingIndex].sellingPrice = sellingPrice;
       if (inStock !== undefined) shop.inventory[existingIndex].inStock = inStock;
+      
+      // 🛡️ THE FIX: Explicitly tell MongoDB that this array was modified!
+      shop.markModified('inventory');
     } else {
       shop.inventory.push({ product: productId, sellingPrice, inStock: true });
     }
@@ -140,7 +142,6 @@ app.patch("/shops/:id", async (req, res) => {
 });
 
 // --- 🕵️ ADMIN ROUTES ---
-// 👇 NEW: Gap Analysis for Admin Drawer
 app.get("/admin/shop-analysis/:shopId", async (req, res) => {
   try {
     const masterItems = await MasterProduct.find();
@@ -148,7 +149,6 @@ app.get("/admin/shop-analysis/:shopId", async (req, res) => {
 
     if (!shop) return res.status(404).send("Shop not found");
 
-    // Filter out any broken links, then map to IDs
     const shopProductIds = shop.inventory
       .filter(item => item.product) 
       .map(item => item.product._id.toString());
@@ -163,6 +163,9 @@ app.get("/admin/shop-analysis/:shopId", async (req, res) => {
     });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
+
+app.get("/shops", async (req, res) => res.json(await Shop.find()));
+app.get("/users", async (req, res) => res.json(await User.find().sort({createdAt: -1})));
 
 // --- 🍎 PRODUCT ROUTES ---
 app.post("/master-products", async (req, res) => {
@@ -263,12 +266,4 @@ app.patch("/users/:id", async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// 🕵️ ADMIN: Global Fetch Routes
-app.get("/shops", async (req, res) => res.json(await Shop.find()));
-app.get("/users", async (req, res) => res.json(await User.find().sort({createdAt: -1})));
-
-
-
 app.listen(8080);
-
-
