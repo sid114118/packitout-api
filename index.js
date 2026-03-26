@@ -1,4 +1,4 @@
-const express = require("express");
+const express = require("express"); // 👈 Fixed the capital 'C'
 const mongoose = require("mongoose");
 const cors = require("cors");
 
@@ -9,12 +9,14 @@ app.use(express.json());
 const MONGO_URI = process.env.MONGO_URI;
 mongoose.connect(MONGO_URI).then(() => console.log("✅ DB Connected")).catch(err => console.log(err));
 
-// SCHEMAS
+// ==========================================
+// 🏗️ SCHEMAS
+// ==========================================
 const shopSchema = new mongoose.Schema({ 
   name: String, 
   pincode: String, 
   phone: { type: String, unique: true }, 
-  password: { type: String, required: true }, // 🔐 Added strict password
+  password: { type: String, required: true }, 
   isOpen: { type: Boolean, default: true } 
 });
 const Shop = mongoose.model("Shop", shopSchema);
@@ -35,7 +37,10 @@ const orderSchema = new mongoose.Schema({
 });
 const Order = mongoose.model("Order", orderSchema);
 
-// ROUTES
+// ==========================================
+// 📮 ROUTES
+// ==========================================
+
 app.post("/shops", async (req, res) => {
   try {
     const newShop = new Shop(req.body);
@@ -64,8 +69,24 @@ app.post("/master-products", async (req, res) => {
 
 app.get("/master-products", async (req, res) => res.json(await MasterProduct.find()));
 
+// --- 🛒 ORDER ROUTES ---
 app.post("/orders", async (req, res) => { const o = new Order(req.body); await o.save(); res.json(o); });
 app.get("/orders", async (req, res) => res.json(await Order.find().populate('userId').populate('shopId').sort({createdAt: -1})));
+
+// 👇 THE NEW ROUTE: Update Order Status
+app.patch("/orders/:id", async (req, res) => {
+  try {
+    const updatedOrder = await Order.findByIdAndUpdate(
+      req.params.id, 
+      { status: req.body.status }, 
+      { new: true }
+    );
+    res.json(updatedOrder);
+  } catch (err) { 
+    res.status(500).json({ error: err.message }); 
+  }
+});
+// 👆 --------------------------------------
 
 app.post("/register", async (req, res) => { const u = new User(req.body); await u.save(); res.json(u); });
 app.post("/login", async (req, res) => {
