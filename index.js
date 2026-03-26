@@ -21,7 +21,17 @@ const shopSchema = new mongoose.Schema({
 });
 const Shop = mongoose.model("Shop", shopSchema);
 
-const masterProductSchema = new mongoose.Schema({ name: String, brand: String, category: String, mrp: Number, qnty: String, emoji: String, searchTags: [String] });
+// 🍎 MASTER PRODUCT SCHEMA: Now with Image Support
+const masterProductSchema = new mongoose.Schema({ 
+  name: String, 
+  brand: String, 
+  category: String, 
+  mrp: Number, 
+  qnty: String, 
+  emoji: String, 
+  image: String, // 🖼️ New field for real product image links
+  searchTags: [String] 
+});
 const MasterProduct = mongoose.model("MasterProduct", masterProductSchema);
 
 // 👤 USER SCHEMA: Added Primary Shop
@@ -34,7 +44,7 @@ const userSchema = new mongoose.Schema({
   coins: { type: Number, default: 0 }, 
   referralCode: { type: String, unique: true }, 
   referredBy: String,
-  primaryShop: { type: mongoose.Schema.Types.ObjectId, ref: 'Shop' } // 🏪 NEW: Link to favorite shop
+  primaryShop: { type: mongoose.Schema.Types.ObjectId, ref: 'Shop' } 
 });
 const User = mongoose.model("User", userSchema);
 
@@ -74,7 +84,6 @@ app.get("/shops/find/:pincode", async (req, res) => {
   shop ? res.json(shop) : res.status(404).json({ error: "No shop here" });
 });
 
-// 👇 NEW: Get ALL shops in a pincode for the user to choose their primary shop
 app.get("/shops/all/:pincode", async (req, res) => {
   try {
     const shops = await Shop.find({ pincode: req.params.pincode });
@@ -84,21 +93,26 @@ app.get("/shops/all/:pincode", async (req, res) => {
 
 // --- 🍎 PRODUCT ROUTES ---
 app.post("/master-products", async (req, res) => {
-  const p = new MasterProduct({...req.body, mrp: Number(req.body.mrp), searchTags: req.body.searchTags?.split(',').map(t => t.trim())});
-  await p.save(); res.json(p);
+  try {
+    const p = new MasterProduct({
+      ...req.body, 
+      mrp: Number(req.body.mrp), 
+      searchTags: req.body.searchTags?.split(',').map(t => t.trim())
+    });
+    await p.save(); 
+    res.json(p);
+  } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
 app.get("/master-products", async (req, res) => res.json(await MasterProduct.find()));
 
-// --- 🛒 ORDER ROUTES (SECURE LOYALTY LOGIC) ---
+// --- 🛒 ORDER ROUTES ---
 app.post("/orders", async (req, res) => { 
   try {
     const o = new Order(req.body); 
     await o.save(); 
     res.json(o); 
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
+  } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
 app.get("/orders", async (req, res) => res.json(await Order.find().populate('userId').populate('shopId').sort({createdAt: -1})));
@@ -108,7 +122,6 @@ app.patch("/orders/:id", async (req, res) => {
     const order = await Order.findById(req.params.id);
     if (!order) return res.status(404).json({ error: "Order not found" });
 
-    // 🛡️ SECURITY CHECK: Give coins ONLY if status changes to Delivered for the first time
     if (req.body.status === "Delivered ✅" && order.status !== "Delivered ✅") {
       const earnedCoins = Math.floor(order.totalAmount / 10);
       await User.findByIdAndUpdate(order.userId, { $inc: { coins: earnedCoins } });
@@ -116,14 +129,11 @@ app.patch("/orders/:id", async (req, res) => {
 
     order.status = req.body.status;
     await order.save();
-
     res.json(order);
-  } catch (err) { 
-    res.status(500).json({ error: err.message }); 
-  }
+  } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// --- 👤 USER & AUTH ROUTES (WITH REFERRAL & PROFILE LOGIC) ---
+// --- 👤 USER & AUTH ROUTES ---
 app.post("/register", async (req, res) => {
   try {
     const baseName = req.body.name ? req.body.name.substring(0, 4).toUpperCase().replace(/\s/g, '') : "PACK";
@@ -142,12 +152,9 @@ app.post("/register", async (req, res) => {
     const u = new User({ ...req.body, referralCode: refCode, coins: startingCoins }); 
     await u.save(); 
     res.json(u); 
-  } catch (err) { 
-    res.status(500).json({ error: "Phone number already registered or server error." }); 
-  } 
+  } catch (err) { res.status(500).json({ error: "Phone number already registered." }); } 
 });
 
-// 👇 UPGRADED: Auto-generates code for old users on Login
 app.post("/login", async (req, res) => {
   try {
     let u = await User.findOne({ phone: req.body.phone, password: req.body.password }).populate('primaryShop');
@@ -158,13 +165,10 @@ app.post("/login", async (req, res) => {
         await u.save();
       }
       res.json(u);
-    } else {
-      res.status(400).send("Fail");
-    }
+    } else { res.status(400).send("Fail"); }
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// 👇 UPGRADED: Auto-generates code for old users and populates Primary Shop
 app.get("/users/:id", async (req, res) => {
   try {
     let user = await User.findById(req.params.id).populate('primaryShop');
@@ -177,18 +181,13 @@ app.get("/users/:id", async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// 👇 NEW: Update User Profile (Name, Pincode, Primary Shop)
 app.patch("/users/:id", async (req, res) => {
   try {
-    // If they set primaryShop to empty string, set it to null in database
     const updateData = { ...req.body };
     if (updateData.primaryShop === "") updateData.primaryShop = null;
-
     const updatedUser = await User.findByIdAndUpdate(req.params.id, updateData, { new: true }).populate('primaryShop');
     res.json(updatedUser);
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
+  } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
 app.listen(8080);
