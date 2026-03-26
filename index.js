@@ -12,16 +12,24 @@ mongoose.connect(MONGO_URI).then(() => console.log("✅ DB Connected")).catch(er
 // ==========================================
 // 🏗️ SCHEMAS
 // ==========================================
+
+// 🏪 SHOP SCHEMA: Upgraded with Custom Inventory
 const shopSchema = new mongoose.Schema({ 
   name: String, 
   pincode: String, 
   phone: { type: String, unique: true }, 
   password: { type: String, required: true }, 
-  isOpen: { type: Boolean, default: true } 
+  isOpen: { type: Boolean, default: true },
+  // 🚀 Marketplace Feature: Links Master Product to Custom Price
+  inventory: [{ 
+    product: { type: mongoose.Schema.Types.ObjectId, ref: 'MasterProduct' },
+    sellingPrice: Number, 
+    inStock: { type: Boolean, default: true }
+  }] 
 });
 const Shop = mongoose.model("Shop", shopSchema);
 
-// 🍎 MASTER PRODUCT SCHEMA: Now with Image Support
+// 🍎 MASTER PRODUCT SCHEMA: With Image Support
 const masterProductSchema = new mongoose.Schema({ 
   name: String, 
   brand: String, 
@@ -29,12 +37,12 @@ const masterProductSchema = new mongoose.Schema({
   mrp: Number, 
   qnty: String, 
   emoji: String, 
-  image: String, // 🖼️ New field for real product image links
+  image: String, 
   searchTags: [String] 
 });
 const MasterProduct = mongoose.model("MasterProduct", masterProductSchema);
 
-// 👤 USER SCHEMA: Added Primary Shop
+// 👤 USER SCHEMA
 const userSchema = new mongoose.Schema({ 
   name: String, 
   phone: { type: String, unique: true }, 
@@ -48,6 +56,7 @@ const userSchema = new mongoose.Schema({
 });
 const User = mongoose.model("User", userSchema);
 
+// 🛒 ORDER SCHEMA
 const orderSchema = new mongoose.Schema({
   userId: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
   shopId: { type: mongoose.Schema.Types.ObjectId, ref: 'Shop' }, 
@@ -88,6 +97,52 @@ app.get("/shops/all/:pincode", async (req, res) => {
   try {
     const shops = await Shop.find({ pincode: req.params.pincode });
     res.json(shops);
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// 👇 NEW: Shop Inventory Manager (Add/Update Price & Stock)
+app.post("/shops/:shopId/inventory", async (req, res) => {
+  try {
+    const { productId, sellingPrice, inStock } = req.body;
+    const shop = await Shop.findById(req.params.shopId);
+
+    const existingIndex = shop.inventory.findIndex(item => item.product.toString() === productId);
+
+    if (existingIndex > -1) {
+      if (sellingPrice !== undefined) shop.inventory[existingIndex].sellingPrice = sellingPrice;
+      if (inStock !== undefined) shop.inventory[existingIndex].inStock = inStock;
+    } else {
+      shop.inventory.push({ product: productId, sellingPrice, inStock: true });
+    }
+
+    await shop.save();
+    await shop.populate('inventory.product'); 
+    res.json(shop);
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// --- 🕵️ ADMIN ROUTES ---
+// 👇 NEW: Gap Analysis for Admin Drawer
+app.get("/admin/shop-analysis/:shopId", async (req, res) => {
+  try {
+    const masterItems = await MasterProduct.find();
+    const shop = await Shop.findById(req.params.shopId).populate('inventory.product');
+
+    if (!shop) return res.status(404).send("Shop not found");
+
+    // Filter out any broken links, then map to IDs
+    const shopProductIds = shop.inventory
+      .filter(item => item.product) 
+      .map(item => item.product._id.toString());
+    
+    const missingItems = masterItems.filter(item => !shopProductIds.includes(item._id.toString()));
+
+    res.json({
+      shopName: shop.name,
+      activeCount: shop.inventory.length,
+      missingCount: missingItems.length,
+      missingItems: missingItems
+    });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
