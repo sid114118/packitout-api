@@ -1,4 +1,4 @@
-const express = require("express");
+const express = require("express"); // 👈 Fixed the capital 'c'
 const mongoose = require("mongoose");
 const cors = require("cors");
 
@@ -24,7 +24,6 @@ const Shop = mongoose.model("Shop", shopSchema);
 const masterProductSchema = new mongoose.Schema({ name: String, brand: String, category: String, mrp: Number, qnty: String, emoji: String, searchTags: [String] });
 const MasterProduct = mongoose.model("MasterProduct", masterProductSchema);
 
-// 👇 UPGRADED: Added coins to User Schema
 const userSchema = new mongoose.Schema({ 
   name: String, 
   phone: { type: String, unique: true }, 
@@ -77,19 +76,13 @@ app.post("/master-products", async (req, res) => {
 
 app.get("/master-products", async (req, res) => res.json(await MasterProduct.find()));
 
-// --- 🛒 ORDER ROUTES WITH LOYALTY REWARDS ---
+// --- 🛒 ORDER ROUTES WITH SECURE LOYALTY REWARDS ---
 
+// 1. Create Order (NO COINS GIVEN YET)
 app.post("/orders", async (req, res) => { 
   try {
     const o = new Order(req.body); 
     await o.save(); 
-
-    // 👇 UPGRADED: Loyalty Reward Logic (1 coin per ₹10 spent)
-    if (req.body.userId && req.body.totalAmount) {
-      const earnedCoins = Math.floor(req.body.totalAmount / 10);
-      await User.findByIdAndUpdate(req.body.userId, { $inc: { coins: earnedCoins } });
-    }
-
     res.json(o); 
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -98,14 +91,23 @@ app.post("/orders", async (req, res) => {
 
 app.get("/orders", async (req, res) => res.json(await Order.find().populate('userId').populate('shopId').sort({createdAt: -1})));
 
+// 2. Update Order Status (🪙 COINS AWARDED HERE)
 app.patch("/orders/:id", async (req, res) => {
   try {
-    const updatedOrder = await Order.findByIdAndUpdate(
-      req.params.id, 
-      { status: req.body.status }, 
-      { new: true }
-    );
-    res.json(updatedOrder);
+    const order = await Order.findById(req.params.id);
+    if (!order) return res.status(404).json({ error: "Order not found" });
+
+    // 🛡️ SECURITY CHECK: Give coins ONLY if status changes to Delivered for the first time
+    if (req.body.status === "Delivered ✅" && order.status !== "Delivered ✅") {
+      const earnedCoins = Math.floor(order.totalAmount / 10);
+      await User.findByIdAndUpdate(order.userId, { $inc: { coins: earnedCoins } });
+    }
+
+    // Update status and save
+    order.status = req.body.status;
+    await order.save();
+
+    res.json(order);
   } catch (err) { 
     res.status(500).json({ error: err.message }); 
   }
@@ -120,7 +122,7 @@ app.post("/login", async (req, res) => {
   u ? res.json(u) : res.status(400).send("Fail");
 });
 
-// 👇 UPGRADED: Fetch fresh user data (specifically to check coin balance)
+// Fetch fresh user data (to check coin balance)
 app.get("/users/:id", async (req, res) => {
   try {
     const user = await User.findById(req.params.id);
