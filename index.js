@@ -245,4 +245,12 @@ app.patch("/users/:id", async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
+// 🕵️ ADMIN: Global Fetch Routes
+app.get("/shops", async (req, res) => res.json(await Shop.find()));
+app.get("/users", async (req, res) => res.json(await User.find().sort({createdAt: -1})));
+
+
+
 app.listen(8080);
+
+
