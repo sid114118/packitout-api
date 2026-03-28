@@ -1,14 +1,13 @@
 const express = require("express");
 const mongoose = require("mongoose");
 const cors = require("cors");
-
-// ==========================================
-// 🧾 PARCHI UPLOAD PACKAGES
-// ==========================================
 const multer = require("multer");
 const cloudinary = require("cloudinary").v2;
 const fs = require("fs");
 
+// ==========================================
+// 🧾 PARCHI UPLOAD PACKAGES
+// ==========================================
 cloudinary.config({ 
   cloud_name: 'dj48tkcsw', 
   api_key: '272175433165944', 
@@ -17,11 +16,20 @@ cloudinary.config({
 
 const upload = multer({ dest: '/tmp/' });
 const app = express();
-app.use(cors());
+
+// 🌐 UPGRADED CORS: Prevents "Failed to Fetch" on mobile
+app.use(cors({
+  origin: "*",
+  methods: ["GET", "POST", "PATCH", "PUT", "DELETE"],
+  allowedHeaders: ["Content-Type", "Authorization"]
+}));
+
 app.use(express.json());
 
 const MONGO_URI = process.env.MONGO_URI;
-mongoose.connect(MONGO_URI).then(() => console.log("✅ DB Connected")).catch(err => console.log(err));
+mongoose.connect(MONGO_URI)
+  .then(() => console.log("✅ DB Connected"))
+  .catch(err => console.log(err));
 
 // ==========================================
 // 🏗️ SCHEMAS
@@ -60,7 +68,7 @@ const orderSchema = new mongoose.Schema({
   shopId: { type: mongoose.Schema.Types.ObjectId, ref: 'Shop' }, 
   items: Array, 
   totalAmount: Number,
-  imageUrl: { type: String, default: "" }, // 🚨 FIXED: Added this to store the photo link!
+  imageUrl: { type: String, default: "" }, 
   status: { type: String, default: "Pending" }, 
   createdAt: { type: Date, default: Date.now }
 });
@@ -80,6 +88,10 @@ const Parchi = mongoose.model("Parchi", parchiSchema);
 // 📮 ROUTES
 // ==========================================
 
+// 🟢 SERVER HEALTH CHECK ROUTE
+app.get("/ping", (req, res) => res.send("PackItOut Server is ALIVE! 🟢"));
+
+// --- PARCHI ROUTES ---
 app.post("/upload-parchi", upload.single('parchiImage'), async (req, res) => {
   try {
     if (!req.file) return res.status(400).json({ error: "No image." });
@@ -97,52 +109,34 @@ app.post("/upload-parchi", upload.single('parchiImage'), async (req, res) => {
   } catch (error) { res.status(500).json({ error: "Upload failed." }); }
 });
 
-// 🏪 FOR SHOP: Get parchis waiting for them
 app.get("/parchis/:shopId", async (req, res) => {
-  try {
-    const parchis = await Parchi.find({ shopId: req.params.shopId, status: 'pending' }).sort({createdAt: -1});
-    res.json(parchis);
-  } catch(err) { res.status(500).json({ error: err.message }); }
+  try { res.json(await Parchi.find({ shopId: req.params.shopId, status: 'pending' }).sort({createdAt: -1})); } 
+  catch(err) { res.status(500).json({ error: err.message }); }
 });
 
-// 👤 FOR USER: Get their own uploaded parchis (FIXED!)
 app.get("/parchis/user/:userId", async (req, res) => {
-  try {
-    const userParchis = await Parchi.find({ userId: req.params.userId, status: 'pending' }).sort({createdAt: -1});
-    res.json(userParchis);
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  try { res.json(await Parchi.find({ userId: req.params.userId, status: 'pending' }).sort({createdAt: -1})); } 
+  catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// 👑 ADMIN ROUTE: Get every single pending parchi in the system
 app.get("/admin/all-parchis", async (req, res) => {
-  try {
-    const allParchis = await Parchi.find({ status: 'pending' }).sort({ createdAt: -1 });
-    res.json(allParchis);
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
+  try { res.json(await Parchi.find({ status: 'pending' }).sort({ createdAt: -1 })); } 
+  catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-
-// --- ORDERS ---
-
+// --- ORDER ROUTES ---
 app.post("/orders", async (req, res) => { 
   try {
     const o = new Order(req.body); 
     await o.save(); 
-
-    // 🧹 Cleanup: If this order was made from a Parchi, mark that Parchi as processed
     if (req.body.imageUrl) {
       await Parchi.updateOne({ imageUrl: req.body.imageUrl }, { $set: { status: 'processed' } });
     }
-
     res.json(o); 
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
 app.get("/orders", async (req, res) => res.json(await Order.find().populate('userId').populate('shopId').sort({createdAt: -1})));
-
-// ... (Rest of your original routes remain exactly the same) ...
 
 app.patch("/orders/:id", async (req, res) => {
   try {
@@ -158,6 +152,7 @@ app.patch("/orders/:id", async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
+// --- USER ROUTES ---
 app.post("/register", async (req, res) => {
   try {
     const baseName = req.body.name ? req.body.name.substring(0, 4).toUpperCase().replace(/\s/g, '') : "PACK";
@@ -179,28 +174,29 @@ app.post("/login", async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
+app.get("/users", async (req, res) => res.json(await User.find().sort({createdAt: -1})));
+
 app.get("/users/:id", async (req, res) => {
-  try {
-    let user = await User.findById(req.params.id).populate('primaryShop');
-    res.json(user);
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  try { res.json(await User.findById(req.params.id).populate('primaryShop')); } 
+  catch (err) { res.status(500).json({ error: err.message }); }
 });
 
 app.patch("/users/:id", async (req, res) => {
   try {
     const updateData = { ...req.body };
     if (updateData.primaryShop === "") updateData.primaryShop = null;
-    const updatedUser = await User.findByIdAndUpdate(req.params.id, updateData, { new: true }).populate('primaryShop');
-    res.json(updatedUser);
+    res.json(await User.findByIdAndUpdate(req.params.id, updateData, { new: true }).populate('primaryShop'));
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
+// --- SHOP ROUTES ---
 app.get("/shops", async (req, res) => res.json(await Shop.find()));
-app.get("/users", async (req, res) => res.json(await User.find().sort({createdAt: -1})));
+
 app.post("/shops", async (req, res) => {
   try { const newShop = new Shop(req.body); await newShop.save(); res.json(newShop); } 
   catch (err) { res.status(500).json({ error: "Exists" }); }
 });
+
 app.post("/shop-login", async (req, res) => {
   try {
     const shop = await Shop.findOne({ phone: req.body.phone, password: req.body.password }).populate('inventory.product');
@@ -208,10 +204,18 @@ app.post("/shop-login", async (req, res) => {
     res.json(shop);
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
+
 app.get("/shops/all/:pincode", async (req, res) => {
-  try { const shops = await Shop.find({ pincode: req.params.pincode }); res.json(shops); } 
+  try { res.json(await Shop.find({ pincode: req.params.pincode })); } 
   catch (err) { res.status(500).json({ error: err.message }); }
 });
+
+// 🚨 THIS IS THE ROUTE THAT WAS MISSING! 
+app.get("/shops/:id/menu", async (req, res) => {
+  try { res.json(await Shop.findById(req.params.id).populate('inventory.product')); } 
+  catch (err) { res.status(500).json({ error: err.message }); }
+});
+
 app.post("/shops/:shopId/inventory", async (req, res) => {
   try {
     const { productId, sellingPrice, inStock } = req.body;
@@ -228,16 +232,23 @@ app.post("/shops/:shopId/inventory", async (req, res) => {
     res.json(await Shop.findById(req.params.shopId).populate('inventory.product'));
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
+
 app.patch("/shops/:id", async (req, res) => {
   try { res.json(await Shop.findByIdAndUpdate(req.params.id, req.body, { new: true }).populate('inventory.product')); } 
   catch (err) { res.status(500).json({ error: err.message }); }
 });
+
+// --- MASTER PRODUCTS ---
 app.post("/master-products", async (req, res) => {
   try {
     const p = new MasterProduct({ ...req.body, mrp: Number(req.body.mrp), searchTags: req.body.searchTags?.split(',').map(t => t.trim()) });
     await p.save(); res.json(p);
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
+
 app.get("/master-products", async (req, res) => res.json(await MasterProduct.find()));
 
+// ==========================================
+// 🚀 START SERVER
+// ==========================================
 app.listen(8080, () => console.log("🚀 Server running on port 8080"));
