@@ -113,6 +113,17 @@ app.get("/parchis/user/:userId", async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
+// 👑 ADMIN ROUTE: Get every single pending parchi in the system
+app.get("/admin/all-parchis", async (req, res) => {
+  try {
+    const allParchis = await Parchi.find({ status: 'pending' }).sort({ createdAt: -1 });
+    res.json(allParchis);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+
 // --- ORDERS ---
 
 app.post("/orders", async (req, res) => { 
