@@ -17,7 +17,7 @@ cloudinary.config({
 });
 
 // Create the temporary upload handler
-const upload = multer({ dest: 'uploads/' });
+const upload = multer({ dest: '/tmp/' });
 
 const app = express();
 app.use(cors());
