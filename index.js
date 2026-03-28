@@ -2,6 +2,23 @@ const express = require("express");
 const mongoose = require("mongoose");
 const cors = require("cors");
 
+// ==========================================
+// 🧾 PARCHI UPLOAD PACKAGES
+// ==========================================
+const multer = require("multer");
+const cloudinary = require("cloudinary").v2;
+const fs = require("fs");
+
+// ⚠️ IMPORTANT: Paste your actual Cloudinary keys here before saving!
+cloudinary.config({ 
+  cloud_name: 'dj48tkcsw', 
+  api_key: '272175433165944', 
+  api_secret: 'Oum12kRi9FjCa5kPe0ZaEoLTAvQ' 
+});
+
+// Create the temporary upload handler
+const upload = multer({ dest: 'uploads/' });
+
 const app = express();
 app.use(cors());
 app.use(express.json());
@@ -62,10 +79,56 @@ const orderSchema = new mongoose.Schema({
 });
 const Order = mongoose.model("Order", orderSchema);
 
+// 🧾 NEW SCHEMA: Parchi Uploads
+const parchiSchema = new mongoose.Schema({
+  userId: String, 
+  shopId: String,
+  customerName: String,
+  imageUrl: String,
+  status: { type: String, default: 'pending' }, // 'pending' or 'processed'
+  createdAt: { type: Date, default: Date.now }
+});
+const Parchi = mongoose.model("Parchi", parchiSchema);
+
 // ==========================================
 // 📮 ROUTES
 // ==========================================
 
+// --- 🧾 PARCHI ROUTES ---
+app.post("/upload-parchi", upload.single('parchiImage'), async (req, res) => {
+  try {
+    if (!req.file) return res.status(400).json({ error: "No image provided." });
+
+    const result = await cloudinary.uploader.upload(req.file.path, {
+      folder: 'packitout_parchis', 
+    });
+
+    fs.unlinkSync(req.file.path); // Delete temp file from server
+
+    const newParchi = new Parchi({
+      userId: req.body.userId || "Guest_ID",
+      shopId: req.body.shopId || "Master_Shop",
+      customerName: req.body.customerName || "Customer",
+      imageUrl: result.secure_url 
+    });
+    
+    await newParchi.save();
+    res.status(200).json({ success: true, message: "Parchi uploaded successfully!", parchi: newParchi });
+  } catch (error) {
+    console.error("Upload Error:", error);
+    res.status(500).json({ error: "Failed to upload image." });
+  }
+});
+
+app.get("/parchis/:shopId", async (req, res) => {
+  try {
+    // Fetch only pending parchis for this specific shop
+    const parchis = await Parchi.find({ shopId: req.params.shopId, status: 'pending' }).sort({createdAt: -1});
+    res.json(parchis);
+  } catch(err) { res.status(500).json({ error: err.message }); }
+});
+
+// --- EXISTING ROUTES ---
 app.post("/shops", async (req, res) => {
   try {
     const newShop = new Shop(req.body);
@@ -74,7 +137,6 @@ app.post("/shops", async (req, res) => {
   } catch (err) { res.status(500).json({ error: "Phone number already exists!" }); }
 });
 
-// 🛡️ FIX 1: Added populate so refreshing the Shop Dashboard doesn't break data
 app.post("/shop-login", async (req, res) => {
   try {
     const shop = await Shop.findOne({ phone: req.body.phone, password: req.body.password }).populate('inventory.product');
@@ -102,12 +164,10 @@ app.get("/shops/:id/menu", async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// ☢️ FIX 2: THE NUCLEAR DB UPDATE (Bypasses Mongoose Array Bugs entirely)
 app.post("/shops/:shopId/inventory", async (req, res) => {
   try {
     const { productId, sellingPrice, inStock } = req.body;
     
-    // 1. Find the shop and the exact index of the item
     const shop = await Shop.findById(req.params.shopId);
     if (!shop) return res.status(404).json({ error: "Shop not found" });
 
@@ -116,21 +176,17 @@ app.post("/shops/:shopId/inventory", async (req, res) => {
     );
 
     if (existingIndex > -1) {
-      // 2. FORCE UPDATE the database directly using MongoDB $set operator
       const updateData = {};
       if (sellingPrice !== undefined) updateData[`inventory.${existingIndex}.sellingPrice`] = Number(sellingPrice);
       if (inStock !== undefined) updateData[`inventory.${existingIndex}.inStock`] = inStock;
-
       await Shop.updateOne({ _id: req.params.shopId }, { $set: updateData });
     } else {
-      // 3. FORCE PUSH new item
       await Shop.updateOne(
         { _id: req.params.shopId },
         { $push: { inventory: { product: productId, sellingPrice: Number(sellingPrice), inStock: true } } }
       );
     }
 
-    // 4. Return the fresh, populated shop data
     const updatedShop = await Shop.findById(req.params.shopId).populate('inventory.product'); 
     res.json(updatedShop);
   } catch (err) { 
