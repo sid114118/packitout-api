@@ -35,9 +35,7 @@ mongoose.connect(MONGO_URI)
 // 🏗️ SCHEMAS
 // ==========================================
 
-// 👇 ULTIMATE SHOP SCHEMA (Hybrid Inventory & Legal Details) 👇
 const shopSchema = new mongoose.Schema({ 
-  // 1. Basic Info
   name: String, 
   ownerName: { type: String, default: "" },      
   fullAddress: { type: String, default: "" },    
@@ -46,35 +44,30 @@ const shopSchema = new mongoose.Schema({
   phone: { type: String, unique: true }, 
   password: { type: String, required: true },
   
-  // 2. Logistics & Status 
   pincode: String, 
   serviceablePincodes: { type: [String], default: [] }, 
   isOpen: { type: Boolean, default: true },
   isAcceptingOrders: { type: Boolean, default: true },
 
-  // 3. Legal & Financial 
   fssai: { type: String, default: "" },          
   gst: { type: String, default: "" },            
   panNumber: { type: String, default: "" },      
   upiId: { type: String, default: "" },          
   
-  // 4. Trust Metrics 
   rating: { type: Number, default: 5.0 },        
   totalOrdersFulfilled: { type: Number, default: 0 }, 
 
-  // 5. 📦 Hybrid Inventory System Settings
   inventoryMode: { type: String, enum: ['manual', 'stock_count'], default: 'manual' },
 
   inventory: [{ 
     product: { type: mongoose.Schema.Types.ObjectId, ref: 'MasterProduct' },
     sellingPrice: Number, 
-    stockCount: { type: Number, default: 0 },    // Used if mode is 'stock_count'
-    inStock: { type: Boolean, default: true }    // Used if mode is 'manual'
+    stockCount: { type: Number, default: 0 },    
+    inStock: { type: Boolean, default: true }    
   }] 
 });
 const Shop = mongoose.model("Shop", shopSchema);
 
-// 👇 UPGRADED MASTER PRODUCT SCHEMA 👇
 const masterProductSchema = new mongoose.Schema({ 
   name: String, 
   brand: String, 
@@ -84,7 +77,6 @@ const masterProductSchema = new mongoose.Schema({
   emoji: String, 
   image: String, 
   searchTags: [String],
-  // NEW PREMIUM FIELDS
   description: { type: String, default: "" },
   manufacturer: { type: String, default: "" },
   energy: { type: String, default: "" },
@@ -124,12 +116,42 @@ const parchiSchema = new mongoose.Schema({
 });
 const Parchi = mongoose.model("Parchi", parchiSchema);
 
+// 👇 NEW: NOTIFICATION SCHEMA 👇
+const notificationSchema = new mongoose.Schema({
+  userId: { type: mongoose.Schema.Types.ObjectId, ref: 'User', default: null }, 
+  shopId: { type: mongoose.Schema.Types.ObjectId, ref: 'Shop', default: null }, 
+  title: String,
+  message: String,
+  isRead: { type: Boolean, default: false },
+  createdAt: { type: Date, default: Date.now }
+});
+const Notification = mongoose.model("Notification", notificationSchema);
+
 // ==========================================
 // 📮 ROUTES
 // ==========================================
 
-// 🟢 SERVER HEALTH CHECK ROUTE
 app.get("/ping", (req, res) => res.send("PackItOut Server is ALIVE! 🟢"));
+
+// --- NOTIFICATION ROUTES (NEW) ---
+app.get("/notifications/user/:userId", async (req, res) => {
+  try { res.json(await Notification.find({ userId: req.params.userId }).sort({ createdAt: -1 }).limit(20)); } 
+  catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.get("/notifications/shop/:shopId", async (req, res) => {
+  try { res.json(await Notification.find({ shopId: req.params.shopId }).sort({ createdAt: -1 }).limit(20)); } 
+  catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.patch("/notifications/read-all", async (req, res) => {
+  try {
+    const { userId, shopId } = req.body;
+    const query = userId ? { userId } : { shopId };
+    await Notification.updateMany(query, { $set: { isRead: true } });
+    res.json({ success: true });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
 
 // --- PARCHI ROUTES ---
 app.post("/upload-parchi", upload.single('parchiImage'), async (req, res) => {
@@ -172,6 +194,14 @@ app.post("/orders", async (req, res) => {
     if (req.body.imageUrl) {
       await Parchi.updateOne({ imageUrl: req.body.imageUrl }, { $set: { status: 'processed' } });
     }
+    
+    // 👇 NEW: Notify Shop of new order
+    await Notification.create({ 
+      shopId: o.shopId, 
+      title: "New Order! 🚀", 
+      message: `Order #${o._id.toString().slice(-5).toUpperCase()} received for ₹${o.totalAmount}` 
+    });
+
     res.json(o); 
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
@@ -188,6 +218,14 @@ app.patch("/orders/:id", async (req, res) => {
     }
     order.status = req.body.status;
     await order.save();
+
+    // 👇 NEW: Notify User of status change
+    await Notification.create({ 
+      userId: order.userId, 
+      title: "Order Update 📦", 
+      message: `Your order is now: ${req.body.status}` 
+    });
+
     res.json(order);
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
@@ -272,7 +310,6 @@ app.post("/shops/:shopId/inventory", async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// 👇 NEW: Admin Edit Shop Route
 app.patch("/shops/:id/admin-edit", async (req, res) => {
   try {
     const updatedShop = await Shop.findByIdAndUpdate(req.params.id, req.body, { new: true });
@@ -311,4 +348,4 @@ app.patch("/master-products/:id", async (req, res) => {
 // 🚀 START SERVER
 // ==========================================
 app.listen(8080, () => console.log("🚀 Server running on port 8080"));
-                                                                                             
+           
