@@ -116,7 +116,6 @@ const parchiSchema = new mongoose.Schema({
 });
 const Parchi = mongoose.model("Parchi", parchiSchema);
 
-// 👇 NEW: NOTIFICATION SCHEMA 👇
 const notificationSchema = new mongoose.Schema({
   userId: { type: mongoose.Schema.Types.ObjectId, ref: 'User', default: null }, 
   shopId: { type: mongoose.Schema.Types.ObjectId, ref: 'Shop', default: null }, 
@@ -128,12 +127,40 @@ const notificationSchema = new mongoose.Schema({
 const Notification = mongoose.model("Notification", notificationSchema);
 
 // ==========================================
+// 🚀 ONESIGNAL PUSH NOTIFICATION HELPER
+// ==========================================
+const sendPushNotification = async (targetUserId, title, message) => {
+  const ONE_SIGNAL_APP_ID = "1da2e78d-0874-4965-a895-42c9237ee92b"; 
+  const ONE_SIGNAL_API_KEY = "26vkocoebe75v5dljzlncxcnx"; 
+
+  try {
+    const response = await fetch("https://onesignal.com/api/v1/notifications", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json; charset=utf-8",
+        "Authorization": `Basic ${ONE_SIGNAL_API_KEY}`
+      },
+      body: JSON.stringify({
+        app_id: ONE_SIGNAL_APP_ID,
+        include_external_user_ids: [targetUserId.toString()], // Targets exact MongoDB _id
+        headings: { en: title },
+        contents: { en: message },
+      })
+    });
+    const data = await response.json();
+    console.log("Push Sent Result:", data);
+  } catch (err) {
+    console.error("OneSignal Error:", err);
+  }
+};
+
+// ==========================================
 // 📮 ROUTES
 // ==========================================
 
 app.get("/ping", (req, res) => res.send("PackItOut Server is ALIVE! 🟢"));
 
-// --- NOTIFICATION ROUTES (NEW) ---
+// --- NOTIFICATION ROUTES ---
 app.get("/notifications/user/:userId", async (req, res) => {
   try { res.json(await Notification.find({ userId: req.params.userId }).sort({ createdAt: -1 }).limit(20)); } 
   catch (err) { res.status(500).json({ error: err.message }); }
@@ -195,12 +222,19 @@ app.post("/orders", async (req, res) => {
       await Parchi.updateOne({ imageUrl: req.body.imageUrl }, { $set: { status: 'processed' } });
     }
     
-    // 👇 NEW: Notify Shop of new order
+    // Save to DB Bell Notification
     await Notification.create({ 
       shopId: o.shopId, 
       title: "New Order! 🚀", 
       message: `Order #${o._id.toString().slice(-5).toUpperCase()} received for ₹${o.totalAmount}` 
     });
+
+    // 📱 PUSH TO MOBILE APP
+    await sendPushNotification(
+      o.shopId, 
+      "New Order! 🚀", 
+      `Order #${o._id.toString().slice(-5).toUpperCase()} received for ₹${o.totalAmount}`
+    );
 
     res.json(o); 
   } catch (err) { res.status(500).json({ error: err.message }); }
@@ -219,12 +253,19 @@ app.patch("/orders/:id", async (req, res) => {
     order.status = req.body.status;
     await order.save();
 
-    // 👇 NEW: Notify User of status change
+    // Save to DB Bell Notification
     await Notification.create({ 
       userId: order.userId, 
       title: "Order Update 📦", 
       message: `Your order is now: ${req.body.status}` 
     });
+
+    // 📱 PUSH TO MOBILE APP
+    await sendPushNotification(
+      order.userId, 
+      "Order Update 📦", 
+      `Your order is now: ${req.body.status}`
+    );
 
     res.json(order);
   } catch (err) { res.status(500).json({ error: err.message }); }
@@ -348,4 +389,4 @@ app.patch("/master-products/:id", async (req, res) => {
 // 🚀 START SERVER
 // ==========================================
 app.listen(8080, () => console.log("🚀 Server running on port 8080"));
-           
+        
