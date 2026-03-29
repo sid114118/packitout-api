@@ -262,8 +262,21 @@ app.post("/master-products", async (req, res) => {
 
 app.get("/master-products", async (req, res) => res.json(await MasterProduct.find()));
 
+// 👇 ADDED THIS NEW PATCH ROUTE TO EDIT EXISTING PRODUCTS 👇
+app.patch("/master-products/:id", async (req, res) => {
+  try {
+    let updateData = { ...req.body };
+    if (updateData.mrp) updateData.mrp = Number(updateData.mrp);
+    if (updateData.searchTags && typeof updateData.searchTags === 'string') {
+      updateData.searchTags = updateData.searchTags.split(',').map(t => t.trim());
+    }
+    const updatedProduct = await MasterProduct.findByIdAndUpdate(req.params.id, updateData, { new: true });
+    res.json(updatedProduct);
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
 // ==========================================
 // 🚀 START SERVER
 // ==========================================
 app.listen(8080, () => console.log("🚀 Server running on port 8080"));
-           
+    
