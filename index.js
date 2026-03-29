@@ -49,9 +49,24 @@ const shopSchema = new mongoose.Schema({
 });
 const Shop = mongoose.model("Shop", shopSchema);
 
+// 👇 UPGRADED MASTER PRODUCT SCHEMA 👇
 const masterProductSchema = new mongoose.Schema({ 
-  name: String, brand: String, category: String, mrp: Number, 
-  qnty: String, emoji: String, image: String, searchTags: [String] 
+  name: String, 
+  brand: String, 
+  category: String, 
+  mrp: Number, 
+  qnty: String, 
+  emoji: String, 
+  image: String, 
+  searchTags: [String],
+  // NEW PREMIUM FIELDS
+  description: { type: String, default: "" },
+  manufacturer: { type: String, default: "" },
+  energy: { type: String, default: "" },
+  protein: { type: String, default: "" },
+  carbs: { type: String, default: "" },
+  sugar: { type: String, default: "" },
+  fat: { type: String, default: "" }
 });
 const MasterProduct = mongoose.model("MasterProduct", masterProductSchema);
 
@@ -210,7 +225,6 @@ app.get("/shops/all/:pincode", async (req, res) => {
   catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// 🚨 THIS IS THE ROUTE THAT WAS MISSING! 
 app.get("/shops/:id/menu", async (req, res) => {
   try { res.json(await Shop.findById(req.params.id).populate('inventory.product')); } 
   catch (err) { res.status(500).json({ error: err.message }); }
@@ -252,3 +266,4 @@ app.get("/master-products", async (req, res) => res.json(await MasterProduct.fin
 // 🚀 START SERVER
 // ==========================================
 app.listen(8080, () => console.log("🚀 Server running on port 8080"));
+           
