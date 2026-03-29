@@ -35,16 +35,41 @@ mongoose.connect(MONGO_URI)
 // 🏗️ SCHEMAS
 // ==========================================
 
+// 👇 ULTIMATE SHOP SCHEMA (Hybrid Inventory & Legal Details) 👇
 const shopSchema = new mongoose.Schema({ 
+  // 1. Basic Info
   name: String, 
-  pincode: String, 
+  ownerName: { type: String, default: "" },      
+  fullAddress: { type: String, default: "" },    
+  operatingHours: { type: String, default: "09:00 AM - 10:00 PM" }, 
+  shopImage: { type: String, default: "" },  
   phone: { type: String, unique: true }, 
-  password: { type: String, required: true }, 
+  password: { type: String, required: true },
+  
+  // 2. Logistics & Status 
+  pincode: String, 
+  serviceablePincodes: { type: [String], default: [] }, 
   isOpen: { type: Boolean, default: true },
+  isAcceptingOrders: { type: Boolean, default: true },
+
+  // 3. Legal & Financial 
+  fssai: { type: String, default: "" },          
+  gst: { type: String, default: "" },            
+  panNumber: { type: String, default: "" },      
+  upiId: { type: String, default: "" },          
+  
+  // 4. Trust Metrics 
+  rating: { type: Number, default: 5.0 },        
+  totalOrdersFulfilled: { type: Number, default: 0 }, 
+
+  // 5. 📦 Hybrid Inventory System Settings
+  inventoryMode: { type: String, enum: ['manual', 'stock_count'], default: 'manual' },
+
   inventory: [{ 
     product: { type: mongoose.Schema.Types.ObjectId, ref: 'MasterProduct' },
     sellingPrice: Number, 
-    inStock: { type: Boolean, default: true }
+    stockCount: { type: Number, default: 0 },    // Used if mode is 'stock_count'
+    inStock: { type: Boolean, default: true }    // Used if mode is 'manual'
   }] 
 });
 const Shop = mongoose.model("Shop", shopSchema);
@@ -247,6 +272,14 @@ app.post("/shops/:shopId/inventory", async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
+// 👇 NEW: Admin Edit Shop Route
+app.patch("/shops/:id/admin-edit", async (req, res) => {
+  try {
+    const updatedShop = await Shop.findByIdAndUpdate(req.params.id, req.body, { new: true });
+    res.json(updatedShop);
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
 app.patch("/shops/:id", async (req, res) => {
   try { res.json(await Shop.findByIdAndUpdate(req.params.id, req.body, { new: true }).populate('inventory.product')); } 
   catch (err) { res.status(500).json({ error: err.message }); }
@@ -262,7 +295,6 @@ app.post("/master-products", async (req, res) => {
 
 app.get("/master-products", async (req, res) => res.json(await MasterProduct.find()));
 
-// 👇 ADDED THIS NEW PATCH ROUTE TO EDIT EXISTING PRODUCTS 👇
 app.patch("/master-products/:id", async (req, res) => {
   try {
     let updateData = { ...req.body };
@@ -279,4 +311,4 @@ app.patch("/master-products/:id", async (req, res) => {
 // 🚀 START SERVER
 // ==========================================
 app.listen(8080, () => console.log("🚀 Server running on port 8080"));
-    
+                                                                                             
