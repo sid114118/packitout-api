@@ -63,7 +63,14 @@ const shopSchema = new mongoose.Schema({
     product: { type: mongoose.Schema.Types.ObjectId, ref: 'MasterProduct' },
     sellingPrice: Number, 
     stockCount: { type: Number, default: 0 },    
-    inStock: { type: Boolean, default: true }    
+    inStock: { type: Boolean, default: true },
+    
+    // 👇 NEW: BULK DISCOUNT LOGIC (Buy 2 for ₹75, etc.)
+    bulkOffer: {
+      isActive: { type: Boolean, default: false },
+      buyQty: { type: Number, default: 0 },
+      offerPrice: { type: Number, default: 0 }
+    }
   }] 
 });
 const Shop = mongoose.model("Shop", shopSchema);
@@ -83,7 +90,16 @@ const masterProductSchema = new mongoose.Schema({
   protein: { type: String, default: "" },
   carbs: { type: String, default: "" },
   sugar: { type: String, default: "" },
-  fat: { type: String, default: "" }
+  fat: { type: String, default: "" },
+
+  // 👇 NEW: MULTIPLE QUANTITIES (VARIANTS) e.g., "COKE" groups all sizes together
+  itemGroupId: { type: String, default: "" },
+
+  // 👇 NEW: FREQUENTLY BOUGHT TOGETHER (Cross-Selling)
+  relatedProducts: [{ type: mongoose.Schema.Types.ObjectId, ref: 'MasterProduct' }],
+
+  // 👇 NEW: OUT OF STOCK SUBSTITUTES
+  substitutes: [{ type: mongoose.Schema.Types.ObjectId, ref: 'MasterProduct' }]
 });
 const MasterProduct = mongoose.model("MasterProduct", masterProductSchema);
 
@@ -389,4 +405,3 @@ app.patch("/master-products/:id", async (req, res) => {
 // 🚀 START SERVER
 // ==========================================
 app.listen(8080, () => console.log("🚀 Server running on port 8080"));
-        
