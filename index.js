@@ -118,6 +118,11 @@ const orderSchema = new mongoose.Schema({
   totalAmount: Number,
   imageUrl: { type: String, default: "" }, 
   status: { type: String, default: "Pending" }, 
+  
+  // 🌟 NEW: PAYMENT TRACKING FIELDS 🌟
+  paymentMethod: { type: String, default: "UPI" },
+  paymentStatus: { type: String, default: "Unpaid" },
+  
   createdAt: { type: Date, default: Date.now }
 });
 const Order = mongoose.model("Order", orderSchema);
