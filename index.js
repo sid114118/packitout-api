@@ -4,6 +4,7 @@ const cors = require("cors");
 const multer = require("multer");
 const cloudinary = require("cloudinary").v2;
 const fs = require("fs");
+const csv = require("csvtojson"); // 👈 NEW: Added CSV to JSON converter
 
 // ==========================================
 // 🧾 PARCHI UPLOAD PACKAGES
@@ -14,7 +15,12 @@ cloudinary.config({
   api_secret: 'Oum12kRi9FjCa5kPe0ZaEoLTAvQ' 
 });
 
+// For Parchi Image Uploads (Saves temporarily to disk)
 const upload = multer({ dest: '/tmp/' });
+
+// 👈 NEW: For CSV Bulk Uploads (Saves temporarily to RAM for extreme speed)
+const memoryUpload = multer({ storage: multer.memoryStorage() });
+
 const app = express();
 
 // 🌐 UPGRADED CORS: Prevents "Failed to Fetch" on mobile
@@ -386,6 +392,57 @@ app.patch("/shops/:id", async (req, res) => {
 });
 
 // --- MASTER PRODUCTS ---
+
+// 🚀 NEW: BULK UPLOAD CSV ROUTE
+app.post("/master-products/bulk-upload", memoryUpload.single('file'), async (req, res) => {
+  try {
+    if (!req.file) {
+      return res.status(400).json({ error: 'No CSV file was uploaded.' });
+    }
+
+    // 1. Convert the file buffer into a readable string
+    const csvString = req.file.buffer.toString('utf8');
+    
+    // 2. Turn the CSV string into an array of JSON objects
+    const jsonArray = await csv().fromString(csvString);
+
+    // 3. Clean and format the data to match your MasterProduct schema perfectly
+    const formattedProducts = jsonArray.map(row => ({
+      name: row.name,
+      brand: row.brand,
+      category: row.category,
+      mrp: Number(row.mrp) || 0, 
+      qnty: row.qnty,
+      emoji: row.emoji || "",
+      image: row.image, 
+      
+      // Convert "snack, maggi" into ["snack", "maggi"]
+      searchTags: row.searchTags ? row.searchTags.split(',').map(tag => tag.trim()) : [],
+      
+      itemGroupId: row.itemGroupId || "",
+      isVeg: String(row.isVeg).toLowerCase() === 'true',
+      
+      description: row.description || "",
+      manufacturer: row.manufacturer || "",
+      energy: row.energy || "",
+      protein: row.protein || "",
+      carbs: row.carbs || "",
+      sugar: row.sugar || "",
+      fat: row.fat || ""
+    }));
+
+    // 4. Push all products to MongoDB in one massive batch
+    await MasterProduct.insertMany(formattedProducts);
+
+    res.status(200).json({ message: `Success! Added ${formattedProducts.length} products to the catalog.` });
+    
+  } catch (error) {
+    console.error("Bulk Upload Error:", error);
+    res.status(500).json({ error: 'Failed to upload products. Check server logs.' });
+  }
+});
+
+// Standard Master Product Routes
 app.post("/master-products", async (req, res) => {
   try {
     const p = new MasterProduct({ ...req.body, mrp: Number(req.body.mrp), searchTags: req.body.searchTags?.split(',').map(t => t.trim()) });
@@ -411,3 +468,4 @@ app.patch("/master-products/:id", async (req, res) => {
 // 🚀 START SERVER
 // ==========================================
 app.listen(8080, () => console.log("🚀 Server running on port 8080"));
+    
