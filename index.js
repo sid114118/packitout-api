@@ -91,6 +91,7 @@ const masterProductSchema = new mongoose.Schema({
   carbs: { type: String, default: "" },
   sugar: { type: String, default: "" },
   fat: { type: String, default: "" },
+  isVeg: { type: Boolean, default: true },    // For the Green/Red dot UI
 
   // 👇 NEW: MULTIPLE QUANTITIES (VARIANTS) e.g., "COKE" groups all sizes together
   itemGroupId: { type: String, default: "" },
