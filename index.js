@@ -430,7 +430,9 @@ app.post("/master-products/bulk-upload", memoryUpload.single('file'), async (req
       protein: row.protein || "",
       carbs: row.carbs || "",
       sugar: row.sugar || "",
-      fat: row.fat || ""
+      fat: row.fat || "",
+      ingredients: row.ingredients || "",
+      manufactureraddress: row.manufactureraddress || ""
     }));
 
     // 4. Push all products to MongoDB in one massive batch
