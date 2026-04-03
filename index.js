@@ -198,19 +198,51 @@ app.post("/orders", async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 app.get("/orders", async (req, res) => res.json(await Order.find().populate('userId').populate('shopId').sort({createdAt: -1})));
+
+// 🛡️ THE BULLETPROOF ORDER UPDATE ROUTE
 app.patch("/orders/:id", async (req, res) => {
   try {
     const order = await Order.findById(req.params.id);
     if (!order) return res.status(404).json({ error: "Order not found" });
+    
+    // SAFE COIN CALCULATION
     if (req.body.status === "Delivered ✅" && order.status !== "Delivered ✅") {
-      await User.findByIdAndUpdate(order.userId, { $inc: { coins: Math.floor(order.totalAmount / 10) } });
+      const safeAmount = Number(order.totalAmount) || 0;
+      const earnedCoins = Math.floor(safeAmount / 10);
+      
+      // Only give coins if the user exists and the ID is valid
+      if (order.userId && mongoose.Types.ObjectId.isValid(order.userId)) {
+        await User.findByIdAndUpdate(order.userId, { $inc: { coins: earnedCoins } });
+      }
     }
+    
+    // Update the status and save!
     order.status = req.body.status;
     await order.save();
-    await Notification.create({ userId: order.userId, title: "Order Update 📦", message: `Your order is now: ${req.body.status}` });
-    await sendPushNotification(order.userId, "Order Update 📦", `Your order is now: ${req.body.status}`);
+
+    // SAFE NOTIFICATIONS
+    if (order.userId && mongoose.Types.ObjectId.isValid(order.userId)) {
+      try {
+        await Notification.create({ 
+          userId: order.userId, 
+          title: "Order Update 📦", 
+          message: `Your order is now: ${req.body.status}` 
+        });
+        await sendPushNotification(
+          order.userId, 
+          "Order Update 📦", 
+          `Your order is now: ${req.body.status}`
+        );
+      } catch (notifErr) {
+        console.log("Notification skipped:", notifErr.message);
+      }
+    }
+
     res.json(order);
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { 
+    console.error("Backend Status Update Error:", err);
+    res.status(500).json({ error: err.message }); 
+  }
 });
 
 // --- 🌟 REVIEW ROUTES (PROPERLY SEPARATED) 🌟 ---
@@ -396,4 +428,3 @@ app.patch("/master-products/:id", async (req, res) => {
 // 🚀 START SERVER
 // ==========================================
 app.listen(8080, () => console.log("🚀 Server running on port 8080"));
-  
