@@ -383,6 +383,16 @@ app.get("/reviews/product/:productId", async (req, res) => {
     res.status(500).json({ error: err.message });
   }
 });
+    // --- 🧾 GET REVIEWS FOR A SPECIFIC ORDER ---
+app.get("/reviews/order/:orderId", async (req, res) => {
+  try {
+    const reviews = await Review.find({ orderId: req.params.orderId });
+    res.json(reviews);
+  } catch (err) {
+    console.error("Fetch Order Reviews Error:", err);
+    res.status(500).json({ error: "Failed to load order reviews" });
+  }
+});
     
     
     // 5. Mark Order as Reviewed
