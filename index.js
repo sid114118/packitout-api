@@ -354,6 +354,37 @@ app.post("/reviews/order-review", async (req, res) => {
       });
     }
 
+    // Get recent reviews for a specific shop
+app.get("/reviews/shop/:shopId", async (req, res) => {
+  try {
+    const reviews = await Review.find({ 
+      targetId: req.params.shopId, 
+      targetType: 'shop' 
+    })
+    .sort({ createdAt: -1 }) // Newest first
+    .limit(10);
+    res.json(reviews);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+    // Get recent reviews for a specific product
+app.get("/reviews/product/:productId", async (req, res) => {
+  try {
+    const reviews = await Review.find({ 
+      targetId: req.params.productId, 
+      targetType: 'product' 
+    })
+    .sort({ createdAt: -1 })
+    .limit(15);
+    res.json(reviews);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+    
+    
     // 5. Mark Order as Reviewed
     await Order.findByIdAndUpdate(orderId, { $set: { isReviewed: true } });
 
