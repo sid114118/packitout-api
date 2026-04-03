@@ -165,6 +165,36 @@ app.patch("/notifications/read-all", async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
+// 🚨 ADMIN OVERRIDE PING ROUTE
+app.post("/admin/ping-shop", async (req, res) => {
+  try {
+    const { shopId, orderId } = req.body;
+    
+    // Safety check: ensure both IDs exist
+    if (!shopId || !orderId) {
+      return res.status(400).json({ error: "Missing shopId or orderId" });
+    }
+
+    const shortOrder = orderId.toString().slice(-5).toUpperCase();
+    const urgentMessage = `🚨 URGENT: Please process Order #${shortOrder} immediately! The customer is waiting.`;
+    
+    // 1. Save to database so it shows in their in-app bell
+    await Notification.create({ 
+      shopId: shopId, 
+      title: "⚠️ ADMIN ALERT", 
+      message: urgentMessage 
+    });
+    
+    // 2. Blast their phone with a push notification!
+    await sendPushNotification(shopId, "⚠️ ADMIN ALERT", urgentMessage);
+    
+    res.json({ success: true });
+  } catch (err) { 
+    console.error("Ping Error:", err);
+    res.status(500).json({ error: err.message }); 
+  }
+});
+
 // --- PARCHI ROUTES ---
 app.post("/upload-parchi", upload.single('parchiImage'), async (req, res) => {
   try {
@@ -407,13 +437,16 @@ app.post("/master-products/bulk-upload", memoryUpload.single('file'), async (req
     res.status(200).json({ message: `Success! Added ${formattedProducts.length} products to the catalog.` });
   } catch (error) { res.status(500).json({ error: 'Failed to upload products.' }); }
 });
+
 app.post("/master-products", async (req, res) => {
   try {
     const p = new MasterProduct({ ...req.body, mrp: Number(req.body.mrp), searchTags: req.body.searchTags?.split(',').map(t => t.trim()) });
     await p.save(); res.json(p);
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
+
 app.get("/master-products", async (req, res) => res.json(await MasterProduct.find()));
+
 app.patch("/master-products/:id", async (req, res) => {
   try {
     let updateData = { ...req.body };
@@ -421,10 +454,13 @@ app.patch("/master-products/:id", async (req, res) => {
     if (updateData.searchTags && typeof updateData.searchTags === 'string') updateData.searchTags = updateData.searchTags.split(',').map(t => t.trim());
     const updatedProduct = await MasterProduct.findByIdAndUpdate(req.params.id, updateData, { new: true });
     res.json(updatedProduct);
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { 
+    res.status(500).json({ error: err.message }); 
+  }
 });
 
 // ==========================================
 // 🚀 START SERVER
 // ==========================================
 app.listen(8080, () => console.log("🚀 Server running on port 8080"));
+
