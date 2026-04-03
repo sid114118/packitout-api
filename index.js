@@ -4,7 +4,7 @@ const cors = require("cors");
 const multer = require("multer");
 const cloudinary = require("cloudinary").v2;
 const fs = require("fs");
-const csv = require("csvtojson"); // 👈 NEW: Added CSV to JSON converter
+const csv = require("csvtojson"); 
 
 // ==========================================
 // 🧾 PARCHI UPLOAD PACKAGES
@@ -15,15 +15,11 @@ cloudinary.config({
   api_secret: 'Oum12kRi9FjCa5kPe0ZaEoLTAvQ' 
 });
 
-// For Parchi Image Uploads (Saves temporarily to disk)
 const upload = multer({ dest: '/tmp/' });
-
-// 👈 NEW: For CSV Bulk Uploads (Saves temporarily to RAM for extreme speed)
 const memoryUpload = multer({ storage: multer.memoryStorage() });
 
 const app = express();
 
-// 🌐 UPGRADED CORS: Prevents "Failed to Fetch" on mobile
 app.use(cors({
   origin: "*",
   methods: ["GET", "POST", "PATCH", "PUT", "DELETE"],
@@ -62,6 +58,7 @@ const shopSchema = new mongoose.Schema({
   
   rating: { type: Number, default: 5.0 },        
   totalOrdersFulfilled: { type: Number, default: 0 }, 
+  totalReviews: { type: Number, default: 0 }, // 👈 NEW: Tracks total shop reviews
 
   inventoryMode: { type: String, enum: ['manual', 'stock_count'], default: 'manual' },
 
@@ -70,8 +67,6 @@ const shopSchema = new mongoose.Schema({
     sellingPrice: Number, 
     stockCount: { type: Number, default: 0 },    
     inStock: { type: Boolean, default: true },
-    
-    // 👇 NEW: BULK DISCOUNT LOGIC (Buy 2 for ₹75, etc.)
     bulkOffer: {
       isActive: { type: Boolean, default: false },
       buyQty: { type: Number, default: 0 },
@@ -99,15 +94,9 @@ const masterProductSchema = new mongoose.Schema({
   carbs: { type: String, default: "" },
   sugar: { type: String, default: "" },
   fat: { type: String, default: "" },
-  isVeg: { type: Boolean, default: true },    // For the Green/Red dot UI
-
-  // 👇 NEW: MULTIPLE QUANTITIES (VARIANTS) e.g., "COKE" groups all sizes together
+  isVeg: { type: Boolean, default: true },   
   itemGroupId: { type: String, default: "" },
-
-  // 👇 NEW: FREQUENTLY BOUGHT TOGETHER (Cross-Selling)
   relatedProducts: [{ type: mongoose.Schema.Types.ObjectId, ref: 'MasterProduct' }],
-
-  // 👇 NEW: OUT OF STOCK SUBSTITUTES
   substitutes: [{ type: mongoose.Schema.Types.ObjectId, ref: 'MasterProduct' }]
 });
 const MasterProduct = mongoose.model("MasterProduct", masterProductSchema);
@@ -127,11 +116,11 @@ const orderSchema = new mongoose.Schema({
   totalAmount: Number,
   imageUrl: { type: String, default: "" }, 
   status: { type: String, default: "Pending" }, 
-  
-  // 🌟 NEW: PAYMENT TRACKING FIELDS 🌟
   paymentMethod: { type: String, default: "UPI" },
   paymentStatus: { type: String, default: "Unpaid" },
   
+  isReviewed: { type: Boolean, default: false }, // 👈 NEW: Prevents double reviews
+
   createdAt: { type: Date, default: Date.now }
 });
 const Order = mongoose.model("Order", orderSchema);
@@ -156,6 +145,21 @@ const notificationSchema = new mongoose.Schema({
 });
 const Notification = mongoose.model("Notification", notificationSchema);
 
+// 🌟 NEW: REVIEW SCHEMA 🌟
+const reviewSchema = new mongoose.Schema({
+  userId: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
+  userName: { type: String, required: true },
+  targetId: { type: mongoose.Schema.Types.ObjectId, required: true },
+  targetType: { type: String, enum: ['shop', 'product'], required: true },
+  rating: { type: Number, required: true, min: 1, max: 5 },
+  comment: { type: String, default: '' },
+  orderId: { type: mongoose.Schema.Types.ObjectId, ref: 'Order', required: true }
+}, { timestamps: true });
+
+// Index for fast lookups
+reviewSchema.index({ targetId: 1, targetType: 1 });
+const Review = mongoose.model("Review", reviewSchema);
+
 // ==========================================
 // 🚀 ONESIGNAL PUSH NOTIFICATION HELPER
 // ==========================================
@@ -172,7 +176,7 @@ const sendPushNotification = async (targetUserId, title, message) => {
       },
       body: JSON.stringify({
         app_id: ONE_SIGNAL_APP_ID,
-        include_external_user_ids: [targetUserId.toString()], // Targets exact MongoDB _id
+        include_external_user_ids: [targetUserId.toString()],
         headings: { en: title },
         contents: { en: message },
       })
@@ -252,14 +256,12 @@ app.post("/orders", async (req, res) => {
       await Parchi.updateOne({ imageUrl: req.body.imageUrl }, { $set: { status: 'processed' } });
     }
     
-    // Save to DB Bell Notification
     await Notification.create({ 
       shopId: o.shopId, 
       title: "New Order! 🚀", 
       message: `Order #${o._id.toString().slice(-5).toUpperCase()} received for ₹${o.totalAmount}` 
     });
 
-    // 📱 PUSH TO MOBILE APP
     await sendPushNotification(
       o.shopId, 
       "New Order! 🚀", 
@@ -283,14 +285,12 @@ app.patch("/orders/:id", async (req, res) => {
     order.status = req.body.status;
     await order.save();
 
-    // Save to DB Bell Notification
     await Notification.create({ 
       userId: order.userId, 
       title: "Order Update 📦", 
       message: `Your order is now: ${req.body.status}` 
     });
 
-    // 📱 PUSH TO MOBILE APP
     await sendPushNotification(
       order.userId, 
       "Order Update 📦", 
@@ -300,6 +300,71 @@ app.patch("/orders/:id", async (req, res) => {
     res.json(order);
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
+
+// --- 🌟 NEW: REVIEW ROUTE 🌟 ---
+app.post("/reviews/order-review", async (req, res) => {
+  try {
+    const { orderId, shop, items, userId, userName } = req.body;
+    const reviewsToInsert = [];
+
+    // 1. Process Shop Review
+    if (shop && shop.rating > 0) {
+      reviewsToInsert.push({
+        userId,
+        userName,
+        orderId,
+        targetId: shop.shopId,
+        targetType: 'shop',
+        rating: shop.rating,
+        comment: shop.reviewText || ''
+      });
+    }
+
+    // 2. Process Product Reviews
+    if (items && items.length > 0) {
+      items.forEach(item => {
+        if (item.rating > 0) {
+          reviewsToInsert.push({
+            userId,
+            userName,
+            orderId,
+            targetId: item.productId,
+            targetType: 'product',
+            rating: item.rating,
+            comment: '' 
+          });
+        }
+      });
+    }
+
+    // 3. Batch insert to database
+    if (reviewsToInsert.length > 0) {
+      await Review.insertMany(reviewsToInsert);
+    }
+
+    // 4. Update the Shop's live average rating
+    if (shop && shop.rating > 0) {
+      const allShopReviews = await Review.find({ targetId: shop.shopId, targetType: 'shop' });
+      const totalScore = allShopReviews.reduce((sum, rev) => sum + rev.rating, 0);
+      const avgRating = (totalScore / allShopReviews.length).toFixed(1);
+      
+      await Shop.findByIdAndUpdate(shop.shopId, { 
+        rating: Number(avgRating),
+        totalReviews: allShopReviews.length
+      });
+    }
+
+    // 5. Mark Order as Reviewed
+    await Order.findByIdAndUpdate(orderId, { $set: { isReviewed: true } });
+
+    res.status(200).json({ message: 'Reviews submitted successfully!' });
+
+  } catch (error) {
+    console.error("Review submission error:", error);
+    res.status(500).json({ error: 'Failed to submit reviews' });
+  }
+});
+
 
 // --- USER ROUTES ---
 app.post("/register", async (req, res) => {
@@ -395,20 +460,14 @@ app.patch("/shops/:id", async (req, res) => {
 
 // --- MASTER PRODUCTS ---
 
-// 🚀 NEW: BULK UPLOAD CSV ROUTE
+// 🚀 BULK UPLOAD CSV ROUTE
 app.post("/master-products/bulk-upload", memoryUpload.single('file'), async (req, res) => {
   try {
-    if (!req.file) {
-      return res.status(400).json({ error: 'No CSV file was uploaded.' });
-    }
+    if (!req.file) return res.status(400).json({ error: 'No CSV file was uploaded.' });
 
-    // 1. Convert the file buffer into a readable string
     const csvString = req.file.buffer.toString('utf8');
-    
-    // 2. Turn the CSV string into an array of JSON objects
     const jsonArray = await csv().fromString(csvString);
 
-    // 3. Clean and format the data to match your MasterProduct schema perfectly
     const formattedProducts = jsonArray.map(row => ({
       name: row.name,
       brand: row.brand,
@@ -417,13 +476,9 @@ app.post("/master-products/bulk-upload", memoryUpload.single('file'), async (req
       qnty: row.qnty,
       emoji: row.emoji || "",
       image: row.image, 
-      
-      // Convert "snack, maggi" into ["snack", "maggi"]
       searchTags: row.searchTags ? row.searchTags.split(',').map(tag => tag.trim()) : [],
-      
       itemGroupId: row.itemGroupId || "",
       isVeg: String(row.isVeg).toLowerCase() === 'true',
-      
       description: row.description || "",
       manufacturer: row.manufacturer || "",
       energy: row.energy || "",
@@ -435,9 +490,7 @@ app.post("/master-products/bulk-upload", memoryUpload.single('file'), async (req
       manufactureraddress: row.manufactureraddress || ""
     }));
 
-    // 4. Push all products to MongoDB in one massive batch
     await MasterProduct.insertMany(formattedProducts);
-
     res.status(200).json({ message: `Success! Added ${formattedProducts.length} products to the catalog.` });
     
   } catch (error) {
@@ -446,7 +499,6 @@ app.post("/master-products/bulk-upload", memoryUpload.single('file'), async (req
   }
 });
 
-// Standard Master Product Routes
 app.post("/master-products", async (req, res) => {
   try {
     const p = new MasterProduct({ ...req.body, mrp: Number(req.body.mrp), searchTags: req.body.searchTags?.split(',').map(t => t.trim()) });
@@ -472,4 +524,4 @@ app.patch("/master-products/:id", async (req, res) => {
 // 🚀 START SERVER
 // ==========================================
 app.listen(8080, () => console.log("🚀 Server running on port 8080"));
-    
+      
