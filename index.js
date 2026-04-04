@@ -170,7 +170,6 @@ app.post("/admin/ping-shop", async (req, res) => {
   try {
     const { shopId, orderId } = req.body;
     
-    // Safety check: ensure both IDs exist
     if (!shopId || !orderId) {
       return res.status(400).json({ error: "Missing shopId or orderId" });
     }
@@ -178,14 +177,12 @@ app.post("/admin/ping-shop", async (req, res) => {
     const shortOrder = orderId.toString().slice(-5).toUpperCase();
     const urgentMessage = `🚨 URGENT: Please process Order #${shortOrder} immediately! The customer is waiting.`;
     
-    // 1. Save to database so it shows in their in-app bell
     await Notification.create({ 
       shopId: shopId, 
       title: "⚠️ ADMIN ALERT", 
       message: urgentMessage 
     });
     
-    // 2. Blast their phone with a push notification!
     await sendPushNotification(shopId, "⚠️ ADMIN ALERT", urgentMessage);
     
     res.json({ success: true });
@@ -235,22 +232,18 @@ app.patch("/orders/:id", async (req, res) => {
     const order = await Order.findById(req.params.id);
     if (!order) return res.status(404).json({ error: "Order not found" });
     
-    // SAFE COIN CALCULATION
     if (req.body.status === "Delivered ✅" && order.status !== "Delivered ✅") {
       const safeAmount = Number(order.totalAmount) || 0;
       const earnedCoins = Math.floor(safeAmount / 10);
       
-      // Only give coins if the user exists and the ID is valid
       if (order.userId && mongoose.Types.ObjectId.isValid(order.userId)) {
         await User.findByIdAndUpdate(order.userId, { $inc: { coins: earnedCoins } });
       }
     }
     
-    // Update the status and save!
     order.status = req.body.status;
     await order.save();
 
-    // SAFE NOTIFICATIONS
     if (order.userId && mongoose.Types.ObjectId.isValid(order.userId)) {
       try {
         await Notification.create({ 
@@ -275,9 +268,7 @@ app.patch("/orders/:id", async (req, res) => {
   }
 });
 
-// --- 🌟 REVIEW ROUTES (PROPERLY SEPARATED) 🌟 ---
-
-// 1. Submit Order Review
+// --- 🌟 REVIEW ROUTES ---
 app.post("/reviews/order-review", async (req, res) => {
   try {
     const { orderId, shop, items, userId, userName } = req.body;
@@ -315,7 +306,6 @@ app.post("/reviews/order-review", async (req, res) => {
   }
 });
 
-// 2. Get Shop Reviews
 app.get("/reviews/shop/:shopId", async (req, res) => {
   try {
     const reviews = await Review.find({ targetId: req.params.shopId, targetType: 'shop' }).sort({ createdAt: -1 }).limit(10);
@@ -323,7 +313,6 @@ app.get("/reviews/shop/:shopId", async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// 3. Get Product Reviews
 app.get("/reviews/product/:productId", async (req, res) => {
   try {
     const reviews = await Review.find({ targetId: req.params.productId, targetType: 'product' }).sort({ createdAt: -1 }).limit(15);
@@ -331,7 +320,6 @@ app.get("/reviews/product/:productId", async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// 4. Get Reviews for a Specific Order (EXTRA SAFE VERSION)
 app.get("/reviews/order/:orderId", async (req, res) => {
   try {
     const { orderId } = req.params;
@@ -421,22 +409,6 @@ app.patch("/shops/:id", async (req, res) => {
 });
 
 // --- MASTER PRODUCTS ---
-app.post("/master-products/bulk-upload", memoryUpload.single('file'), async (req, res) => {
-  try {
-    if (!req.file) return res.status(400).json({ error: 'No CSV file was uploaded.' });
-    const jsonArray = await csv().fromString(req.file.buffer.toString('utf8'));
-    const formattedProducts = jsonArray.map(row => ({
-      name: row.name, brand: row.brand, category: row.category, mrp: Number(row.mrp) || 0, qnty: row.qnty,
-      emoji: row.emoji || "", image: row.image, searchTags: row.searchTags ? row.searchTags.split(',').map(tag => tag.trim()) : [],
-      itemGroupId: row.itemGroupId || "", isVeg: String(row.isVeg).toLowerCase() === 'true',
-      description: row.description || "", manufacturer: row.manufacturer || "", energy: row.energy || "",
-      protein: row.protein || "", carbs: row.carbs || "", sugar: row.sugar || "", fat: row.fat || "",
-      ingredients: row.ingredients || "", manufactureraddress: row.manufactureraddress || ""
-    }));
-    await MasterProduct.insertMany(formattedProducts);
-    res.status(200).json({ message: `Success! Added ${formattedProducts.length} products to the catalog.` });
-  } catch (error) { res.status(500).json({ error: 'Failed to upload products.' }); }
-});
 
 app.post("/master-products", async (req, res) => {
   try {
@@ -446,6 +418,41 @@ app.post("/master-products", async (req, res) => {
 });
 
 app.get("/master-products", async (req, res) => res.json(await MasterProduct.find()));
+
+// ⚠️ THE KILL SWITCH: PURGE ALL PRODUCTS (For Pydroid Script)
+// Note: Placed above /:id to ensure Express routes it correctly
+app.delete("/master-products/purge-all", async (req, res) => {
+  try {
+    const masterResult = await MasterProduct.deleteMany({});
+    
+    // Wipe them from all shop inventories too so your React app doesn't crash trying to load deleted products
+    await Shop.updateMany({}, { $set: { inventory: [] } });
+
+    res.json({ 
+      message: "🧹 Master Database & Shop Inventories wiped clean!", 
+      deletedCount: masterResult.deletedCount
+    });
+  } catch (error) {
+    res.status(500).json({ error: "Failed to purge database." });
+  }
+});
+
+// 🗑️  DELETE A SINGLE PRODUCT (For Admin UI)
+app.delete("/master-products/:id", async (req, res) => {
+  try {
+    const deletedProduct = await MasterProduct.findByIdAndDelete(req.params.id);
+    if (!deletedProduct) {
+      return res.status(404).json({ error: "Product not found." });
+    }
+    
+    // Pull this product from all Shop Inventories here so it doesn't leave ghost items
+    await Shop.updateMany({}, { $pull: { inventory: { product: req.params.id } } });
+
+    res.json({ message: "Product deleted successfully!" });
+  } catch (err) { 
+    res.status(500).json({ error: err.message }); 
+  }
+});
 
 app.patch("/master-products/:id", async (req, res) => {
   try {
@@ -459,8 +466,62 @@ app.patch("/master-products/:id", async (req, res) => {
   }
 });
 
+// 🌟 UPDATED BULK UPLOAD WITH QC GATEKEEPER 🌟
+app.post("/master-products/bulk-upload", memoryUpload.single('file'), async (req, res) => {
+  try {
+    if (!req.file) return res.status(400).json({ error: 'No CSV file was uploaded.' });
+    const jsonArray = await csv().fromString(req.file.buffer.toString('utf8'));
+    
+    const formattedProducts = [];
+    let skippedCount = 0;
+
+    jsonArray.forEach((row) => {
+      // THE QC GATEKEEPER: Reject if missing critical data
+      if (!row.name || !row.mrp || (!row.image && !row.emoji)) {
+        skippedCount++;
+        return; // Skip this product
+      }
+
+      formattedProducts.push({
+        name: row.name, 
+        brand: row.brand || "Generic", 
+        category: row.category || "Uncategorized", 
+        mrp: Number(row.mrp) || 0, 
+        qnty: row.qnty || "1 unit",
+        emoji: row.emoji || "", 
+        image: row.image || "", 
+        searchTags: row.searchTags ? row.searchTags.split(',').map(tag => tag.trim()) : [],
+        itemGroupId: row.itemGroupId || "", 
+        isVeg: String(row.isVeg).toLowerCase() === 'true',
+        description: row.description || "", 
+        manufacturer: row.manufacturer || "", 
+        energy: row.energy || "",
+        protein: row.protein || "", 
+        carbs: row.carbs || "", 
+        sugar: row.sugar || "", 
+        fat: row.fat || "",
+        ingredients: row.ingredients || "", 
+        manufactureraddress: row.manufactureraddress || ""
+      });
+    });
+
+    if (formattedProducts.length > 0) {
+      await MasterProduct.insertMany(formattedProducts);
+    }
+    
+    res.status(200).json({ 
+      message: `Success! Added ${formattedProducts.length} products to the catalog.`,
+      skipped: skippedCount > 0 ? `Skipped ${skippedCount} items due to missing data.` : "All items passed QC."
+    });
+  } catch (error) { 
+    res.status(500).json({ error: 'Failed to upload products.' }); 
+  }
+});
+
 // ==========================================
 // 🚀 START SERVER
 // ==========================================
-app.listen(8080, () => console.log("🚀 Server running on port 8080"));
-
+const PORT = process.env.PORT || 5000;
+app.listen(PORT, () => {
+  console.log(`🚀 Server running on port ${PORT}`);
+});
