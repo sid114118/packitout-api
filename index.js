@@ -518,6 +518,57 @@ app.post("/master-products/bulk-upload", memoryUpload.single('file'), async (req
   }
 });
 
+
+// ==========================================
+// ⚡ DYNAMIC BULK IMPORT ROUTE
+// ==========================================
+app.post("/shops/:shopId/bulk-import", async (req, res) => {
+  try {
+    const { shopId } = req.params;
+    
+    // 🚀 Grab the dynamic discount from the frontend (defaults to 0 if not sent)
+    const discountPercent = Number(req.body.discountPercent) || 0;
+
+    // 1. Fetch ALL Master Products
+    const masterProducts = await MasterProduct.find({});
+    
+    if (!masterProducts || masterProducts.length === 0) {
+      return res.status(400).json({ error: "Master catalog is empty!" });
+    }
+
+    // 2. Format them for your Shop.inventory schema with the dynamic discount
+    const newInventoryArray = masterProducts.map(product => {
+      const baseMrp = Number(product.mrp) || 0;
+      
+      // 🧮 Math: If input is 10%, multiplier becomes 0.90
+      const discountMultiplier = (100 - discountPercent) / 100; 
+      const discountedPrice = Math.floor(baseMrp * discountMultiplier); 
+
+      return {
+        product: product._id,         // References MasterProduct
+        sellingPrice: discountedPrice, // Dynamically discounted price
+        stockCount: 100,               
+        inStock: true                  
+      };
+    });
+
+    // 3. Completely replace the shop's existing inventory array
+    await Shop.findByIdAndUpdate(shopId, { 
+      $set: { inventory: newInventoryArray } 
+    });
+
+    res.status(200).json({ 
+      success: true,
+      message: `Successfully imported ${newInventoryArray.length} products with a ${discountPercent}% discount!` 
+    });
+
+  } catch (error) {
+    console.error("Bulk Import Error:", error);
+    res.status(500).json({ error: "Failed to bulk import products." });
+  }
+});
+
+
 // ==========================================
 // 🚀 START SERVER
 // ==========================================
