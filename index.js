@@ -1,10 +1,18 @@
+// Load .env first so process.env values are available everywhere below.
+try { require("dotenv").config(); } catch (e) { /* dotenv optional in production */ }
+
 const express = require("express");
 const mongoose = require("mongoose");
 const cors = require("cors");
 const multer = require("multer");
 const cloudinary = require("cloudinary").v2;
 const fs = require("fs");
-const csv = require("csvtojson"); 
+const csv = require("csvtojson");
+const { GoogleGenerativeAI } = require("@google/generative-ai");
+
+const genAI = process.env.GEMINI_API_KEY
+  ? new GoogleGenerativeAI(process.env.GEMINI_API_KEY)
+  : null;
 
 // ==========================================
 // 🧾 PARCHI UPLOAD PACKAGES
@@ -202,6 +210,151 @@ app.post("/upload-parchi", upload.single('parchiImage'), async (req, res) => {
     await newParchi.save();
     res.status(200).json({ success: true, parchi: newParchi });
   } catch (error) { res.status(500).json({ error: "Upload failed." }); }
+});
+
+// 🤖 AI PARCHI EXTRACTION — reads handwritten list with Gemini and matches to catalog
+app.post("/extract-parchi", upload.single('parchiImage'), async (req, res) => {
+  if (!genAI) return res.status(500).json({ error: "GEMINI_API_KEY not configured on the server." });
+  if (!req.file) return res.status(400).json({ error: "No image." });
+
+  try {
+    const shopId = req.body.shopId && mongoose.isValidObjectId(req.body.shopId) ? req.body.shopId : null;
+
+    // Build the catalog the model can match against. Prefer the shop's actual inventory
+    // (so prices reflect that shop), fall back to master catalog otherwise.
+    let catalogForPrompt = [];
+    let priceLookup = {};
+
+    if (shopId) {
+      const shop = await Shop.findById(shopId).populate('inventory.product');
+      if (shop && shop.inventory) {
+        for (const inv of shop.inventory) {
+          if (!inv.product || inv.inStock === false) continue;
+          const p = inv.product;
+          catalogForPrompt.push({
+            id: p._id.toString(),
+            name: p.name,
+            brand: p.brand || "",
+            qnty: p.qnty || "",
+            category: p.category || "",
+          });
+          priceLookup[p._id.toString()] = {
+            sellingPrice: inv.sellingPrice || p.mrp || 0,
+            mrp: p.mrp || 0,
+            image: p.image || "",
+            emoji: p.emoji || "",
+          };
+        }
+      }
+    }
+    if (catalogForPrompt.length === 0) {
+      const all = await MasterProduct.find({}).limit(2000).lean();
+      for (const p of all) {
+        catalogForPrompt.push({
+          id: p._id.toString(),
+          name: p.name,
+          brand: p.brand || "",
+          qnty: p.qnty || "",
+          category: p.category || "",
+        });
+        priceLookup[p._id.toString()] = {
+          sellingPrice: p.mrp || 0,
+          mrp: p.mrp || 0,
+          image: p.image || "",
+          emoji: p.emoji || "",
+        };
+      }
+    }
+
+    const imageBuffer = fs.readFileSync(req.file.path);
+    const imagePart = {
+      inlineData: {
+        data: imageBuffer.toString('base64'),
+        mimeType: req.file.mimetype || 'image/jpeg',
+      }
+    };
+
+    const prompt = `You are reading a customer's handwritten Indian shopping list (called a "parchi"). The text may be in Hindi (Devanagari), English, or a mix. Common Indian grocery items include atta, dal, doodh (milk), chini (sugar), namak (salt), chai, biscuit, maggi, sabji, anda (egg), tel (oil), masala, etc.
+
+Below is the available product catalog at this shop, as a JSON array. Each entry has id, name, brand, qnty (pack size), category.
+${JSON.stringify(catalogForPrompt)}
+
+For each LINE on the parchi:
+1. Read the item the customer wrote (translate Hindi → English meaning if needed).
+2. Find the BEST matching product in the catalog above. Match on item name, brand if mentioned, and pack size if mentioned. If multiple products fit, pick the closest pack size.
+3. If no good match exists, set productId to null.
+4. Read the quantity the customer wants (e.g. "2 packets" → qty 2, "1 dozen" → qty 12, default 1 if unclear).
+
+Return ONLY a JSON array — no prose, no markdown fences. Shape:
+[
+  { "rawText": "<what was written>", "productId": "<id from catalog or null>", "qty": <integer>, "note": "<short reason for the match or why it failed>" }
+]`;
+
+    const model = genAI.getGenerativeModel({
+      model: "gemini-2.0-flash",
+      generationConfig: {
+        responseMimeType: "application/json",
+        temperature: 0.2,
+      },
+    });
+
+    const result = await model.generateContent([prompt, imagePart]);
+    const text = result.response.text();
+
+    // Clean up the temp file
+    try { fs.unlinkSync(req.file.path); } catch (e) {}
+
+    let extracted;
+    try {
+      extracted = JSON.parse(text);
+    } catch (e) {
+      console.error("Gemini returned non-JSON:", text);
+      return res.status(502).json({ error: "AI response could not be parsed.", raw: text });
+    }
+    if (!Array.isArray(extracted)) extracted = [];
+
+    // Enrich each item with the matched product details + shop price
+    const catalogById = {};
+    for (const c of catalogForPrompt) catalogById[c.id] = c;
+
+    const items = extracted.map((line) => {
+      const productId = line.productId && catalogById[line.productId] ? line.productId : null;
+      const qty = Number.isFinite(line.qty) ? Math.max(1, Math.floor(line.qty)) : 1;
+      if (productId) {
+        const c = catalogById[productId];
+        const price = priceLookup[productId] || {};
+        return {
+          rawText: line.rawText || "",
+          matched: true,
+          qty,
+          note: line.note || "",
+          product: {
+            _id: productId,
+            name: c.name,
+            brand: c.brand,
+            qnty: c.qnty,
+            mrp: price.mrp,
+            sellingPrice: price.sellingPrice,
+            image: price.image,
+            emoji: price.emoji,
+          },
+        };
+      }
+      return {
+        rawText: line.rawText || "",
+        matched: false,
+        qty,
+        note: line.note || "no match found",
+        product: null,
+      };
+    });
+
+    res.json({ success: true, items });
+  } catch (err) {
+    console.error("Parchi extraction error:", err);
+    try { if (req.file) fs.unlinkSync(req.file.path); } catch (e) {}
+    res.status(500).json({ error: err.message || "Extraction failed." });
+  }
 });
 app.get("/parchis/:shopId", async (req, res) => {
   try { res.json(await Parchi.find({ shopId: req.params.shopId, status: 'pending' }).sort({createdAt: -1})); } catch(err) { res.status(500).json({ error: err.message }); }
