@@ -65,18 +65,19 @@ const shopSchema = new mongoose.Schema({
   totalOrdersFulfilled: { type: Number, default: 0 }, 
   totalReviews: { type: Number, default: 0 }, 
   inventoryMode: { type: String, enum: ['manual', 'stock_count'], default: 'manual' },
-  inventory: [{ 
+  inventory: [{
     product: { type: mongoose.Schema.Types.ObjectId, ref: 'MasterProduct' },
-    sellingPrice: Number, 
-    stockCount: { type: Number, default: 0 },    
+    sellingPrice: Number,
+    stockCount: { type: Number, default: 0 },
     inStock: { type: Boolean, default: true },
     bulkOffer: {
       isActive: { type: Boolean, default: false },
       buyQty: { type: Number, default: 0 },
       offerPrice: { type: Number, default: 0 }
     }
-  }] 
+  }]
 });
+shopSchema.index({ pincode: 1 });
 const Shop = mongoose.model("Shop", shopSchema);
 
 const masterProductSchema = new mongoose.Schema({ 
@@ -100,26 +101,33 @@ const User = mongoose.model("User", userSchema);
 
 const orderSchema = new mongoose.Schema({
   userId: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
-  shopId: { type: mongoose.Schema.Types.ObjectId, ref: 'Shop' }, 
-  items: Array, totalAmount: Number, imageUrl: { type: String, default: "" }, 
+  shopId: { type: mongoose.Schema.Types.ObjectId, ref: 'Shop' },
+  items: Array, totalAmount: Number, imageUrl: { type: String, default: "" },
   status: { type: String, default: "Pending" }, paymentMethod: { type: String, default: "UPI" },
-  paymentStatus: { type: String, default: "Unpaid" }, isReviewed: { type: Boolean, default: false }, 
+  paymentStatus: { type: String, default: "Unpaid" }, isReviewed: { type: Boolean, default: false },
   createdAt: { type: Date, default: Date.now }
 });
+orderSchema.index({ userId: 1, createdAt: -1 });
+orderSchema.index({ shopId: 1, createdAt: -1 });
 const Order = mongoose.model("Order", orderSchema);
 
 const parchiSchema = new mongoose.Schema({
   userId: String, shopId: String, customerName: String, imageUrl: String,
   status: { type: String, default: 'pending' }, createdAt: { type: Date, default: Date.now }
 });
+parchiSchema.index({ shopId: 1, status: 1, createdAt: -1 });
+parchiSchema.index({ userId: 1, status: 1, createdAt: -1 });
+parchiSchema.index({ status: 1, createdAt: -1 });
 const Parchi = mongoose.model("Parchi", parchiSchema);
 
 const notificationSchema = new mongoose.Schema({
-  userId: { type: mongoose.Schema.Types.ObjectId, ref: 'User', default: null }, 
-  shopId: { type: mongoose.Schema.Types.ObjectId, ref: 'Shop', default: null }, 
+  userId: { type: mongoose.Schema.Types.ObjectId, ref: 'User', default: null },
+  shopId: { type: mongoose.Schema.Types.ObjectId, ref: 'Shop', default: null },
   title: String, message: String, isRead: { type: Boolean, default: false },
   createdAt: { type: Date, default: Date.now }
 });
+notificationSchema.index({ userId: 1, createdAt: -1 });
+notificationSchema.index({ shopId: 1, createdAt: -1 });
 const Notification = mongoose.model("Notification", notificationSchema);
 
 // 🌟 REVIEW SCHEMA
@@ -379,6 +387,20 @@ app.post("/orders", async (req, res) => {
 });
 app.get("/orders", async (req, res) => res.json(await Order.find().populate('userId').populate('shopId').sort({createdAt: -1})));
 
+// Slim per-user feed for the customer feed's "Buy It Again" widget. The old
+// approach was to fetch /orders (every order, every user, populated) and filter
+// client-side — this avoids the global scan and the populate join.
+app.get("/orders/user/:userId", async (req, res) => {
+  try {
+    const orders = await Order.find({ userId: req.params.userId })
+      .select('items createdAt')
+      .sort({ createdAt: -1 })
+      .limit(50)
+      .lean();
+    res.json(orders);
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
 // 🛡️ THE BULLETPROOF ORDER UPDATE ROUTE
 app.patch("/orders/:id", async (req, res) => {
   try {
@@ -538,6 +560,21 @@ app.get("/shops/all/:pincode", async (req, res) => {
 app.get("/shops/:id/menu", async (req, res) => {
   try { res.json(await Shop.findById(req.params.id).populate('inventory.product')); } catch (err) { res.status(500).json({ error: err.message }); }
 });
+// Slim variant for the customer feed/list views — strips description, ingredients,
+// manufacturer fields, nutrition, and related/substitute refs that the feed never renders.
+// ProductModal lazily refetches the full doc via GET /master-products/:id when opened.
+app.get("/shops/:id/menu/lean", async (req, res) => {
+  try {
+    const shop = await Shop.findById(req.params.id)
+      .select('name isOpen isAcceptingOrders shopImage operatingHours fullAddress pincode rating totalReviews inventoryMode inventory')
+      .populate({
+        path: 'inventory.product',
+        select: 'name brand category mrp qnty emoji image searchTags isVeg itemGroupId'
+      })
+      .lean();
+    res.json(shop);
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
 app.post("/shops/:shopId/inventory", async (req, res) => {
   try {
     const { productId, sellingPrice, inStock } = req.body;
@@ -571,6 +608,16 @@ app.post("/master-products", async (req, res) => {
 });
 
 app.get("/master-products", async (req, res) => res.json(await MasterProduct.find()));
+
+// Lazy-loaded by ProductModal so the customer feed can ship a slim product payload
+// and only fetch description/ingredients/nutrition when a user opens a product.
+app.get("/master-products/:id", async (req, res) => {
+  try {
+    const product = await MasterProduct.findById(req.params.id).lean();
+    if (!product) return res.status(404).json({ error: "Product not found." });
+    res.json(product);
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
 
 // ⚠️ THE KILL SWITCH: PURGE ALL PRODUCTS (For Pydroid Script)
 // Note: Placed above /:id to ensure Express routes it correctly
