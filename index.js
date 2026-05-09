@@ -8,10 +8,20 @@ const multer = require("multer");
 const cloudinary = require("cloudinary").v2;
 const fs = require("fs");
 const csv = require("csvtojson");
+const crypto = require("crypto");
+const bcrypt = require("bcryptjs");
+const Razorpay = require("razorpay");
 const { GoogleGenerativeAI } = require("@google/generative-ai");
 
 const genAI = process.env.GEMINI_API_KEY
   ? new GoogleGenerativeAI(process.env.GEMINI_API_KEY)
+  : null;
+
+const razorpay = (process.env.RAZORPAY_KEY_ID && process.env.RAZORPAY_KEY_SECRET)
+  ? new Razorpay({
+      key_id: process.env.RAZORPAY_KEY_ID,
+      key_secret: process.env.RAZORPAY_KEY_SECRET,
+    })
   : null;
 
 // ==========================================
@@ -105,6 +115,14 @@ const orderSchema = new mongoose.Schema({
   items: Array, totalAmount: Number, imageUrl: { type: String, default: "" },
   status: { type: String, default: "Pending" }, paymentMethod: { type: String, default: "UPI" },
   paymentStatus: { type: String, default: "Unpaid" }, isReviewed: { type: Boolean, default: false },
+  coinsUsed: { type: Number, default: 0 },
+  razorpayOrderId: { type: String, default: "" },
+  razorpayPaymentId: { type: String, default: "" },
+  razorpaySignature: { type: String, default: "" },
+  statusHistory: {
+    type: [{ status: String, at: { type: Date, default: Date.now }, _id: false }],
+    default: []
+  },
   createdAt: { type: Date, default: Date.now }
 });
 orderSchema.index({ userId: 1, createdAt: -1 });
@@ -143,6 +161,52 @@ const reviewSchema = new mongoose.Schema({
 
 reviewSchema.index({ targetId: 1, targetType: 1 });
 const Review = mongoose.model("Review", reviewSchema);
+
+// 🔐 OTP REQUEST SCHEMA
+// expiresAt has a TTL index so Mongo auto-deletes stale OTPs.
+const otpRequestSchema = new mongoose.Schema({
+  phone: { type: String, required: true, index: true },
+  otp: { type: String, required: true },
+  purpose: { type: String, enum: ['register', 'login'], default: 'register' },
+  attempts: { type: Number, default: 0 },
+  verified: { type: Boolean, default: false },
+  consumed: { type: Boolean, default: false },
+  expiresAt: { type: Date, required: true },
+  createdAt: { type: Date, default: Date.now },
+});
+otpRequestSchema.index({ expiresAt: 1 }, { expireAfterSeconds: 0 });
+const OtpRequest = mongoose.model("OtpRequest", otpRequestSchema);
+
+// ==========================================
+// 🔐 AUTH VALIDATORS, RATE LIMIT, OTP HELPER
+// ==========================================
+const validatePhone = (phone) => /^[6-9]\d{9}$/.test(String(phone || "").trim());
+const validatePincode = (pincode) => /^\d{6}$/.test(String(pincode || "").trim());
+const validatePassword = (password) => typeof password === 'string' && password.length >= 6;
+
+// Treat any password starting with $2a$/$2b$/$2y$ as a bcrypt hash. Otherwise plaintext (legacy).
+const looksHashed = (pwd) => typeof pwd === 'string' && /^\$2[aby]\$/.test(pwd);
+
+// In-memory OTP send rate limiter: 3 sends per phone per 15 minutes.
+// Single-process only — swap to Redis if you scale horizontally.
+const OTP_RATE_WINDOW_MS = 15 * 60 * 1000;
+const OTP_RATE_MAX = 3;
+const otpSendLog = new Map(); // phone -> [timestamps]
+const checkOtpRateLimit = (phone) => {
+  const now = Date.now();
+  const past = (otpSendLog.get(phone) || []).filter(t => now - t < OTP_RATE_WINDOW_MS);
+  if (past.length >= OTP_RATE_MAX) return false;
+  past.push(now);
+  otpSendLog.set(phone, past);
+  return true;
+};
+
+const SMS_PROVIDER_CONFIGURED = false; // Wire to MSG91/Firebase later by flipping this on env var.
+const sendOtpSms = async (phone, otp) => {
+  // Dev mode: log only. In production, replace with provider call (MSG91/Firebase/Twilio).
+  console.log(`[OTP][DEV] phone=${phone} otp=${otp} (no SMS provider configured — would have sent in production)`);
+  return { delivered: false, devMode: true };
+};
 
 // ==========================================
 // 🚀 ONESIGNAL PUSH NOTIFICATION HELPER
@@ -374,15 +438,141 @@ app.get("/admin/all-parchis", async (req, res) => {
   try { res.json(await Parchi.find({ status: 'pending' }).sort({ createdAt: -1 })); } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// --- ORDER ROUTES ---
-app.post("/orders", async (req, res) => { 
+// ==========================================
+// 💳 PAYMENT ROUTES (Razorpay)
+// ==========================================
+
+// Recompute the trusted cart total from the shop's current inventory.
+// Frontend prices/totals are NEVER trusted — we always recompute server-side.
+const computeTrustedTotal = async (shopId, items, coinsUsed) => {
+  const shop = await Shop.findById(shopId).populate('inventory.product');
+  if (!shop) throw new Error("Shop not found");
+
+  const priceByProductId = {};
+  for (const inv of (shop.inventory || [])) {
+    if (!inv.product) continue;
+    priceByProductId[inv.product._id.toString()] = Number(inv.sellingPrice) || Number(inv.product.mrp) || 0;
+  }
+
+  let itemTotal = 0;
+  const trustedItems = [];
+  for (const line of (items || [])) {
+    const pid = (line.productId || "").toString();
+    const qty = Math.max(1, Math.floor(Number(line.qty) || 1));
+    const price = priceByProductId[pid];
+    if (price === undefined) throw new Error(`Product ${pid} not in shop inventory`);
+    itemTotal += price * qty;
+    trustedItems.push({ productId: pid, name: line.name || "", qty, price });
+  }
+
+  // Coins: 10 coins = ₹1, capped at 10% of item total (mirrors Cart.jsx logic).
+  const safeCoinsUsed = Math.max(0, Math.floor(Number(coinsUsed) || 0));
+  const maxDiscountAllowed = itemTotal * 0.10;
+  const coinDiscount = Math.min(safeCoinsUsed / 10, maxDiscountAllowed);
+  const finalAmount = Math.max(0, Number((itemTotal - coinDiscount).toFixed(2)));
+
+  return { itemTotal, coinDiscount, finalAmount, trustedItems, coinsUsed: safeCoinsUsed };
+};
+
+app.post("/payments/create-order", async (req, res) => {
   try {
-    const o = new Order(req.body); 
-    await o.save(); 
+    if (!razorpay) return res.status(503).json({ error: "Payment gateway not configured." });
+    const { userId, shopId, items, coinsUsed } = req.body;
+    if (!userId || !shopId || !Array.isArray(items) || items.length === 0) {
+      return res.status(400).json({ error: "Missing userId, shopId, or items." });
+    }
+
+    const { finalAmount } = await computeTrustedTotal(shopId, items, coinsUsed);
+    if (finalAmount <= 0) return res.status(400).json({ error: "Order total must be greater than zero." });
+
+    const rzpOrder = await razorpay.orders.create({
+      amount: Math.round(finalAmount * 100), // paise
+      currency: "INR",
+      receipt: `rcpt_${Date.now()}_${userId.toString().slice(-6)}`,
+      notes: { userId: userId.toString(), shopId: shopId.toString() },
+    });
+
+    res.json({
+      razorpayOrderId: rzpOrder.id,
+      amount: rzpOrder.amount,
+      currency: rzpOrder.currency,
+      keyId: process.env.RAZORPAY_KEY_ID,
+      computedTotal: finalAmount,
+    });
+  } catch (err) {
+    console.error("create-order error:", err);
+    res.status(500).json({ error: err.message || "Failed to create payment order." });
+  }
+});
+
+app.post("/payments/verify", async (req, res) => {
+  try {
+    if (!razorpay) return res.status(503).json({ error: "Payment gateway not configured." });
+    const {
+      razorpay_order_id, razorpay_payment_id, razorpay_signature,
+      userId, shopId, items, paymentMethod, coinsUsed,
+    } = req.body;
+
+    if (!razorpay_order_id || !razorpay_payment_id || !razorpay_signature) {
+      return res.status(400).json({ error: "Missing payment signature fields." });
+    }
+
+    // HMAC SHA256 verification — Razorpay's prescribed signature check.
+    const expectedSignature = crypto
+      .createHmac("sha256", process.env.RAZORPAY_KEY_SECRET)
+      .update(`${razorpay_order_id}|${razorpay_payment_id}`)
+      .digest("hex");
+
+    if (expectedSignature !== razorpay_signature) {
+      return res.status(400).json({ error: "Payment signature verification failed." });
+    }
+
+    // Recompute trusted total — never trust the client.
+    const { finalAmount, trustedItems, coinsUsed: safeCoinsUsed } =
+      await computeTrustedTotal(shopId, items, coinsUsed);
+
+    const order = await Order.create({
+      userId, shopId,
+      items: trustedItems,
+      totalAmount: finalAmount,
+      paymentMethod: paymentMethod || "UPI",
+      paymentStatus: "Paid",
+      coinsUsed: safeCoinsUsed,
+      razorpayOrderId: razorpay_order_id,
+      razorpayPaymentId: razorpay_payment_id,
+      razorpaySignature: razorpay_signature,
+      statusHistory: [{ status: "Pending", at: new Date() }],
+    });
+
+    // Deduct coins after the order is safely persisted.
+    if (safeCoinsUsed > 0 && mongoose.Types.ObjectId.isValid(userId)) {
+      await User.findByIdAndUpdate(userId, { $inc: { coins: -safeCoinsUsed } });
+    }
+
+    const shortOrder = order._id.toString().slice(-5).toUpperCase();
+    await Notification.create({ shopId, title: "New Order! 🚀", message: `Order #${shortOrder} received for ₹${finalAmount}` });
+    await sendPushNotification(shopId, "New Order! 🚀", `Order #${shortOrder} received for ₹${finalAmount}`);
+
+    res.json({ success: true, order });
+  } catch (err) {
+    console.error("verify error:", err);
+    res.status(500).json({ error: err.message || "Payment verification failed." });
+  }
+});
+
+// --- ORDER ROUTES ---
+app.post("/orders", async (req, res) => {
+  try {
+    const initialStatus = req.body.status || "Pending";
+    const o = new Order({
+      ...req.body,
+      statusHistory: [{ status: initialStatus, at: new Date() }],
+    });
+    await o.save();
     if (req.body.imageUrl) await Parchi.updateOne({ imageUrl: req.body.imageUrl }, { $set: { status: 'processed' } });
     await Notification.create({ shopId: o.shopId, title: "New Order! 🚀", message: `Order #${o._id.toString().slice(-5).toUpperCase()} received for ₹${o.totalAmount}` });
     await sendPushNotification(o.shopId, "New Order! 🚀", `Order #${o._id.toString().slice(-5).toUpperCase()} received for ₹${o.totalAmount}`);
-    res.json(o); 
+    res.json(o);
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 app.get("/orders", async (req, res) => res.json(await Order.find().populate('userId').populate('shopId').sort({createdAt: -1})));
@@ -416,6 +606,9 @@ app.patch("/orders/:id", async (req, res) => {
       }
     }
     
+    if (req.body.status && req.body.status !== order.status) {
+      order.statusHistory = [...(order.statusHistory || []), { status: req.body.status, at: new Date() }];
+    }
     order.status = req.body.status;
     await order.save();
 
@@ -510,25 +703,163 @@ app.get("/reviews/order/:orderId", async (req, res) => {
   }
 });
 
+// --- AUTH / OTP ROUTES ---
+app.post("/auth/send-otp", async (req, res) => {
+  try {
+    const phone = String(req.body.phone || "").trim();
+    const purpose = req.body.purpose === 'login' ? 'login' : 'register';
+
+    if (!validatePhone(phone)) {
+      return res.status(400).json({ error: "Enter a valid 10-digit Indian mobile number." });
+    }
+    if (!checkOtpRateLimit(phone)) {
+      return res.status(429).json({ error: "Too many OTP requests. Try again in 15 minutes." });
+    }
+
+    // For registration, refuse if the number is already an account.
+    if (purpose === 'register') {
+      const existing = await User.findOne({ phone }).select('_id').lean();
+      if (existing) return res.status(409).json({ error: "Phone already registered. Please log in." });
+    }
+
+    const otp = String(Math.floor(100000 + Math.random() * 900000));
+    const expiresAt = new Date(Date.now() + 10 * 60 * 1000); // 10 min
+
+    // Wipe any prior unverified OTPs for the same phone+purpose so verify-otp finds only the latest.
+    await OtpRequest.deleteMany({ phone, purpose, verified: false });
+    await OtpRequest.create({ phone, otp, purpose, expiresAt });
+
+    const sendResult = await sendOtpSms(phone, otp);
+
+    const payload = { success: true, expiresInSeconds: 600 };
+    // Dev mode convenience: surface the OTP in the response so testing is painless.
+    // This branch is gated on SMS_PROVIDER_CONFIGURED so production can never leak it.
+    if (!SMS_PROVIDER_CONFIGURED) payload.devOtp = otp;
+    res.json(payload);
+  } catch (err) {
+    console.error("send-otp error:", err);
+    res.status(500).json({ error: "Could not send OTP." });
+  }
+});
+
+app.post("/auth/verify-otp", async (req, res) => {
+  try {
+    const phone = String(req.body.phone || "").trim();
+    const otp = String(req.body.otp || "").trim();
+    const purpose = req.body.purpose === 'login' ? 'login' : 'register';
+
+    if (!validatePhone(phone)) return res.status(400).json({ error: "Invalid phone number." });
+    if (!/^\d{6}$/.test(otp)) return res.status(400).json({ error: "Enter the 6-digit OTP." });
+
+    const record = await OtpRequest.findOne({ phone, purpose, consumed: false }).sort({ createdAt: -1 });
+    if (!record) return res.status(400).json({ error: "No OTP found. Please request a new one." });
+    if (record.expiresAt < new Date()) return res.status(400).json({ error: "OTP expired. Please request a new one." });
+    if (record.attempts >= 5) return res.status(429).json({ error: "Too many wrong attempts. Request a new OTP." });
+
+    if (record.otp !== otp) {
+      record.attempts += 1;
+      await record.save();
+      return res.status(400).json({ error: `Wrong OTP. ${5 - record.attempts} attempt(s) left.` });
+    }
+
+    record.verified = true;
+    await record.save();
+
+    // The token is the OtpRequest._id — short-lived, single-use, tied to a verified phone.
+    res.json({ success: true, verificationToken: record._id.toString() });
+  } catch (err) {
+    console.error("verify-otp error:", err);
+    res.status(500).json({ error: "Could not verify OTP." });
+  }
+});
+
 // --- USER ROUTES ---
 app.post("/register", async (req, res) => {
   try {
-    const baseName = req.body.name ? req.body.name.substring(0, 4).toUpperCase().replace(/\s/g, '') : "PACK";
+    const { name, phone, password, pincode, referredBy, verificationToken } = req.body;
+
+    if (!validatePhone(phone)) return res.status(400).json({ error: "Enter a valid 10-digit Indian mobile number." });
+    if (!validatePincode(pincode)) return res.status(400).json({ error: "Pincode must be exactly 6 digits." });
+    if (!validatePassword(password)) return res.status(400).json({ error: "Password must be at least 6 characters." });
+    if (!name || !name.trim()) return res.status(400).json({ error: "Please enter your name." });
+    if (!verificationToken) return res.status(400).json({ error: "Please verify your phone number first." });
+
+    // Verify the OTP token: must be a verified, unconsumed OtpRequest for the SAME phone.
+    if (!mongoose.Types.ObjectId.isValid(verificationToken)) {
+      return res.status(400).json({ error: "Invalid verification token." });
+    }
+    const otpRecord = await OtpRequest.findById(verificationToken);
+    if (!otpRecord || otpRecord.phone !== String(phone).trim() || otpRecord.purpose !== 'register' || !otpRecord.verified || otpRecord.consumed || otpRecord.expiresAt < new Date()) {
+      return res.status(400).json({ error: "Phone verification expired or invalid. Please request a new OTP." });
+    }
+
+    const existing = await User.findOne({ phone }).select('_id').lean();
+    if (existing) return res.status(409).json({ error: "Phone already registered. Please log in." });
+
+    const baseName = name.substring(0, 4).toUpperCase().replace(/\s/g, '') || "PACK";
     const refCode = baseName + Math.floor(1000 + Math.random() * 9000);
     let startingCoins = 0;
-    if (req.body.referredBy) {
-      const referrer = await User.findOne({ referralCode: req.body.referredBy });
+    if (referredBy) {
+      const referrer = await User.findOne({ referralCode: referredBy });
       if (referrer) { referrer.coins += 50; await referrer.save(); startingCoins = 50; }
     }
-    const u = new User({ ...req.body, referralCode: refCode, coins: startingCoins }); 
-    await u.save(); res.json(u); 
-  } catch (err) { res.status(500).json({ error: "Phone number registered." }); } 
+
+    const passwordHash = await bcrypt.hash(password, 10);
+    const u = new User({
+      name: name.trim(),
+      phone: String(phone).trim(),
+      pincode: String(pincode).trim(),
+      password: passwordHash,
+      referredBy,
+      referralCode: refCode,
+      coins: startingCoins,
+    });
+    await u.save();
+
+    // Burn the OTP so the same token cannot register a second account.
+    otpRecord.consumed = true;
+    await otpRecord.save();
+
+    const safe = u.toObject();
+    delete safe.password;
+    res.json(safe);
+  } catch (err) {
+    console.error("register error:", err);
+    res.status(500).json({ error: "Registration failed. Please try again." });
+  }
 });
+
 app.post("/login", async (req, res) => {
   try {
-    let u = await User.findOne({ phone: req.body.phone, password: req.body.password }).populate('primaryShop');
-    if (u) { res.json(u); } else { res.status(400).send("Fail"); }
-  } catch (err) { res.status(500).json({ error: err.message }); }
+    const phone = String(req.body.phone || "").trim();
+    const password = String(req.body.password || "");
+    if (!validatePhone(phone)) return res.status(400).json({ error: "Enter a valid 10-digit Indian mobile number." });
+    if (!password) return res.status(400).json({ error: "Enter your password." });
+
+    const user = await User.findOne({ phone }).populate('primaryShop');
+    if (!user) return res.status(400).json({ error: "Invalid phone or password." });
+
+    let matches = false;
+    if (looksHashed(user.password)) {
+      matches = await bcrypt.compare(password, user.password);
+    } else {
+      // Legacy plaintext path: check equality, then silently upgrade to bcrypt on success.
+      matches = user.password === password;
+      if (matches) {
+        user.password = await bcrypt.hash(password, 10);
+        await user.save();
+      }
+    }
+
+    if (!matches) return res.status(400).json({ error: "Invalid phone or password." });
+
+    const safe = user.toObject();
+    delete safe.password;
+    res.json(safe);
+  } catch (err) {
+    console.error("login error:", err);
+    res.status(500).json({ error: "Login failed. Please try again." });
+  }
 });
 app.get("/users", async (req, res) => res.json(await User.find().sort({createdAt: -1})));
 app.get("/users/:id", async (req, res) => {
