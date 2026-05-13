@@ -142,6 +142,11 @@ const notificationSchema = new mongoose.Schema({
   userId: { type: mongoose.Schema.Types.ObjectId, ref: 'User', default: null },
   shopId: { type: mongoose.Schema.Types.ObjectId, ref: 'Shop', default: null },
   title: String, message: String, isRead: { type: Boolean, default: false },
+  // orderId lets the frontend deep-link to the related order on tap.
+  // type drives the icon (order_placed | order_ready | order_delivered |
+  // order_cancelled | new_order | promo | system). Default 'order' for legacy rows.
+  orderId: { type: mongoose.Schema.Types.ObjectId, ref: 'Order', default: null },
+  type: { type: String, default: 'order' },
   createdAt: { type: Date, default: Date.now }
 });
 notificationSchema.index({ userId: 1, createdAt: -1 });
@@ -206,6 +211,37 @@ const sendOtpSms = async (phone, otp) => {
   // Dev mode: log only. In production, replace with provider call (MSG91/Firebase/Twilio).
   console.log(`[OTP][DEV] phone=${phone} otp=${otp} (no SMS provider configured — would have sent in production)`);
   return { delivered: false, devMode: true };
+};
+
+// ==========================================
+// 📣 ORDER NOTIFICATION COPY
+// ==========================================
+// Maps an order status (the exact string the shop dashboard saves) to friendly
+// title + body + type used for both the in-app bell and the OneSignal push.
+// Keeping the mapping in one place so message wording stays consistent.
+const orderNotificationFor = (status, shortId) => {
+  const id = shortId ? `#${shortId}` : '';
+  const s = String(status || '').toLowerCase();
+  if (s.includes('cancel') || s.includes('reject')) {
+    return { type: 'order_cancelled', title: 'Order Cancelled ❌', message: `Your order ${id} was cancelled. Any payment/coins will be refunded shortly.`.trim() };
+  }
+  if (s.includes('deliver')) {
+    return { type: 'order_delivered', title: 'Order Delivered ✅', message: `Your order ${id} has been delivered. Tap to rate your experience!`.trim() };
+  }
+  if (s.includes('ready') || s.includes('collect') || s.includes('pack')) {
+    return { type: 'order_ready', title: 'Order Ready 🛍️', message: `Your order ${id} is ready to collect from the shop.`.trim() };
+  }
+  if (s.includes('out for') || s.includes('on the way')) {
+    return { type: 'order_out', title: 'Out for Delivery 🛵', message: `Your order ${id} is on its way to you.`.trim() };
+  }
+  if (s.includes('accept') || s.includes('confirm') || s.includes('prepar')) {
+    return { type: 'order_accepted', title: 'Order Accepted 👨‍🍳', message: `The shop accepted your order ${id} and started preparing it.`.trim() };
+  }
+  if (s.includes('pending') || s.includes('placed')) {
+    return { type: 'order_placed', title: 'Order Placed 🎉', message: `Your order ${id} was placed and is waiting for the shop to confirm.`.trim() };
+  }
+  // Fallback for anything custom the shop adds later.
+  return { type: 'order', title: 'Order Update 📦', message: `Your order ${id} is now: ${status}`.trim() };
 };
 
 // ==========================================
@@ -448,10 +484,12 @@ const computeTrustedTotal = async (shopId, items, coinsUsed) => {
   const shop = await Shop.findById(shopId).populate('inventory.product');
   if (!shop) throw new Error("Shop not found");
 
-  const priceByProductId = {};
+  // Index inventory by productId so we can resolve both price (trusted) and
+  // display fields (image/qnty/brand/emoji) without hitting the catalog twice.
+  const invByProductId = {};
   for (const inv of (shop.inventory || [])) {
     if (!inv.product) continue;
-    priceByProductId[inv.product._id.toString()] = Number(inv.sellingPrice) || Number(inv.product.mrp) || 0;
+    invByProductId[inv.product._id.toString()] = inv;
   }
 
   let itemTotal = 0;
@@ -459,10 +497,22 @@ const computeTrustedTotal = async (shopId, items, coinsUsed) => {
   for (const line of (items || [])) {
     const pid = (line.productId || "").toString();
     const qty = Math.max(1, Math.floor(Number(line.qty) || 1));
-    const price = priceByProductId[pid];
-    if (price === undefined) throw new Error(`Product ${pid} not in shop inventory`);
+    const inv = invByProductId[pid];
+    if (!inv) throw new Error(`Product ${pid} not in shop inventory`);
+    const price = Number(inv.sellingPrice) || Number(inv.product.mrp) || 0;
     itemTotal += price * qty;
-    trustedItems.push({ productId: pid, name: line.name || "", qty, price });
+    trustedItems.push({
+      productId: pid,
+      name: line.name || inv.product.name || "",
+      qty,
+      price,
+      // Snapshot display metadata so the order card can render images later
+      // even if the master catalog item is renamed / removed.
+      image: inv.product.image || "",
+      qnty: inv.product.qnty || "",
+      brand: inv.product.brand || "",
+      emoji: inv.product.emoji || "🛒",
+    });
   }
 
   // Coins: 10 coins = ₹1, capped at 10% of item total (mirrors Cart.jsx logic).
@@ -570,8 +620,39 @@ app.post("/orders", async (req, res) => {
     });
     await o.save();
     if (req.body.imageUrl) await Parchi.updateOne({ imageUrl: req.body.imageUrl }, { $set: { status: 'processed' } });
-    await Notification.create({ shopId: o.shopId, title: "New Order! 🚀", message: `Order #${o._id.toString().slice(-5).toUpperCase()} received for ₹${o.totalAmount}` });
-    await sendPushNotification(o.shopId, "New Order! 🚀", `Order #${o._id.toString().slice(-5).toUpperCase()} received for ₹${o.totalAmount}`);
+
+    const shortId = o._id.toString().slice(-5).toUpperCase();
+
+    // Notify the shop that a new order arrived.
+    const shopTitle = "New Order! 🚀";
+    const shopMessage = `Order #${shortId} received for ₹${o.totalAmount}`;
+    await Notification.create({
+      shopId: o.shopId,
+      orderId: o._id,
+      type: 'new_order',
+      title: shopTitle,
+      message: shopMessage,
+    });
+    await sendPushNotification(o.shopId, shopTitle, shopMessage);
+
+    // Also confirm the order to the customer so they get instant feedback in the
+    // bell + push, even before the shop accepts.
+    if (o.userId && mongoose.Types.ObjectId.isValid(o.userId)) {
+      const { type, title, message } = orderNotificationFor(initialStatus, shortId);
+      try {
+        await Notification.create({
+          userId: o.userId,
+          orderId: o._id,
+          type,
+          title,
+          message,
+        });
+        await sendPushNotification(o.userId, title, message);
+      } catch (notifErr) {
+        console.log("Customer placement notification skipped:", notifErr.message);
+      }
+    }
+
     res.json(o);
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
@@ -582,8 +663,10 @@ app.get("/orders", async (req, res) => res.json(await Order.find().populate('use
 // client-side — this avoids the global scan and the populate join.
 app.get("/orders/user/:userId", async (req, res) => {
   try {
+    // Populate just the shop fields the OrdersPage card needs — keeps the
+    // payload small while still letting the customer see who they ordered from.
     const orders = await Order.find({ userId: req.params.userId })
-      .select('items createdAt')
+      .populate('shopId', 'name phone')
       .sort({ createdAt: -1 })
       .limit(50)
       .lean();
@@ -614,16 +697,16 @@ app.patch("/orders/:id", async (req, res) => {
 
     if (order.userId && mongoose.Types.ObjectId.isValid(order.userId)) {
       try {
-        await Notification.create({ 
-          userId: order.userId, 
-          title: "Order Update 📦", 
-          message: `Your order is now: ${req.body.status}` 
+        const shortId = order._id.toString().slice(-5).toUpperCase();
+        const { type, title, message } = orderNotificationFor(req.body.status, shortId);
+        await Notification.create({
+          userId: order.userId,
+          orderId: order._id,
+          type,
+          title,
+          message,
         });
-        await sendPushNotification(
-          order.userId, 
-          "Order Update 📦", 
-          `Your order is now: ${req.body.status}`
-        );
+        await sendPushNotification(order.userId, title, message);
       } catch (notifErr) {
         console.log("Notification skipped:", notifErr.message);
       }
