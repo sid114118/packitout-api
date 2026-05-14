@@ -119,6 +119,9 @@ const orderSchema = new mongoose.Schema({
   razorpayOrderId: { type: String, default: "" },
   razorpayPaymentId: { type: String, default: "" },
   razorpaySignature: { type: String, default: "" },
+  // 🕒 Customer-chosen pickup time, set at checkout. Null when the order is urgent (ASAP).
+  pickupTime: { type: Date, default: null },
+  isUrgent: { type: Boolean, default: false },
   statusHistory: {
     type: [{ status: String, at: { type: Date, default: Date.now }, _id: false }],
     default: []
@@ -166,6 +169,36 @@ const reviewSchema = new mongoose.Schema({
 
 reviewSchema.index({ targetId: 1, targetType: 1 });
 const Review = mongoose.model("Review", reviewSchema);
+
+// 📣 COMPLAINT SCHEMA
+// Customers file complaints from their profile. targetType decides who sees it:
+//   - 'shop'/'item' with a shopId → visible to admin + that shop
+//   - 'app' or untargeted → admin only
+// Replies are an embedded thread — admin and shop both write into the same
+// array so the customer sees one unified conversation.
+const complaintReplySchema = new mongoose.Schema({
+  authorType: { type: String, enum: ['shop', 'admin'], required: true },
+  authorName: { type: String, default: '' },
+  message: { type: String, required: true, maxlength: 2000 },
+  createdAt: { type: Date, default: Date.now },
+}, { _id: true });
+
+const complaintSchema = new mongoose.Schema({
+  userId: { type: mongoose.Schema.Types.ObjectId, ref: 'User', default: null },
+  userName: { type: String, default: 'Customer' },
+  userPhone: { type: String, default: '' },
+  targetType: { type: String, enum: ['shop', 'item', 'app'], required: true },
+  shopId: { type: mongoose.Schema.Types.ObjectId, ref: 'Shop', default: null },
+  itemName: { type: String, default: '' },
+  message: { type: String, required: true, maxlength: 2000 },
+  status: { type: String, enum: ['open', 'reviewed', 'resolved'], default: 'open' },
+  replies: { type: [complaintReplySchema], default: [] },
+}, { timestamps: true });
+
+complaintSchema.index({ status: 1, createdAt: -1 });
+complaintSchema.index({ shopId: 1, createdAt: -1 });
+complaintSchema.index({ userId: 1, createdAt: -1 });
+const Complaint = mongoose.model("Complaint", complaintSchema);
 
 // 🔐 OTP REQUEST SCHEMA
 // expiresAt has a TTL index so Mongo auto-deletes stale OTPs.
@@ -242,6 +275,33 @@ const orderNotificationFor = (status, shortId) => {
   }
   // Fallback for anything custom the shop adds later.
   return { type: 'order', title: 'Order Update 📦', message: `Your order ${id} is now: ${status}`.trim() };
+};
+
+// Title + body for the shop-side notification fired on a new order. Highlights
+// URGENT orders and surfaces the customer's pickup time when one was chosen so
+// the shopkeeper can prioritise without opening the dashboard.
+const buildNewOrderShopNotif = (shortId, totalAmount, isUrgent, pickupTime) => {
+  const id = shortId ? `#${shortId}` : '';
+  if (isUrgent) {
+    return {
+      title: "⚡ URGENT Order!",
+      message: `URGENT: Order ${id} for ₹${totalAmount} — customer wants it ASAP.`.trim(),
+    };
+  }
+  if (pickupTime) {
+    const dt = new Date(pickupTime);
+    if (!Number.isNaN(dt.getTime())) {
+      const clock = dt.toLocaleTimeString('en-IN', { hour: 'numeric', minute: '2-digit', hour12: true });
+      return {
+        title: "New Order! 🚀",
+        message: `Order ${id} for ₹${totalAmount} · Pickup at ${clock}`.trim(),
+      };
+    }
+  }
+  return {
+    title: "New Order! 🚀",
+    message: `Order ${id} received for ₹${totalAmount}`.trim(),
+  };
 };
 
 // ==========================================
@@ -561,6 +621,7 @@ app.post("/payments/verify", async (req, res) => {
     const {
       razorpay_order_id, razorpay_payment_id, razorpay_signature,
       userId, shopId, items, paymentMethod, coinsUsed,
+      pickupTime, isUrgent,
     } = req.body;
 
     if (!razorpay_order_id || !razorpay_payment_id || !razorpay_signature) {
@@ -591,6 +652,8 @@ app.post("/payments/verify", async (req, res) => {
       razorpayOrderId: razorpay_order_id,
       razorpayPaymentId: razorpay_payment_id,
       razorpaySignature: razorpay_signature,
+      pickupTime: pickupTime || null,
+      isUrgent: Boolean(isUrgent),
       statusHistory: [{ status: "Pending", at: new Date() }],
     });
 
@@ -600,8 +663,9 @@ app.post("/payments/verify", async (req, res) => {
     }
 
     const shortOrder = order._id.toString().slice(-5).toUpperCase();
-    await Notification.create({ shopId, title: "New Order! 🚀", message: `Order #${shortOrder} received for ₹${finalAmount}` });
-    await sendPushNotification(shopId, "New Order! 🚀", `Order #${shortOrder} received for ₹${finalAmount}`);
+    const { title: shopTitle, message: shopMessage } = buildNewOrderShopNotif(shortOrder, finalAmount, order.isUrgent, order.pickupTime);
+    await Notification.create({ shopId, orderId: order._id, type: 'new_order', title: shopTitle, message: shopMessage });
+    await sendPushNotification(shopId, shopTitle, shopMessage);
 
     res.json({ success: true, order });
   } catch (err) {
@@ -623,9 +687,9 @@ app.post("/orders", async (req, res) => {
 
     const shortId = o._id.toString().slice(-5).toUpperCase();
 
-    // Notify the shop that a new order arrived.
-    const shopTitle = "New Order! 🚀";
-    const shopMessage = `Order #${shortId} received for ₹${o.totalAmount}`;
+    // Notify the shop that a new order arrived. The title/body call out URGENT
+    // orders and scheduled pickup times so the shopkeeper sees it at a glance.
+    const { title: shopTitle, message: shopMessage } = buildNewOrderShopNotif(shortId, o.totalAmount, o.isUrgent, o.pickupTime);
     await Notification.create({
       shopId: o.shopId,
       orderId: o._id,
@@ -783,6 +847,134 @@ app.get("/reviews/order/:orderId", async (req, res) => {
   } catch (err) {
     console.error("Fetch Order Reviews Error:", err);
     res.status(500).json({ error: "Failed to load order reviews" });
+  }
+});
+
+// --- 📣 COMPLAINT ROUTES ---
+// Customer files a complaint. Notifies the admin in-app, and pings the shop
+// when the complaint is targeted at one.
+app.post("/complaints", async (req, res) => {
+  try {
+    const { targetType, message } = req.body || {};
+    if (!targetType || !message || !message.trim()) {
+      return res.status(400).json({ error: "targetType and message are required." });
+    }
+
+    const complaint = new Complaint({
+      userId: req.body.userId || null,
+      userName: req.body.userName || 'Customer',
+      userPhone: req.body.userPhone || '',
+      targetType,
+      shopId: req.body.shopId || null,
+      itemName: req.body.itemName || '',
+      message: message.trim(),
+    });
+    await complaint.save();
+
+    // Notify the shop if this complaint targets them.
+    if (complaint.shopId && (targetType === 'shop' || targetType === 'item')) {
+      const title = "📣 New Complaint";
+      const body = `${complaint.userName} filed a complaint${complaint.itemName ? ` about "${complaint.itemName}"` : ''}.`;
+      try {
+        await Notification.create({ shopId: complaint.shopId, type: 'system', title, message: body });
+        await sendPushNotification(complaint.shopId, title, body);
+      } catch (e) { console.log("Shop complaint notify skipped:", e.message); }
+    }
+
+    res.status(201).json(complaint);
+  } catch (err) {
+    console.error("Complaint create error:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Admin — all complaints, newest first, with shop populated for display.
+app.get("/complaints", async (req, res) => {
+  try {
+    const list = await Complaint.find()
+      .populate('shopId', 'name phone')
+      .sort({ createdAt: -1 });
+    res.json(list);
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// Shop view — only complaints filed against this shop.
+app.get("/complaints/shop/:shopId", async (req, res) => {
+  try {
+    const list = await Complaint.find({ shopId: req.params.shopId })
+      .sort({ createdAt: -1 });
+    res.json(list);
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// User view — every complaint a given customer filed, newest first. Used by
+// the "My Complaints" screen so the user can read replies.
+app.get("/complaints/user/:userId", async (req, res) => {
+  try {
+    const list = await Complaint.find({ userId: req.params.userId })
+      .populate('shopId', 'name')
+      .sort({ createdAt: -1 });
+    res.json(list);
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// Status updates: open ↔ reviewed ↔ resolved.
+app.patch("/complaints/:id", async (req, res) => {
+  try {
+    const { status } = req.body || {};
+    if (!['open', 'reviewed', 'resolved'].includes(status)) {
+      return res.status(400).json({ error: "Invalid status." });
+    }
+    const updated = await Complaint.findByIdAndUpdate(
+      req.params.id,
+      { $set: { status } },
+      { new: true }
+    );
+    if (!updated) return res.status(404).json({ error: "Complaint not found." });
+    res.json(updated);
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// Shop or admin posts a reply onto a complaint. The original customer is
+// notified in-app + via OneSignal so they know to come back and read it.
+app.post("/complaints/:id/replies", async (req, res) => {
+  try {
+    const { authorType, authorName, message } = req.body || {};
+    if (!['shop', 'admin'].includes(authorType)) {
+      return res.status(400).json({ error: "authorType must be 'shop' or 'admin'." });
+    }
+    if (!message || !message.trim()) {
+      return res.status(400).json({ error: "Reply message is required." });
+    }
+
+    const complaint = await Complaint.findById(req.params.id);
+    if (!complaint) return res.status(404).json({ error: "Complaint not found." });
+
+    complaint.replies.push({
+      authorType,
+      authorName: (authorName || '').toString().slice(0, 120),
+      message: message.trim(),
+    });
+    // A fresh reply implies someone is engaging with it — auto-bump 'open' to
+    // 'reviewed' so the admin queue reflects reality.
+    if (complaint.status === 'open') complaint.status = 'reviewed';
+    await complaint.save();
+
+    // Notify the customer who filed it.
+    if (complaint.userId) {
+      const who = authorType === 'shop' ? 'The shop' : 'PackItOut support';
+      const title = "📣 Reply to your complaint";
+      const body = `${who} replied: ${message.trim().slice(0, 120)}`;
+      try {
+        await Notification.create({ userId: complaint.userId, type: 'system', title, message: body });
+        await sendPushNotification(complaint.userId, title, body);
+      } catch (e) { console.log("Reply notify skipped:", e.message); }
+    }
+
+    res.status(201).json(complaint);
+  } catch (err) {
+    console.error("Reply create error:", err);
+    res.status(500).json({ error: err.message });
   }
 });
 
