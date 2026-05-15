@@ -215,6 +215,34 @@ const otpRequestSchema = new mongoose.Schema({
 otpRequestSchema.index({ expiresAt: 1 }, { expireAfterSeconds: 0 });
 const OtpRequest = mongoose.model("OtpRequest", otpRequestSchema);
 
+// 🔎 MISSED SEARCH SCHEMA
+// One row per unique lowercased term. Count increments every time the
+// catalog returns zero results for that term. Pincodes/userIds are kept
+// as sets so admin sees who/where the demand is coming from.
+const missedSearchSchema = new mongoose.Schema({
+  term: { type: String, required: true, unique: true, lowercase: true, trim: true, index: true },
+  count: { type: Number, default: 1 },
+  pincodes: { type: [String], default: [] },
+  userIds: { type: [String], default: [] },
+  resolved: { type: Boolean, default: false, index: true },
+  lastSearchedAt: { type: Date, default: Date.now },
+  createdAt: { type: Date, default: Date.now },
+});
+missedSearchSchema.index({ resolved: 1, count: -1, lastSearchedAt: -1 });
+const MissedSearch = mongoose.model("MissedSearch", missedSearchSchema);
+
+// 🎯 RANKING CONFIG (singleton)
+// One document gates ALL admin ranking control. `enabled=false` means the
+// app behaves like the default sort. `brandOrder` is a lowercased,
+// ordered list — products of brand at index 0 surface first.
+const rankingConfigSchema = new mongoose.Schema({
+  singleton: { type: String, default: 'main', unique: true, index: true },
+  enabled: { type: Boolean, default: false },
+  brandOrder: { type: [String], default: [] },
+  updatedAt: { type: Date, default: Date.now },
+});
+const RankingConfig = mongoose.model("RankingConfig", rankingConfigSchema);
+
 // ==========================================
 // 🔐 AUTH VALIDATORS, RATE LIMIT, OTP HELPER
 // ==========================================
@@ -1396,6 +1424,166 @@ app.post("/shops/:shopId/bulk-import", async (req, res) => {
   } catch (error) {
     console.error("Bulk Import Error:", error);
     res.status(500).json({ error: "Failed to bulk import products." });
+  }
+});
+
+
+// ==========================================
+// 🔎 MISSED SEARCH ROUTES
+// ==========================================
+
+// Log a search that returned zero results. Upsert on lowercased term —
+// count++, dedupe userIds/pincodes, refresh lastSearchedAt. Idempotent
+// from the client's POV; the frontend can call once per zero-result
+// term and we won't blow up on repeats.
+app.post("/missed-searches", async (req, res) => {
+  try {
+    const rawTerm = String(req.body?.term || "").trim().toLowerCase();
+    if (rawTerm.length < 2 || rawTerm.length > 80) {
+      return res.status(400).json({ error: "term must be 2-80 chars" });
+    }
+    const pincode = String(req.body?.pincode || "").trim();
+    const userId = String(req.body?.userId || "").trim();
+
+    const update = {
+      $inc: { count: 1 },
+      $set: { lastSearchedAt: new Date() },
+      $setOnInsert: { term: rawTerm, createdAt: new Date(), resolved: false },
+    };
+    const addToSet = {};
+    if (pincode && /^\d{6}$/.test(pincode)) addToSet.pincodes = pincode;
+    if (userId && mongoose.isValidObjectId(userId)) addToSet.userIds = userId;
+    if (Object.keys(addToSet).length) update.$addToSet = addToSet;
+
+    const doc = await MissedSearch.findOneAndUpdate(
+      { term: rawTerm },
+      update,
+      { upsert: true, new: true }
+    );
+    res.json({ success: true, missedSearch: doc });
+  } catch (err) {
+    console.error("missed-searches POST failed:", err);
+    res.status(500).json({ error: "Failed to log search" });
+  }
+});
+
+// List missed searches for admin. ?resolved=false (default) hides done.
+// ?sort=count (default) | lastSearchedAt
+app.get("/missed-searches", async (req, res) => {
+  try {
+    const resolvedParam = String(req.query.resolved || "false");
+    const filter = {};
+    if (resolvedParam !== "all") filter.resolved = resolvedParam === "true";
+
+    const sortKey = req.query.sort === "lastSearchedAt" ? "lastSearchedAt" : "count";
+    const sort = sortKey === "count"
+      ? { count: -1, lastSearchedAt: -1 }
+      : { lastSearchedAt: -1, count: -1 };
+
+    const docs = await MissedSearch.find(filter).sort(sort).limit(500);
+    res.json(docs);
+  } catch (err) {
+    console.error("missed-searches GET failed:", err);
+    res.status(500).json({ error: "Failed to fetch missed searches" });
+  }
+});
+
+// Toggle resolved state — admin clicks "Mark resolved" once a matching
+// product is added, or unticks if they were wrong.
+app.patch("/missed-searches/:id/resolve", async (req, res) => {
+  try {
+    if (!mongoose.isValidObjectId(req.params.id)) {
+      return res.status(400).json({ error: "Invalid id" });
+    }
+    const resolved = req.body?.resolved !== false; // default true
+    const doc = await MissedSearch.findByIdAndUpdate(
+      req.params.id,
+      { $set: { resolved } },
+      { new: true }
+    );
+    if (!doc) return res.status(404).json({ error: "Not found" });
+    res.json(doc);
+  } catch (err) {
+    console.error("missed-searches PATCH failed:", err);
+    res.status(500).json({ error: "Failed to update" });
+  }
+});
+
+app.delete("/missed-searches/:id", async (req, res) => {
+  try {
+    if (!mongoose.isValidObjectId(req.params.id)) {
+      return res.status(400).json({ error: "Invalid id" });
+    }
+    const doc = await MissedSearch.findByIdAndDelete(req.params.id);
+    if (!doc) return res.status(404).json({ error: "Not found" });
+    res.json({ success: true });
+  } catch (err) {
+    console.error("missed-searches DELETE failed:", err);
+    res.status(500).json({ error: "Failed to delete" });
+  }
+});
+
+
+// ==========================================
+// 🎯 RANKING CONFIG ROUTES
+// ==========================================
+
+// Read-or-create. Fast path — the customer apps call this on every boot,
+// so we keep the work minimal.
+app.get("/ranking-config", async (_req, res) => {
+  try {
+    let doc = await RankingConfig.findOne({ singleton: 'main' });
+    if (!doc) {
+      doc = await RankingConfig.create({ singleton: 'main', enabled: false, brandOrder: [] });
+    }
+    res.json(doc);
+  } catch (err) {
+    console.error("ranking-config GET failed:", err);
+    res.status(500).json({ error: "Failed to fetch config" });
+  }
+});
+
+// Admin save. Whole-document replace of the editable fields; brand names
+// are lowercased + trimmed + de-duped here so the frontend doesn't have
+// to be careful.
+app.put("/ranking-config", async (req, res) => {
+  try {
+    const enabled = req.body?.enabled !== false; // default true on save
+    const rawList = Array.isArray(req.body?.brandOrder) ? req.body.brandOrder : [];
+    const seen = new Set();
+    const brandOrder = [];
+    for (const raw of rawList) {
+      const v = String(raw || '').trim().toLowerCase();
+      if (!v || seen.has(v)) continue;
+      seen.add(v);
+      brandOrder.push(v);
+    }
+    const doc = await RankingConfig.findOneAndUpdate(
+      { singleton: 'main' },
+      { $set: { enabled, brandOrder, updatedAt: new Date() } },
+      { new: true, upsert: true }
+    );
+    res.json(doc);
+  } catch (err) {
+    console.error("ranking-config PUT failed:", err);
+    res.status(500).json({ error: "Failed to save config" });
+  }
+});
+
+// Distinct brand list for the admin picker. We filter out empty/"nan"
+// entries because the master catalog has historically contained both.
+app.get("/brands", async (_req, res) => {
+  try {
+    const raw = await MasterProduct.distinct("brand");
+    const cleaned = Array.from(new Set(
+      raw
+        .map(b => String(b || '').trim())
+        .filter(b => b && b.toLowerCase() !== 'nan')
+    )).sort((a, b) => a.localeCompare(b));
+    res.json(cleaned);
+  } catch (err) {
+    console.error("brands GET failed:", err);
+    res.status(500).json({ error: "Failed to fetch brands" });
   }
 });
 
