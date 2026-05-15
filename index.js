@@ -1200,6 +1200,31 @@ app.post("/shops/:shopId/inventory", async (req, res) => {
 app.patch("/shops/:id/admin-edit", async (req, res) => {
   try { const updatedShop = await Shop.findByIdAndUpdate(req.params.id, req.body, { new: true }); res.json(updatedShop); } catch (err) { res.status(500).json({ error: err.message }); }
 });
+
+// Upload / replace shop photo. Cloudinary holds the file; the Shop doc stores the URL.
+app.post("/shops/:id/upload-image", upload.single('shopImage'), async (req, res) => {
+  try {
+    if (!req.file) return res.status(400).json({ error: "No image." });
+    const shop = await Shop.findById(req.params.id);
+    if (!shop) {
+      fs.unlinkSync(req.file.path);
+      return res.status(404).json({ error: "Shop not found." });
+    }
+    const result = await cloudinary.uploader.upload(req.file.path, {
+      folder: 'packitout_shops',
+      transformation: [{ width: 1200, height: 1200, crop: 'limit', quality: 'auto:good' }],
+    });
+    fs.unlinkSync(req.file.path);
+    shop.shopImage = result.secure_url;
+    await shop.save();
+    const populated = await Shop.findById(shop._id).populate('inventory.product');
+    res.json(populated);
+  } catch (err) {
+    console.error("Shop image upload failed:", err);
+    res.status(500).json({ error: "Upload failed." });
+  }
+});
+
 app.patch("/shops/:id", async (req, res) => {
   try { res.json(await Shop.findByIdAndUpdate(req.params.id, req.body, { new: true }).populate('inventory.product')); } catch (err) { res.status(500).json({ error: err.message }); }
 });
