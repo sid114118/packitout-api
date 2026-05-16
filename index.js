@@ -126,6 +126,21 @@ const orderSchema = new mongoose.Schema({
     type: [{ status: String, at: { type: Date, default: Date.now }, _id: false }],
     default: []
   },
+  // 🚨 Escalation tracker for the unresponsive-shop worker.
+  // tier: 0=none, 1=loud-push+SMS sent, 2=voice-call placed, 3=auto-cancelled.
+  // Persisted so a server restart doesn't re-fire tiers that already went out.
+  escalation: {
+    tier: { type: Number, default: 0 },
+    lastFiredAt: { type: Date, default: null },
+  },
+  // 🔁 Refund bookkeeping for auto-cancelled paid orders. When the SMS/voice
+  // pipeline gives up at T+15min, coins are auto-returned and Razorpay refund is
+  // flagged for admin (or auto-fired if AUTO_REFUND_ENABLED=true env is set).
+  refund: {
+    pending: { type: Boolean, default: false },
+    razorpayRefundId: { type: String, default: "" },
+    attemptedAt: { type: Date, default: null },
+  },
   createdAt: { type: Date, default: Date.now }
 });
 orderSchema.index({ userId: 1, createdAt: -1 });
@@ -272,6 +287,58 @@ const sendOtpSms = async (phone, otp) => {
   // Dev mode: log only. In production, replace with provider call (MSG91/Firebase/Twilio).
   console.log(`[OTP][DEV] phone=${phone} otp=${otp} (no SMS provider configured — would have sent in production)`);
   return { delivered: false, devMode: true };
+};
+
+// ==========================================
+// 📞 ESCALATION CHANNELS (STUBBED — wire providers when credentials arrive)
+// ==========================================
+// All three helpers log-only today and return {stubMode: true}. The escalation
+// worker calls them regardless so the flow is exercised end-to-end; wiring a
+// real provider is a single-function change per channel.
+//
+// SMS (MSG91 / Gupshup / Twilio): set MSG91_AUTH_KEY env, flip the flag.
+// Voice (Exotel / Knowlarity / Twilio Voice): set EXOTEL_SID + token, flip the flag.
+// Razorpay refund: AUTO_REFUND_ENABLED=true to actually fire — otherwise we mark
+//   `order.refund.pending=true` and admin issues the refund manually.
+const ESCALATION_SMS_CONFIGURED = false;
+const ESCALATION_VOICE_CONFIGURED = false;
+const AUTO_REFUND_ENABLED = process.env.AUTO_REFUND_ENABLED === 'true';
+
+const sendSmsToPhone = async (phone, message) => {
+  if (!ESCALATION_SMS_CONFIGURED) {
+    console.log(`[ESCALATION-SMS][STUB] to=${phone} msg="${message}"`);
+    return { delivered: false, stubMode: true };
+  }
+  // TODO: provider call goes here.
+  return { delivered: false, stubMode: true };
+};
+
+const placeVoiceCallToPhone = async (phone, message) => {
+  if (!ESCALATION_VOICE_CONFIGURED) {
+    console.log(`[ESCALATION-VOICE][STUB] to=${phone} script="${message}"`);
+    return { delivered: false, stubMode: true };
+  }
+  // TODO: provider call goes here (TTS script or pre-recorded clip URL).
+  return { delivered: false, stubMode: true };
+};
+
+const issueRazorpayRefund = async (order) => {
+  if (!order?.razorpayPaymentId) return { delivered: false, reason: 'no_payment_id' };
+  if (!AUTO_REFUND_ENABLED || !razorpay) {
+    console.log(`[REFUND][STUB] orderId=${order._id} paymentId=${order.razorpayPaymentId} amount=${order.totalAmount} (set AUTO_REFUND_ENABLED=true to fire for real)`);
+    return { delivered: false, stubMode: true };
+  }
+  try {
+    const refund = await razorpay.payments.refund(order.razorpayPaymentId, {
+      amount: Math.round((Number(order.totalAmount) || 0) * 100),
+      speed: 'optimum',
+      notes: { reason: 'shop_unresponsive_auto_cancel', orderId: order._id.toString() },
+    });
+    return { delivered: true, refundId: refund.id };
+  } catch (err) {
+    console.error('[REFUND] failed:', err.message);
+    return { delivered: false, error: err.message };
+  }
 };
 
 // ==========================================
@@ -1587,6 +1654,147 @@ app.get("/brands", async (_req, res) => {
   }
 });
 
+
+// ==========================================
+// 🚨 UNRESPONSIVE-SHOP ESCALATION WORKER
+// ==========================================
+// Scans every 30s for Pending orders and escalates by age:
+//   T+2min  → loud push + SMS to shop owner
+//   T+5min  → automated voice call to shop owner
+//   T+15min → auto-cancel, refund coins, flag/issue Razorpay refund, notify both
+// Tier progress is persisted on the order so restarts don't double-fire and
+// shops that accept mid-escalation stop receiving further escalation events.
+const ESCALATION_TIERS = [
+  { tier: 1, afterMs: 2 * 60 * 1000,  name: 'sms+loud-push' },
+  { tier: 2, afterMs: 5 * 60 * 1000,  name: 'voice-call'    },
+  { tier: 3, afterMs: 15 * 60 * 1000, name: 'auto-cancel'   },
+];
+const ESCALATION_MAX_AGE_MS = 24 * 60 * 60 * 1000; // safety: don't spam old/forgotten orders on first boot
+const ESCALATION_SCAN_INTERVAL_MS = 30 * 1000;
+
+async function fireEscalationTier(order, tier) {
+  const shortId = order._id.toString().slice(-5).toUpperCase();
+  const shopId = order.shopId?._id || order.shopId;
+  const shopPhone = order.shopId?.phone || null;
+  const amount = order.totalAmount;
+
+  if (tier.tier === 1) {
+    const title = '⚠️ ORDER WAITING — ACT NOW';
+    const msg = `🚨 Order #${shortId} (₹${amount}) is still unaccepted. Tap Accept or Cancel immediately.`;
+    await Notification.create({ shopId, orderId: order._id, type: 'new_order', title, message: msg });
+    await sendPushNotification(shopId, title, msg);
+    if (shopPhone) await sendSmsToPhone(shopPhone, `PackItOut: Order #${shortId} (Rs.${amount}) waiting. Open app & accept now.`);
+    return;
+  }
+
+  if (tier.tier === 2) {
+    const script = `This is an urgent call from PackItOut. Order ${shortId} for rupees ${amount} is still waiting for your acceptance. Please open the app and accept or cancel the order immediately.`;
+    if (shopPhone) await placeVoiceCallToPhone(shopPhone, script);
+    const title = '📞 AUTO-CALL PLACED';
+    const msg = `Automated call sent for Order #${shortId} — please respond.`;
+    await Notification.create({ shopId, orderId: order._id, type: 'new_order', title, message: msg });
+    await sendPushNotification(shopId, title, msg);
+    return;
+  }
+
+  if (tier.tier === 3) {
+    await autoCancelOrder(order);
+    return;
+  }
+}
+
+async function autoCancelOrder(order) {
+  const shortId = order._id.toString().slice(-5).toUpperCase();
+  const newStatus = 'Cancelled ❌ (shop unresponsive)';
+
+  // Refund coins regardless of payment method — they were debited at checkout.
+  if (order.coinsUsed > 0 && order.userId && mongoose.Types.ObjectId.isValid(order.userId._id || order.userId)) {
+    const userId = order.userId._id || order.userId;
+    try { await User.findByIdAndUpdate(userId, { $inc: { coins: order.coinsUsed } }); }
+    catch (e) { console.error('[auto-cancel] coin refund failed:', e.message); }
+  }
+
+  // Razorpay refund — fires only if AUTO_REFUND_ENABLED=true, otherwise flagged for admin.
+  let refundFlag = { pending: false, razorpayRefundId: '', attemptedAt: null };
+  if (order.paymentStatus === 'Paid' && order.razorpayPaymentId) {
+    const r = await issueRazorpayRefund(order);
+    refundFlag = {
+      pending: !r.delivered,
+      razorpayRefundId: r.refundId || '',
+      attemptedAt: new Date(),
+    };
+  }
+
+  order.status = newStatus;
+  order.statusHistory = [...(order.statusHistory || []), { status: newStatus, at: new Date() }];
+  order.refund = refundFlag;
+  await order.save();
+
+  // Notify customer.
+  const customerId = order.userId?._id || order.userId;
+  if (customerId && mongoose.Types.ObjectId.isValid(customerId)) {
+    const title = 'Order Cancelled ❌';
+    const msg = `Order #${shortId} was auto-cancelled — the shop didn't respond. Refund is being processed.`;
+    try {
+      await Notification.create({ userId: customerId, orderId: order._id, type: 'order_cancelled', title, message: msg });
+      await sendPushNotification(customerId, title, msg);
+    } catch (e) { console.error('[auto-cancel] customer notify failed:', e.message); }
+  }
+
+  // Tell the shop they lost it.
+  const shopId = order.shopId?._id || order.shopId;
+  if (shopId) {
+    const title = '⚠️ Order Auto-Cancelled';
+    const msg = `Order #${shortId} was auto-cancelled — you didn't respond within 15 minutes.`;
+    try {
+      await Notification.create({ shopId, orderId: order._id, type: 'order_cancelled', title, message: msg });
+      await sendPushNotification(shopId, title, msg);
+    } catch (e) { console.error('[auto-cancel] shop notify failed:', e.message); }
+  }
+}
+
+async function runEscalationScan() {
+  try {
+    const now = Date.now();
+    const firstTierCutoff = new Date(now - ESCALATION_TIERS[0].afterMs);
+    const maxAgeCutoff   = new Date(now - ESCALATION_MAX_AGE_MS);
+
+    const candidates = await Order.find({
+      status: 'Pending',
+      createdAt: { $lte: firstTierCutoff, $gte: maxAgeCutoff },
+    })
+      .populate('shopId', 'name phone')
+      .populate('userId', 'name phone');
+
+    for (const order of candidates) {
+      const ageMs = now - new Date(order.createdAt).getTime();
+      const currentTier = order.escalation?.tier || 0;
+
+      for (const tier of ESCALATION_TIERS) {
+        if (tier.tier <= currentTier) continue;
+        if (ageMs < tier.afterMs) break;
+        try {
+          await fireEscalationTier(order, tier);
+          order.escalation = { tier: tier.tier, lastFiredAt: new Date() };
+          await order.save();
+          // If auto-cancel just ran, the order is no longer Pending — stop here.
+          if (tier.tier === 3) break;
+        } catch (e) {
+          console.error(`[escalation] tier ${tier.tier} failed for order ${order._id}:`, e.message);
+          break;
+        }
+      }
+    }
+  } catch (err) {
+    console.error('[escalation] scan error:', err.message);
+  }
+}
+
+// Kick off after Mongoose has had a moment to connect.
+setTimeout(() => {
+  console.log(`🚨 Escalation worker armed — scanning every ${ESCALATION_SCAN_INTERVAL_MS / 1000}s`);
+  setInterval(runEscalationScan, ESCALATION_SCAN_INTERVAL_MS);
+}, 10 * 1000);
 
 // ==========================================
 // 🚀 START SERVER
