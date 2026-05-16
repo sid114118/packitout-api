@@ -141,6 +141,19 @@ const orderSchema = new mongoose.Schema({
     razorpayRefundId: { type: String, default: "" },
     attemptedAt: { type: Date, default: null },
   },
+  // 📒 Ops call log — admin notes and force-actions taken on this order.
+  // Surfaced in the Live Ops tab so successive admins (or later auditing)
+  // can see what was already tried.
+  opsLog: {
+    type: [{
+      at: { type: Date, default: Date.now },
+      action: { type: String, default: 'note' }, // note | force_accept | force_cancel | ping
+      adminName: { type: String, default: 'admin' },
+      text: { type: String, default: '' },
+      _id: false,
+    }],
+    default: [],
+  },
   createdAt: { type: Date, default: Date.now }
 });
 orderSchema.index({ userId: 1, createdAt: -1 });
@@ -439,27 +452,125 @@ app.patch("/notifications/read-all", async (req, res) => {
 // 🚨 ADMIN OVERRIDE PING ROUTE
 app.post("/admin/ping-shop", async (req, res) => {
   try {
-    const { shopId, orderId } = req.body;
-    
+    const { shopId, orderId, adminName } = req.body;
+
     if (!shopId || !orderId) {
       return res.status(400).json({ error: "Missing shopId or orderId" });
     }
 
     const shortOrder = orderId.toString().slice(-5).toUpperCase();
     const urgentMessage = `🚨 URGENT: Please process Order #${shortOrder} immediately! The customer is waiting.`;
-    
-    await Notification.create({ 
-      shopId: shopId, 
-      title: "⚠️ ADMIN ALERT", 
-      message: urgentMessage 
+
+    await Notification.create({
+      shopId: shopId,
+      orderId: orderId,
+      type: 'new_order',
+      title: "⚠️ ADMIN ALERT",
+      message: urgentMessage
     });
-    
+
     await sendPushNotification(shopId, "⚠️ ADMIN ALERT", urgentMessage);
-    
+
+    // Log the ping in the order's ops trail so later admins see it was tried.
+    try {
+      await Order.findByIdAndUpdate(orderId, {
+        $push: { opsLog: { action: 'ping', adminName: adminName || 'admin', text: 'Sent urgent ping to shop', at: new Date() } }
+      });
+    } catch (e) { console.error("ops-log on ping failed:", e.message); }
+
     res.json({ success: true });
-  } catch (err) { 
+  } catch (err) {
     console.error("Ping Error:", err);
-    res.status(500).json({ error: err.message }); 
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// --- 🛡️ OPS CONSOLE: admin force actions on stalled orders ---
+
+// POST /admin/orders/:id/force-cancel — runs the same auto-cancel path the
+// T+15min worker uses: refunds coins, flags Razorpay refund, notifies both
+// sides. Use when the shop can't be reached or the customer asks to cancel.
+app.post("/admin/orders/:id/force-cancel", async (req, res) => {
+  try {
+    const order = await Order.findById(req.params.id)
+      .populate('shopId', 'name phone')
+      .populate('userId', 'name phone');
+    if (!order) return res.status(404).json({ error: "Order not found" });
+    if (order.status?.includes('✅') || order.status?.includes('❌')) {
+      return res.status(400).json({ error: "Order is already closed" });
+    }
+
+    const adminName = (req.body && req.body.adminName) || 'admin';
+    const reason = (req.body && req.body.reason) || 'admin force-cancel';
+
+    await autoCancelOrder(order);
+
+    // Stamp the ops trail.
+    await Order.findByIdAndUpdate(order._id, {
+      $push: { opsLog: { action: 'force_cancel', adminName, text: reason, at: new Date() } }
+    });
+
+    res.json({ success: true });
+  } catch (err) {
+    console.error("force-cancel error:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /admin/orders/:id/force-accept — set status to "Accepted 👨‍🍳" on the
+// shop's behalf. Use after a phone call where the shop confirmed verbally
+// but can't tap Accept (offline phone, app crashed, etc).
+app.post("/admin/orders/:id/force-accept", async (req, res) => {
+  try {
+    const order = await Order.findById(req.params.id);
+    if (!order) return res.status(404).json({ error: "Order not found" });
+    if (order.status !== 'Pending') {
+      return res.status(400).json({ error: `Order is already ${order.status}` });
+    }
+
+    const adminName = (req.body && req.body.adminName) || 'admin';
+    const reason = (req.body && req.body.reason) || 'admin force-accept';
+    const newStatus = 'Accepted 👨‍🍳';
+
+    order.status = newStatus;
+    order.statusHistory = [...(order.statusHistory || []), { status: newStatus, at: new Date() }];
+    order.opsLog = [...(order.opsLog || []), { action: 'force_accept', adminName, text: reason, at: new Date() }];
+    await order.save();
+
+    // Tell the customer the order was accepted (matches normal flow).
+    if (order.userId && mongoose.Types.ObjectId.isValid(order.userId)) {
+      try {
+        const shortId = order._id.toString().slice(-5).toUpperCase();
+        const { type, title, message } = orderNotificationFor(newStatus, shortId);
+        await Notification.create({ userId: order.userId, orderId: order._id, type, title, message });
+        await sendPushNotification(order.userId, title, message);
+      } catch (e) { console.error('force-accept notify failed:', e.message); }
+    }
+
+    res.json({ success: true, order });
+  } catch (err) {
+    console.error("force-accept error:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /admin/orders/:id/ops-log — append a free-form note (e.g. "called shop
+// at 14:32, no answer"). Lets successive admins see what was already tried.
+app.post("/admin/orders/:id/ops-log", async (req, res) => {
+  try {
+    const { text, adminName, action } = req.body || {};
+    if (!text || !String(text).trim()) return res.status(400).json({ error: "Note text required" });
+
+    const updated = await Order.findByIdAndUpdate(
+      req.params.id,
+      { $push: { opsLog: { action: action || 'note', adminName: adminName || 'admin', text: String(text).trim(), at: new Date() } } },
+      { new: true }
+    );
+    if (!updated) return res.status(404).json({ error: "Order not found" });
+    res.json({ success: true, opsLog: updated.opsLog });
+  } catch (err) {
+    console.error("ops-log error:", err);
+    res.status(500).json({ error: err.message });
   }
 });
 
