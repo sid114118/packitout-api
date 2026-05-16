@@ -85,9 +85,17 @@ const shopSchema = new mongoose.Schema({
       buyQty: { type: Number, default: 0 },
       offerPrice: { type: Number, default: 0 }
     }
-  }]
+  }],
+  // 🔐 Session tokens issued at login. Array so the shopkeeper can be logged
+  // in on multiple devices; each device's token is independent.
+  sessionTokens: {
+    type: [{ token: { type: String, index: true }, createdAt: { type: Date, default: Date.now }, _id: false }],
+    default: [],
+    select: false, // never include in default queries — never want this in client payloads
+  },
 });
 shopSchema.index({ pincode: 1 });
+shopSchema.index({ "sessionTokens.token": 1 });
 const Shop = mongoose.model("Shop", shopSchema);
 
 const masterProductSchema = new mongoose.Schema({ 
@@ -102,11 +110,19 @@ const masterProductSchema = new mongoose.Schema({
 });
 const MasterProduct = mongoose.model("MasterProduct", masterProductSchema);
 
-const userSchema = new mongoose.Schema({ 
+const userSchema = new mongoose.Schema({
   name: String, phone: { type: String, unique: true }, password: String, pincode: String, address: String,
-  coins: { type: Number, default: 0 }, referralCode: { type: String, unique: true }, 
-  referredBy: String, primaryShop: { type: mongoose.Schema.Types.ObjectId, ref: 'Shop' } 
+  coins: { type: Number, default: 0 }, referralCode: { type: String, unique: true },
+  referredBy: String, primaryShop: { type: mongoose.Schema.Types.ObjectId, ref: 'Shop' },
+  // 🔐 Session tokens — same pattern as Shop.sessionTokens. select:false so they
+  // never leak through generic Mongoose responses (admin user list, /users/:id, etc).
+  sessionTokens: {
+    type: [{ token: { type: String, index: true }, createdAt: { type: Date, default: Date.now }, _id: false }],
+    default: [],
+    select: false,
+  },
 });
+userSchema.index({ "sessionTokens.token": 1 });
 const User = mongoose.model("User", userSchema);
 
 const orderSchema = new mongoose.Schema({
@@ -293,6 +309,48 @@ const checkOtpRateLimit = (phone) => {
   past.push(now);
   otpSendLog.set(phone, past);
   return true;
+};
+
+// ==========================================
+// 🔐 SESSION TOKENS (User + Shop) and route guards
+// ==========================================
+// Pattern: random 32-byte hex token pushed onto User/Shop.sessionTokens at
+// login. Every mutating route that needs to know "is this really the shop /
+// the user it claims to be?" goes through requireShop / requireUser, which
+// matches the bearer token to a doc and attaches it to req.
+const issueSessionToken = async (Model, docId) => {
+  const token = crypto.randomBytes(32).toString('hex');
+  await Model.updateOne({ _id: docId }, { $push: { sessionTokens: { token, createdAt: new Date() } } });
+  return token;
+};
+
+const extractBearer = (req) => {
+  const auth = req.headers.authorization || req.headers.Authorization || '';
+  if (typeof auth !== 'string') return '';
+  return auth.startsWith('Bearer ') ? auth.slice(7).trim() : '';
+};
+
+const requireShop = async (req, res, next) => {
+  try {
+    const token = extractBearer(req);
+    if (!token) return res.status(401).json({ error: "Missing shop session token" });
+    // sessionTokens has select:false in the schema — must opt in explicitly.
+    const shop = await Shop.findOne({ "sessionTokens.token": token }).select('+sessionTokens');
+    if (!shop) return res.status(401).json({ error: "Invalid or expired session" });
+    req.shop = shop;
+    next();
+  } catch (err) { res.status(500).json({ error: err.message }); }
+};
+
+const requireUser = async (req, res, next) => {
+  try {
+    const token = extractBearer(req);
+    if (!token) return res.status(401).json({ error: "Missing user session token" });
+    const user = await User.findOne({ "sessionTokens.token": token }).select('+sessionTokens');
+    if (!user) return res.status(401).json({ error: "Invalid or expired session" });
+    req.user = user;
+    next();
+  } catch (err) { res.status(500).json({ error: err.message }); }
 };
 
 const SMS_PROVIDER_CONFIGURED = false; // Wire to MSG91/Firebase later by flipping this on env var.
@@ -502,8 +560,15 @@ app.post("/admin/orders/:id/force-cancel", async (req, res) => {
 
     const adminName = (req.body && req.body.adminName) || 'admin';
     const reason = (req.body && req.body.reason) || 'admin force-cancel';
+    const shortId = order._id.toString().slice(-5).toUpperCase();
 
-    await autoCancelOrder(order);
+    await cancelOrderWithRefund(order, {
+      statusLabel: 'Cancelled ❌ (by admin)',
+      customerTitle: 'Order Cancelled ❌',
+      customerMsg:   `Order #${shortId} was cancelled by support. Refund is being processed.`,
+      shopTitle: '⚠️ Order Cancelled by Admin',
+      shopMsg: `Order #${shortId} was cancelled by support (${reason}).`,
+    });
 
     // Stamp the ops trail.
     await Order.findByIdAndUpdate(order._id, {
@@ -945,20 +1010,30 @@ app.get("/orders/user/:userId", async (req, res) => {
 });
 
 // 🛡️ THE BULLETPROOF ORDER UPDATE ROUTE
-app.patch("/orders/:id", async (req, res) => {
+// 🔐 Shop-only status updates. requireShop verifies the bearer token and
+// attaches req.shop. Ownership is checked inside (shop can only mutate its
+// own orders). Cancellation is rejected here — must go through the dedicated
+// /shop-cancel endpoint so refunds always fire.
+app.patch("/orders/:id", requireShop, async (req, res) => {
   try {
     const order = await Order.findById(req.params.id);
     if (!order) return res.status(404).json({ error: "Order not found" });
-    
+    if (order.shopId.toString() !== req.shop._id.toString()) {
+      return res.status(403).json({ error: "Not your order" });
+    }
+    if (req.body.status && /cancel|reject/i.test(req.body.status)) {
+      return res.status(400).json({ error: "Use POST /orders/:id/shop-cancel to cancel — keeps refunds consistent" });
+    }
+
     if (req.body.status === "Delivered ✅" && order.status !== "Delivered ✅") {
       const safeAmount = Number(order.totalAmount) || 0;
       const earnedCoins = Math.floor(safeAmount / 10);
-      
+
       if (order.userId && mongoose.Types.ObjectId.isValid(order.userId)) {
         await User.findByIdAndUpdate(order.userId, { $inc: { coins: earnedCoins } });
       }
     }
-    
+
     if (req.body.status && req.body.status !== order.status) {
       order.statusHistory = [...(order.statusHistory || []), { status: req.body.status, at: new Date() }];
     }
@@ -983,9 +1058,89 @@ app.patch("/orders/:id", async (req, res) => {
     }
 
     res.json(order);
-  } catch (err) { 
+  } catch (err) {
     console.error("Backend Status Update Error:", err);
-    res.status(500).json({ error: err.message }); 
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// 🔐 Shop-initiated cancel with refund. Shares cancelOrderWithRefund() with
+// the worker auto-cancel and admin force-cancel so the refund path is
+// guaranteed identical across all three call sites.
+app.post("/orders/:id/shop-cancel", requireShop, async (req, res) => {
+  try {
+    const order = await Order.findById(req.params.id)
+      .populate('shopId', 'name phone')
+      .populate('userId', 'name phone');
+    if (!order) return res.status(404).json({ error: "Order not found" });
+
+    const orderShopId = (order.shopId?._id || order.shopId).toString();
+    if (orderShopId !== req.shop._id.toString()) {
+      return res.status(403).json({ error: "Not your order" });
+    }
+    if (order.status?.includes('✅') || order.status?.includes('❌')) {
+      return res.status(400).json({ error: "Order is already closed" });
+    }
+
+    const reason = (req.body && req.body.reason) || 'Cancelled by shop';
+    const shortId = order._id.toString().slice(-5).toUpperCase();
+    await cancelOrderWithRefund(order, {
+      statusLabel: 'Cancelled ❌ (by shop)',
+      customerTitle: 'Order Cancelled ❌',
+      customerMsg:   `Sorry — the shop cancelled your order #${shortId}. Refund is being processed.`,
+      // No shop-side push: the shop just cancelled it themselves, so don't ping them.
+      shopTitle: null,
+    });
+    // Stamp the ops trail so admin / future audits see who cancelled and why.
+    try {
+      await Order.findByIdAndUpdate(order._id, {
+        $push: { opsLog: { action: 'shop_cancel', adminName: req.shop.name || 'shop', text: reason, at: new Date() } }
+      });
+    } catch (e) { /* non-fatal */ }
+
+    res.json({ success: true });
+  } catch (err) {
+    console.error("shop-cancel error:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// 🔐 Customer-initiated cancel with refund. Only allowed while the order is
+// still Pending — once the shop has accepted, the customer must contact the
+// shop. Same refund path as every other cancel.
+app.post("/orders/:id/user-cancel", requireUser, async (req, res) => {
+  try {
+    const order = await Order.findById(req.params.id)
+      .populate('shopId', 'name phone')
+      .populate('userId', 'name phone');
+    if (!order) return res.status(404).json({ error: "Order not found" });
+
+    const orderUserId = (order.userId?._id || order.userId).toString();
+    if (orderUserId !== req.user._id.toString()) {
+      return res.status(403).json({ error: "Not your order" });
+    }
+    if (order.status !== 'Pending') {
+      return res.status(400).json({ error: `Order can no longer be cancelled — current status: ${order.status}. Please contact the shop.` });
+    }
+
+    const shortId = order._id.toString().slice(-5).toUpperCase();
+    await cancelOrderWithRefund(order, {
+      statusLabel: 'Cancelled ❌ (by customer)',
+      // No customer push — they just clicked the cancel button, they know.
+      customerTitle: null,
+      shopTitle: 'Order Cancelled by Customer ❌',
+      shopMsg: `The customer cancelled order #${shortId} before you accepted it.`,
+    });
+    try {
+      await Order.findByIdAndUpdate(order._id, {
+        $push: { opsLog: { action: 'user_cancel', adminName: req.user.name || 'customer', text: 'Customer cancelled while Pending', at: new Date() } }
+      });
+    } catch (e) { /* non-fatal */ }
+
+    res.json({ success: true });
+  } catch (err) {
+    console.error("user-cancel error:", err);
+    res.status(500).json({ error: err.message });
   }
 });
 
@@ -1301,9 +1456,13 @@ app.post("/register", async (req, res) => {
     otpRecord.consumed = true;
     await otpRecord.save();
 
+    // Auto-login: new user gets a session token so they don't need to log in again.
+    const sessionToken = await issueSessionToken(User, u._id);
+
     const safe = u.toObject();
     delete safe.password;
-    res.json(safe);
+    delete safe.sessionTokens;
+    res.json({ ...safe, sessionToken });
   } catch (err) {
     console.error("register error:", err);
     res.status(500).json({ error: "Registration failed. Please try again." });
@@ -1334,9 +1493,13 @@ app.post("/login", async (req, res) => {
 
     if (!matches) return res.status(400).json({ error: "Invalid phone or password." });
 
+    // Session token for protected endpoints (order cancel, etc).
+    const sessionToken = await issueSessionToken(User, user._id);
+
     const safe = user.toObject();
     delete safe.password;
-    res.json(safe);
+    delete safe.sessionTokens;
+    res.json({ ...safe, sessionToken });
   } catch (err) {
     console.error("login error:", err);
     res.status(500).json({ error: "Login failed. Please try again." });
@@ -1363,7 +1526,15 @@ app.post("/shop-login", async (req, res) => {
   try {
     const shop = await Shop.findOne({ phone: req.body.phone, password: req.body.password }).populate('inventory.product');
     if (!shop) return res.status(401).json({ error: "Invalid" });
-    res.json(shop);
+
+    // Issue a fresh session token — front-end stores it and sends in
+    // Authorization: Bearer for every order-mutating request.
+    const sessionToken = await issueSessionToken(Shop, shop._id);
+
+    const safe = shop.toObject();
+    delete safe.password;
+    delete safe.sessionTokens;
+    res.json({ ...safe, sessionToken });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 app.get("/shops/all/:pincode", async (req, res) => {
@@ -1814,15 +1985,25 @@ async function fireEscalationTier(order, tier) {
   }
 }
 
-async function autoCancelOrder(order) {
+// Generic cancellation + refund helper, shared by the auto-cancel worker, the
+// admin force-cancel route, the shop-initiated cancel, and the user-initiated
+// cancel. All four paths must refund identically or audits will diverge.
+//
+// opts:
+//   statusLabel   — what to write to order.status (e.g. "Cancelled ❌ (by shop)")
+//   customerTitle — push title shown to the customer
+//   customerMsg   — push body shown to the customer
+//   shopTitle     — push title shown to the shop (omit to skip)
+//   shopMsg       — push body shown to the shop
+async function cancelOrderWithRefund(order, opts) {
+  const { statusLabel, customerTitle, customerMsg, shopTitle, shopMsg } = opts;
   const shortId = order._id.toString().slice(-5).toUpperCase();
-  const newStatus = 'Cancelled ❌ (shop unresponsive)';
 
   // Refund coins regardless of payment method — they were debited at checkout.
   if (order.coinsUsed > 0 && order.userId && mongoose.Types.ObjectId.isValid(order.userId._id || order.userId)) {
     const userId = order.userId._id || order.userId;
     try { await User.findByIdAndUpdate(userId, { $inc: { coins: order.coinsUsed } }); }
-    catch (e) { console.error('[auto-cancel] coin refund failed:', e.message); }
+    catch (e) { console.error('[cancel] coin refund failed:', e.message); }
   }
 
   // Razorpay refund — fires only if AUTO_REFUND_ENABLED=true, otherwise flagged for admin.
@@ -1836,32 +2017,41 @@ async function autoCancelOrder(order) {
     };
   }
 
-  order.status = newStatus;
-  order.statusHistory = [...(order.statusHistory || []), { status: newStatus, at: new Date() }];
+  order.status = statusLabel;
+  order.statusHistory = [...(order.statusHistory || []), { status: statusLabel, at: new Date() }];
   order.refund = refundFlag;
   await order.save();
 
   // Notify customer.
   const customerId = order.userId?._id || order.userId;
-  if (customerId && mongoose.Types.ObjectId.isValid(customerId)) {
-    const title = 'Order Cancelled ❌';
-    const msg = `Order #${shortId} was auto-cancelled — the shop didn't respond. Refund is being processed.`;
+  if (customerId && mongoose.Types.ObjectId.isValid(customerId) && customerTitle) {
     try {
-      await Notification.create({ userId: customerId, orderId: order._id, type: 'order_cancelled', title, message: msg });
-      await sendPushNotification(customerId, title, msg);
-    } catch (e) { console.error('[auto-cancel] customer notify failed:', e.message); }
+      await Notification.create({ userId: customerId, orderId: order._id, type: 'order_cancelled', title: customerTitle, message: customerMsg });
+      await sendPushNotification(customerId, customerTitle, customerMsg);
+    } catch (e) { console.error('[cancel] customer notify failed:', e.message); }
   }
 
-  // Tell the shop they lost it.
+  // Notify shop (optional — skip for shop-initiated cancel; they already know).
   const shopId = order.shopId?._id || order.shopId;
-  if (shopId) {
-    const title = '⚠️ Order Auto-Cancelled';
-    const msg = `Order #${shortId} was auto-cancelled — you didn't respond within 15 minutes.`;
+  if (shopId && shopTitle) {
     try {
-      await Notification.create({ shopId, orderId: order._id, type: 'order_cancelled', title, message: msg });
-      await sendPushNotification(shopId, title, msg);
-    } catch (e) { console.error('[auto-cancel] shop notify failed:', e.message); }
+      await Notification.create({ shopId, orderId: order._id, type: 'order_cancelled', title: shopTitle, message: shopMsg });
+      await sendPushNotification(shopId, shopTitle, shopMsg);
+    } catch (e) { console.error('[cancel] shop notify failed:', e.message); }
   }
+}
+
+// Thin wrapper kept for the escalation worker — preserves the original
+// auto-cancel messaging so customers see "shop didn't respond" wording.
+async function autoCancelOrder(order) {
+  const shortId = order._id.toString().slice(-5).toUpperCase();
+  return cancelOrderWithRefund(order, {
+    statusLabel: 'Cancelled ❌ (shop unresponsive)',
+    customerTitle: 'Order Cancelled ❌',
+    customerMsg:   `Order #${shortId} was auto-cancelled — the shop didn't respond. Refund is being processed.`,
+    shopTitle:     '⚠️ Order Auto-Cancelled',
+    shopMsg:       `Order #${shortId} was auto-cancelled — you didn't respond within 15 minutes.`,
+  });
 }
 
 async function runEscalationScan() {
