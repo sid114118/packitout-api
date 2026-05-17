@@ -67,6 +67,14 @@ const shopSchema = new mongoose.Schema({
   serviceablePincodes: { type: [String], default: [] }, 
   isOpen: { type: Boolean, default: true },
   isAcceptingOrders: { type: Boolean, default: true },
+  // Pickup location as GeoJSON Point. coordinates are [longitude, latitude]
+  // — Mongo's order, NOT the lat/lng order most APIs use. The whole field is
+  // unset until the shop taps "Use my current location" in the dashboard, so
+  // the 2dsphere index above tolerates missing docs (sparse-by-default).
+  location: {
+    type: { type: String, enum: ['Point'], default: 'Point' },
+    coordinates: { type: [Number], default: undefined },
+  },
   fssai: { type: String, default: "" },          
   gst: { type: String, default: "" },            
   panNumber: { type: String, default: "" },      
@@ -96,6 +104,10 @@ const shopSchema = new mongoose.Schema({
 });
 shopSchema.index({ pincode: 1 });
 shopSchema.index({ "sessionTokens.token": 1 });
+// 2dsphere index on the GeoJSON `location` so geo queries are fast. Shops set
+// this once via "Use my current location" in the dashboard; without it they
+// just don't get a distance shown in the customer's Nearby grid.
+shopSchema.index({ location: '2dsphere' });
 const Shop = mongoose.model("Shop", shopSchema);
 
 const masterProductSchema = new mongoose.Schema({ 
@@ -1565,8 +1577,66 @@ app.post("/shop-login", async (req, res) => {
     res.json({ ...safe, sessionToken });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
+// Haversine distance in kilometres between two [lng, lat] pairs.
+const haversineKm = (lng1, lat1, lng2, lat2) => {
+  const R = 6371; // earth radius, km
+  const toRad = (d) => (d * Math.PI) / 180;
+  const dLat = toRad(lat2 - lat1);
+  const dLng = toRad(lng2 - lng1);
+  const a = Math.sin(dLat / 2) ** 2
+    + Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.sin(dLng / 2) ** 2;
+  return 2 * R * Math.asin(Math.sqrt(a));
+};
+
 app.get("/shops/all/:pincode", async (req, res) => {
-  try { res.json(await Shop.find({ pincode: req.params.pincode })); } catch (err) { res.status(500).json({ error: err.message }); }
+  try {
+    const shops = await Shop.find({ pincode: req.params.pincode }).lean();
+
+    // Optional ?lat=&lng= from the customer. When present we attach a
+    // distanceKm field and sort closest-first; shops without a stored
+    // location fall to the bottom unchanged.
+    const lat = Number(req.query.lat);
+    const lng = Number(req.query.lng);
+    const hasCustomerLoc = Number.isFinite(lat) && Number.isFinite(lng)
+      && Math.abs(lat) <= 90 && Math.abs(lng) <= 180;
+
+    if (hasCustomerLoc) {
+      for (const s of shops) {
+        const coords = s.location && Array.isArray(s.location.coordinates) ? s.location.coordinates : null;
+        if (coords && coords.length === 2 && Number.isFinite(coords[0]) && Number.isFinite(coords[1])) {
+          s.distanceKm = Number(haversineKm(lng, lat, coords[0], coords[1]).toFixed(2));
+        }
+      }
+      shops.sort((a, b) => {
+        const da = typeof a.distanceKm === 'number' ? a.distanceKm : Infinity;
+        const db = typeof b.distanceKm === 'number' ? b.distanceKm : Infinity;
+        return da - db;
+      });
+    }
+
+    res.json(shops);
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// Shop sets / updates its pickup location. Bearer-token gated — only the shop
+// itself (logged in on some device) can move its own pin.
+app.patch("/shops/:id/location", requireShop, async (req, res) => {
+  try {
+    if (req.shop._id.toString() !== req.params.id) {
+      return res.status(403).json({ error: "Cannot modify another shop's location" });
+    }
+    const lat = Number(req.body.lat);
+    const lng = Number(req.body.lng);
+    if (!Number.isFinite(lat) || !Number.isFinite(lng) || Math.abs(lat) > 90 || Math.abs(lng) > 180) {
+      return res.status(400).json({ error: "Invalid lat/lng" });
+    }
+    const updated = await Shop.findByIdAndUpdate(
+      req.params.id,
+      { location: { type: 'Point', coordinates: [lng, lat] } },
+      { new: true }
+    );
+    res.json(updated);
+  } catch (err) { res.status(500).json({ error: err.message }); }
 });
 app.get("/shops/:id/menu", async (req, res) => {
   try { res.json(await Shop.findById(req.params.id).populate('inventory.product')); } catch (err) { res.status(500).json({ error: err.message }); }
