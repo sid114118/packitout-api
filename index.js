@@ -424,14 +424,13 @@ const orderNotificationFor = (status, shortId) => {
   if (s.includes('cancel') || s.includes('reject')) {
     return { type: 'order_cancelled', title: 'Order Cancelled ❌', message: `Your order ${id} was cancelled. Any payment/coins will be refunded shortly.`.trim() };
   }
-  if (s.includes('deliver')) {
-    return { type: 'order_delivered', title: 'Order Delivered ✅', message: `Your order ${id} has been delivered. Tap to rate your experience!`.trim() };
+  // Final pickup stage. Match new "Picked Up ✅" and legacy "Delivered ✅" so
+  // in-flight orders from before the rename still resolve to the same event.
+  if (s.includes('pick') || s.includes('deliver')) {
+    return { type: 'order_delivered', title: 'Order Picked Up ✅', message: `Your order ${id} was picked up from the shop. Tap to rate your experience!`.trim() };
   }
   if (s.includes('ready') || s.includes('collect') || s.includes('pack')) {
     return { type: 'order_ready', title: 'Order Ready 🛍️', message: `Your order ${id} is ready to collect from the shop.`.trim() };
-  }
-  if (s.includes('out for') || s.includes('on the way')) {
-    return { type: 'order_out', title: 'Out for Delivery 🛵', message: `Your order ${id} is on its way to you.`.trim() };
   }
   if (s.includes('accept') || s.includes('confirm') || s.includes('prepar')) {
     return { type: 'order_accepted', title: 'Order Accepted 👨‍🍳', message: `The shop accepted your order ${id} and started preparing it.`.trim() };
@@ -1025,7 +1024,12 @@ app.patch("/orders/:id", requireShop, async (req, res) => {
       return res.status(400).json({ error: "Use POST /orders/:id/shop-cancel to cancel — keeps refunds consistent" });
     }
 
-    if (req.body.status === "Delivered ✅" && order.status !== "Delivered ✅") {
+    // Final pickup → award loyalty coins (1 coin per ₹10 spent). Match both the
+    // new "Picked Up ✅" status and the legacy "Delivered ✅" so older orders
+    // still in flight at deploy time keep working.
+    const isFinalNow = req.body.status === "Picked Up ✅" || req.body.status === "Delivered ✅";
+    const wasFinalAlready = order.status === "Picked Up ✅" || order.status === "Delivered ✅";
+    if (isFinalNow && !wasFinalAlready) {
       const safeAmount = Number(order.totalAmount) || 0;
       const earnedCoins = Math.floor(safeAmount / 10);
 
