@@ -816,6 +816,108 @@ app.get("/admin/all-parchis", async (req, res) => {
   try { res.json(await Parchi.find({ status: 'pending' }).sort({ createdAt: -1 })); } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
+// 🧑‍💼 Admin "drill-into-user" view. One round-trip returns everything the
+// admin UserProfileModal renders: profile, derived stats, full order history
+// (shop populated), reviews left, complaints filed, parchis uploaded, plus
+// derived "interests" (top brands / items / favourite shop, urgent/COD splits).
+// Heavy by design — only the admin tab hits it, paginated drill-down can come
+// later if the order list grows large.
+app.get("/admin/users/:id/profile", async (req, res) => {
+  try {
+    const userId = req.params.id;
+    if (!mongoose.Types.ObjectId.isValid(userId)) {
+      return res.status(400).json({ error: "Invalid user id" });
+    }
+
+    // Run the independent fetches in parallel to keep the modal snappy.
+    const [user, orders, reviews, complaints, parchis] = await Promise.all([
+      User.findById(userId).populate('primaryShop', 'name pincode').lean(),
+      Order.find({ userId }).populate('shopId', 'name pincode phone').sort({ createdAt: -1 }).lean(),
+      Review.find({ userId }).sort({ createdAt: -1 }).lean(),
+      Complaint.find({ userId }).populate('shopId', 'name').sort({ createdAt: -1 }).lean(),
+      Parchi.find({ userId: String(userId) }).sort({ createdAt: -1 }).lean(),
+    ]);
+    if (!user) return res.status(404).json({ error: "User not found" });
+
+    // ObjectId embeds creation timestamp — use it as a free "joined date"
+    // even though userSchema has no timestamps field.
+    const joinedAt = user._id && user._id.getTimestamp ? user._id.getTimestamp() : null;
+
+    // ---- Derived stats over the full order history ----
+    const successfulOrders = orders.filter(o => !/cancel|reject/i.test(o.status || ''));
+    const totalSpent = successfulOrders.reduce((s, o) => s + (Number(o.totalAmount) || 0), 0);
+    const totalCoinsSpent = successfulOrders.reduce((s, o) => s + (Number(o.coinsUsed) || 0), 0);
+    const urgentCount = successfulOrders.filter(o => o.isUrgent).length;
+    const codCount = successfulOrders.filter(o => (o.paymentMethod || '').toUpperCase() === 'COD').length;
+    const lastOrderAt = orders.length ? orders[0].createdAt : null;
+    const daysSinceLastOrder = lastOrderAt ? Math.floor((Date.now() - new Date(lastOrderAt).getTime()) / 86400000) : null;
+
+    // ---- Interests: tally brands, items, shops across all line items ----
+    const brandCount = new Map();
+    const itemCount = new Map(); // key: productId || name
+    const shopCount = new Map();
+    const shopNames = new Map(); // shopId -> name (for display)
+    for (const o of successfulOrders) {
+      if (o.shopId && o.shopId._id) {
+        const sid = o.shopId._id.toString();
+        shopCount.set(sid, (shopCount.get(sid) || 0) + 1);
+        if (o.shopId.name) shopNames.set(sid, o.shopId.name);
+      }
+      for (const line of (o.items || [])) {
+        const brand = (line.brand || '').trim();
+        if (brand) brandCount.set(brand, (brandCount.get(brand) || 0) + Number(line.qty || 1));
+        const itemKey = (line.productId || line.name || '').toString();
+        if (itemKey) {
+          const prev = itemCount.get(itemKey) || { name: line.name || itemKey, qty: 0, image: line.image, emoji: line.emoji, brand };
+          prev.qty += Number(line.qty || 1);
+          itemCount.set(itemKey, prev);
+        }
+      }
+    }
+    const topFromMap = (map, n) => [...map.entries()]
+      .sort((a, b) => b[1] - a[1]).slice(0, n);
+
+    const interests = {
+      topBrands: topFromMap(brandCount, 5).map(([brand, qty]) => ({ brand, qty })),
+      topItems: [...itemCount.values()].sort((a, b) => b.qty - a.qty).slice(0, 8),
+      favouriteShop: (() => {
+        const top = topFromMap(shopCount, 1)[0];
+        if (!top) return null;
+        const [sid, orderCount] = top;
+        return { shopId: sid, name: shopNames.get(sid) || 'Unknown shop', orderCount };
+      })(),
+      urgentRatio: successfulOrders.length ? Number((urgentCount / successfulOrders.length).toFixed(2)) : 0,
+      codRatio: successfulOrders.length ? Number((codCount / successfulOrders.length).toFixed(2)) : 0,
+    };
+
+    // Strip secrets — password and sessionTokens (the latter is select:false so
+    // shouldn't be here, but defensive).
+    const { password, sessionTokens, ...safeUser } = user;
+
+    res.json({
+      user: safeUser,
+      stats: {
+        joinedAt,
+        totalOrders: orders.length,
+        successfulOrders: successfulOrders.length,
+        cancelledOrders: orders.length - successfulOrders.length,
+        totalSpent: Number(totalSpent.toFixed(2)),
+        totalCoinsSpent,
+        lastOrderAt,
+        daysSinceLastOrder,
+      },
+      interests,
+      orders,
+      reviews,
+      complaints,
+      parchis,
+    });
+  } catch (err) {
+    console.error("admin user profile error:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // ==========================================
 // 💳 PAYMENT ROUTES (Razorpay)
 // ==========================================
