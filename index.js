@@ -946,10 +946,28 @@ app.post("/payments/verify", async (req, res) => {
 
 // --- ORDER ROUTES ---
 app.post("/orders", async (req, res) => {
+  // Track any coin debit so we can refund it if the order save later fails.
+  // Coin deduction MUST happen server-side and atomically — the COD path used
+  // to trust a client PATCH after the order was saved, which leaked coins on
+  // network failures and was trivially exploitable.
+  let coinRefund = null;
   try {
+    const requestedCoins = Math.max(0, Math.floor(Number(req.body.coinsUsed) || 0));
+    if (requestedCoins > 0 && req.body.userId && mongoose.Types.ObjectId.isValid(req.body.userId)) {
+      const r = await User.updateOne(
+        { _id: req.body.userId, coins: { $gte: requestedCoins } },
+        { $inc: { coins: -requestedCoins } }
+      );
+      if (r.matchedCount === 0) {
+        return res.status(400).json({ error: "Insufficient coin balance." });
+      }
+      coinRefund = { userId: req.body.userId, amount: requestedCoins };
+    }
+
     const initialStatus = req.body.status || "Pending";
     const o = new Order({
       ...req.body,
+      coinsUsed: requestedCoins,
       statusHistory: [{ status: initialStatus, at: new Date() }],
     });
     await o.save();
@@ -988,7 +1006,13 @@ app.post("/orders", async (req, res) => {
     }
 
     res.json(o);
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) {
+    if (coinRefund) {
+      try { await User.findByIdAndUpdate(coinRefund.userId, { $inc: { coins: coinRefund.amount } }); }
+      catch (refundErr) { console.error("Coin refund after failed order failed:", refundErr.message); }
+    }
+    res.status(500).json({ error: err.message });
+  }
 });
 app.get("/orders", async (req, res) => res.json(await Order.find().populate('userId').populate('shopId').sort({createdAt: -1})));
 
