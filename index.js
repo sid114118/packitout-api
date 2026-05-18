@@ -27,24 +27,52 @@ const razorpay = (process.env.RAZORPAY_KEY_ID && process.env.RAZORPAY_KEY_SECRET
 // ==========================================
 // 🧾 PARCHI UPLOAD PACKAGES
 // ==========================================
-cloudinary.config({ 
-  cloud_name: 'dj48tkcsw', 
-  api_key: '272175433165944', 
-  api_secret: 'Oum12kRi9FjCa5kPe0ZaEoLTAvQ' 
+// Cloudinary credentials. The old hardcoded values are kept as a fallback so
+// existing deploys don't break before .env is filled in, but the committed
+// values are now public — ROTATE them on the Cloudinary dashboard, set
+// CLOUDINARY_API_SECRET (+ key + cloud_name) on Hostinger, then strip the
+// fallbacks.
+cloudinary.config({
+  cloud_name: process.env.CLOUDINARY_CLOUD_NAME || 'dj48tkcsw',
+  api_key:    process.env.CLOUDINARY_API_KEY    || '272175433165944',
+  api_secret: process.env.CLOUDINARY_API_SECRET || 'Oum12kRi9FjCa5kPe0ZaEoLTAvQ',
 });
 
-const upload = multer({ dest: '/tmp/' });
-const memoryUpload = multer({ storage: multer.memoryStorage() });
+// File uploads: cap at 8 MB and reject anything that isn't an image. Without
+// these, an attacker can POST a 5 GB body to /upload-parchi or /extract-parchi
+// and fill /tmp on the Hostinger box.
+const IMAGE_MIME_RE = /^image\/(jpe?g|png|webp|heic|heif)$/i;
+const imageUploadOpts = {
+  dest: '/tmp/',
+  limits: { fileSize: 8 * 1024 * 1024 }, // 8 MB
+  fileFilter: (_req, file, cb) => cb(null, IMAGE_MIME_RE.test(file.mimetype || '')),
+};
+const upload = multer(imageUploadOpts);
+// CSV bulk-upload — keep memory storage but cap at 5 MB.
+const memoryUpload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 5 * 1024 * 1024 },
+});
+
+// Safe wrapper so synchronous unlinkSync calls never throw on a missing path
+// (and never block the event loop on cleanup).
+const safeUnlink = (p) => { try { if (p) fs.unlinkSync(p); } catch (e) {} };
 
 const app = express();
 
+// CORS allowlist. Set CORS_ORIGINS to a comma-separated list of allowed
+// origins (e.g. "https://packitout.app,https://admin.packitout.app"). Defaults
+// to "*" for backwards-compatibility during rollout; tighten once the
+// production origins are known.
+const corsAllowlist = String(process.env.CORS_ORIGINS || '*')
+  .split(',').map(s => s.trim()).filter(Boolean);
 app.use(cors({
-  origin: "*",
+  origin: corsAllowlist.includes('*') ? '*' : corsAllowlist,
   methods: ["GET", "POST", "PATCH", "PUT", "DELETE"],
-  allowedHeaders: ["Content-Type", "Authorization"]
+  allowedHeaders: ["Content-Type", "Authorization", "X-Admin-Token"],
 }));
 
-app.use(express.json());
+app.use(express.json({ limit: '1mb' }));
 
 const MONGO_URI = process.env.MONGO_URI;
 mongoose.connect(MONGO_URI)
@@ -61,8 +89,10 @@ const shopSchema = new mongoose.Schema({
   fullAddress: { type: String, default: "" },    
   operatingHours: { type: String, default: "09:00 AM - 10:00 PM" }, 
   shopImage: { type: String, default: "" },  
-  phone: { type: String, unique: true }, 
-  password: { type: String, required: true },
+  phone: { type: String, unique: true },
+  // Password hash — select:false so it never leaks via the public GET /shops
+  // endpoint, which used to dump every shop's hash in plain text.
+  password: { type: String, required: true, select: false },
   pincode: String, 
   serviceablePincodes: { type: [String], default: [] }, 
   isOpen: { type: Boolean, default: true },
@@ -123,7 +153,11 @@ const masterProductSchema = new mongoose.Schema({
 const MasterProduct = mongoose.model("MasterProduct", masterProductSchema);
 
 const userSchema = new mongoose.Schema({
-  name: String, phone: { type: String, unique: true }, password: String, pincode: String, address: String,
+  name: String, phone: { type: String, unique: true },
+  // Password hash — select:false so it never leaks via GET /users or
+  // /users/:id, which used to return it on every response.
+  password: { type: String, select: false },
+  pincode: String, address: String,
   coins: { type: Number, default: 0 }, referralCode: { type: String, unique: true },
   referredBy: String, primaryShop: { type: mongoose.Schema.Types.ObjectId, ref: 'Shop' },
   // 🔐 Session tokens — same pattern as Shop.sessionTokens. select:false so they
@@ -145,8 +179,15 @@ const orderSchema = new mongoose.Schema({
   paymentStatus: { type: String, default: "Unpaid" }, isReviewed: { type: Boolean, default: false },
   coinsUsed: { type: Number, default: 0 },
   razorpayOrderId: { type: String, default: "" },
-  razorpayPaymentId: { type: String, default: "" },
+  // unique+sparse so the same Razorpay payment can never create two orders —
+  // closes the verify-replay duplicate-order hole. "" is allowed (sparse skips
+  // empty strings on most Mongo versions, but we also guard in app code).
+  razorpayPaymentId: { type: String, default: "", index: { unique: true, sparse: true } },
   razorpaySignature: { type: String, default: "" },
+  // Idempotency flag for the loyalty-coin grant at pickup. Set once, never
+  // unset. Prevents shops from toggling status back and forth and re-awarding
+  // coins, and prevents two concurrent PATCH /orders/:id from both crediting.
+  coinsAwarded: { type: Boolean, default: false },
   // 🕒 Customer-chosen pickup time, set at checkout. Null when the order is urgent (ASAP).
   pickupTime: { type: Date, default: null },
   isUrgent: { type: Boolean, default: false },
@@ -365,6 +406,38 @@ const requireUser = async (req, res, next) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 };
 
+// ==========================================
+// 🛡️ ADMIN TOKEN GUARD
+// ==========================================
+// Set ADMIN_TOKEN on Hostinger (any long random string — e.g. 64 hex chars).
+// Admin frontend sends it in X-Admin-Token on every /admin/* and destructive
+// route. If unset on the server, all admin routes refuse with 503 so a
+// mis-configured deploy fails loud instead of silently allowing everyone.
+const requireAdmin = (req, res, next) => {
+  const expected = process.env.ADMIN_TOKEN;
+  if (!expected) return res.status(503).json({ error: "Admin token not configured on server. Set ADMIN_TOKEN env var." });
+  const provided = req.headers['x-admin-token'] || req.headers['X-Admin-Token'];
+  if (!provided || typeof provided !== 'string' || provided !== expected) {
+    return res.status(401).json({ error: "Admin token missing or invalid" });
+  }
+  next();
+};
+
+// POST /admin/login — frontend exchange. AdminLogin sends { password }; if it
+// matches ADMIN_PASSWORD env, server hands back ADMIN_TOKEN which the
+// dashboard stores in localStorage and sends as X-Admin-Token on every call.
+// Until both env vars are set on Hostinger, every admin route is locked.
+app.post("/admin/login", express.json(), (req, res) => {
+  const expectedPw = process.env.ADMIN_PASSWORD;
+  const token = process.env.ADMIN_TOKEN;
+  if (!expectedPw || !token) {
+    return res.status(503).json({ error: "Admin auth not configured. Set ADMIN_PASSWORD and ADMIN_TOKEN on the server." });
+  }
+  const given = String(req.body?.password || "");
+  if (given !== expectedPw) return res.status(401).json({ error: "Invalid admin password" });
+  res.json({ token });
+});
+
 const SMS_PROVIDER_CONFIGURED = false; // Wire to MSG91/Firebase later by flipping this on env var.
 const sendOtpSms = async (phone, otp) => {
   // Dev mode: log only. In production, replace with provider call (MSG91/Firebase/Twilio).
@@ -468,7 +541,9 @@ const buildNewOrderShopNotif = (shortId, totalAmount, isUrgent, pickupTime) => {
   if (pickupTime) {
     const dt = new Date(pickupTime);
     if (!Number.isNaN(dt.getTime())) {
-      const clock = dt.toLocaleTimeString('en-IN', { hour: 'numeric', minute: '2-digit', hour12: true });
+      // Force IST so the shop sees Indian local time even when the server
+      // (Hostinger) is running in UTC.
+      const clock = dt.toLocaleTimeString('en-IN', { hour: 'numeric', minute: '2-digit', hour12: true, timeZone: 'Asia/Kolkata' });
       return {
         title: "New Order! 🚀",
         message: `Order ${id} for ₹${totalAmount} · Pickup at ${clock}`.trim(),
@@ -484,9 +559,12 @@ const buildNewOrderShopNotif = (shortId, totalAmount, isUrgent, pickupTime) => {
 // ==========================================
 // 🚀 ONESIGNAL PUSH NOTIFICATION HELPER
 // ==========================================
+// OneSignal credentials. Hardcoded values are kept as a fallback during
+// rollout — ROTATE on the OneSignal dashboard, set ONESIGNAL_APP_ID +
+// ONESIGNAL_API_KEY on Hostinger, then strip the fallbacks.
+const ONE_SIGNAL_APP_ID = process.env.ONESIGNAL_APP_ID || "1da2e78d-0874-4965-a895-42c9237ee92b";
+const ONE_SIGNAL_API_KEY = process.env.ONESIGNAL_API_KEY || "26vkocoebe75v5dljzlncxcnx";
 const sendPushNotification = async (targetUserId, title, message) => {
-  const ONE_SIGNAL_APP_ID = "1da2e78d-0874-4965-a895-42c9237ee92b"; 
-  const ONE_SIGNAL_API_KEY = "26vkocoebe75v5dljzlncxcnx"; 
   try {
     const response = await fetch("https://onesignal.com/api/v1/notifications", {
       method: "POST", headers: { "Content-Type": "application/json; charset=utf-8", "Authorization": `Basic ${ONE_SIGNAL_API_KEY}` },
@@ -512,14 +590,24 @@ app.get("/notifications/shop/:shopId", async (req, res) => {
 });
 app.patch("/notifications/read-all", async (req, res) => {
   try {
-    const { userId, shopId } = req.body;
-    await Notification.updateMany(userId ? { userId } : { shopId }, { $set: { isRead: true } });
+    // Coerce ids to plain strings to defeat operator-injection
+    // (e.g. {"userId": {"$ne": null}} would mark every notification read).
+    const rawUserId = req.body?.userId;
+    const rawShopId = req.body?.shopId;
+    const userId = (typeof rawUserId === 'string' || typeof rawUserId === 'number') ? String(rawUserId) : null;
+    const shopId = (typeof rawShopId === 'string' || typeof rawShopId === 'number') ? String(rawShopId) : null;
+    if (!userId && !shopId) return res.status(400).json({ error: "userId or shopId required" });
+    const filter = userId
+      ? (mongoose.Types.ObjectId.isValid(userId) ? { userId } : null)
+      : (mongoose.Types.ObjectId.isValid(shopId) ? { shopId } : null);
+    if (!filter) return res.status(400).json({ error: "Invalid id" });
+    await Notification.updateMany(filter, { $set: { isRead: true } });
     res.json({ success: true });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { res.status(500).json({ error: "Failed to update notifications" }); }
 });
 
 // 🚨 ADMIN OVERRIDE PING ROUTE
-app.post("/admin/ping-shop", async (req, res) => {
+app.post("/admin/ping-shop", requireAdmin, async (req, res) => {
   try {
     const { shopId, orderId, adminName } = req.body;
 
@@ -559,7 +647,7 @@ app.post("/admin/ping-shop", async (req, res) => {
 // POST /admin/orders/:id/force-cancel — runs the same auto-cancel path the
 // T+15min worker uses: refunds coins, flags Razorpay refund, notifies both
 // sides. Use when the shop can't be reached or the customer asks to cancel.
-app.post("/admin/orders/:id/force-cancel", async (req, res) => {
+app.post("/admin/orders/:id/force-cancel", requireAdmin, async (req, res) => {
   try {
     const order = await Order.findById(req.params.id)
       .populate('shopId', 'name phone')
@@ -596,7 +684,7 @@ app.post("/admin/orders/:id/force-cancel", async (req, res) => {
 // POST /admin/orders/:id/force-accept — set status to "Accepted 👨‍🍳" on the
 // shop's behalf. Use after a phone call where the shop confirmed verbally
 // but can't tap Accept (offline phone, app crashed, etc).
-app.post("/admin/orders/:id/force-accept", async (req, res) => {
+app.post("/admin/orders/:id/force-accept", requireAdmin, async (req, res) => {
   try {
     const order = await Order.findById(req.params.id);
     if (!order) return res.status(404).json({ error: "Order not found" });
@@ -632,7 +720,7 @@ app.post("/admin/orders/:id/force-accept", async (req, res) => {
 
 // POST /admin/orders/:id/ops-log — append a free-form note (e.g. "called shop
 // at 14:32, no answer"). Lets successive admins see what was already tried.
-app.post("/admin/orders/:id/ops-log", async (req, res) => {
+app.post("/admin/orders/:id/ops-log", requireAdmin, async (req, res) => {
   try {
     const { text, adminName, action } = req.body || {};
     if (!text || !String(text).trim()) return res.status(400).json({ error: "Note text required" });
@@ -652,14 +740,17 @@ app.post("/admin/orders/:id/ops-log", async (req, res) => {
 
 // --- PARCHI ROUTES ---
 app.post("/upload-parchi", upload.single('parchiImage'), async (req, res) => {
+  if (!req.file) return res.status(400).json({ error: "No image." });
   try {
-    if (!req.file) return res.status(400).json({ error: "No image." });
     const result = await cloudinary.uploader.upload(req.file.path, { folder: 'packitout_parchis' });
-    fs.unlinkSync(req.file.path);
     const newParchi = new Parchi({ userId: req.body.userId, shopId: req.body.shopId, customerName: req.body.customerName, imageUrl: result.secure_url });
     await newParchi.save();
     res.status(200).json({ success: true, parchi: newParchi });
-  } catch (error) { res.status(500).json({ error: "Upload failed." }); }
+  } catch (error) {
+    res.status(500).json({ error: "Upload failed." });
+  } finally {
+    safeUnlink(req.file?.path);
+  }
 });
 
 // 🤖 AI PARCHI EXTRACTION — reads handwritten list with Gemini and matches to catalog
@@ -716,6 +807,7 @@ app.post("/extract-parchi", upload.single('parchiImage'), async (req, res) => {
       }
     }
 
+    // multer's 8 MB limit means the file is small enough to read into memory.
     const imageBuffer = fs.readFileSync(req.file.path);
     const imagePart = {
       inlineData: {
@@ -751,8 +843,7 @@ Return ONLY a JSON array — no prose, no markdown fences. Shape:
     const result = await model.generateContent([prompt, imagePart]);
     const text = result.response.text();
 
-    // Clean up the temp file
-    try { fs.unlinkSync(req.file.path); } catch (e) {}
+    // Temp file cleanup is in the route's finally — no per-branch unlink needed.
 
     let extracted;
     try {
@@ -802,8 +893,9 @@ Return ONLY a JSON array — no prose, no markdown fences. Shape:
     res.json({ success: true, items });
   } catch (err) {
     console.error("Parchi extraction error:", err);
-    try { if (req.file) fs.unlinkSync(req.file.path); } catch (e) {}
-    res.status(500).json({ error: err.message || "Extraction failed." });
+    res.status(500).json({ error: "Extraction failed." });
+  } finally {
+    safeUnlink(req.file?.path);
   }
 });
 app.get("/parchis/:shopId", async (req, res) => {
@@ -812,8 +904,29 @@ app.get("/parchis/:shopId", async (req, res) => {
 app.get("/parchis/user/:userId", async (req, res) => {
   try { res.json(await Parchi.find({ userId: req.params.userId, status: 'pending' }).sort({createdAt: -1})); } catch (err) { res.status(500).json({ error: err.message }); }
 });
-app.get("/admin/all-parchis", async (req, res) => {
+app.get("/admin/all-parchis", requireAdmin, async (req, res) => {
   try { res.json(await Parchi.find({ status: 'pending' }).sort({ createdAt: -1 })); } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// Admin manual coin adjustment. Set or add to a user's coin balance from the
+// Users tab. Used to be done via PATCH /users/:id with { coins }, but that
+// route is now field-whitelisted (the customer can't change their own coins).
+app.post("/admin/users/:id/coins", requireAdmin, async (req, res) => {
+  try {
+    if (!mongoose.Types.ObjectId.isValid(req.params.id)) {
+      return res.status(400).json({ error: "Invalid user id" });
+    }
+    const mode = req.body?.mode === 'inc' ? 'inc' : 'set';
+    const value = Number(req.body?.value);
+    if (!Number.isFinite(value)) return res.status(400).json({ error: "value must be a number" });
+
+    const update = mode === 'inc'
+      ? { $inc: { coins: Math.floor(value) } }
+      : { $set: { coins: Math.max(0, Math.floor(value)) } };
+    const user = await User.findByIdAndUpdate(req.params.id, update, { new: true });
+    if (!user) return res.status(404).json({ error: "User not found" });
+    res.json(user);
+  } catch (err) { res.status(500).json({ error: "Failed to update coins" }); }
 });
 
 // 🧑‍💼 Admin "drill-into-user" view. One round-trip returns everything the
@@ -822,7 +935,7 @@ app.get("/admin/all-parchis", async (req, res) => {
 // derived "interests" (top brands / items / favourite shop, urgent/COD splits).
 // Heavy by design — only the admin tab hits it, paginated drill-down can come
 // later if the order list grows large.
-app.get("/admin/users/:id/profile", async (req, res) => {
+app.get("/admin/users/:id/profile", requireAdmin, async (req, res) => {
   try {
     const userId = req.params.id;
     if (!mongoose.Types.ObjectId.isValid(userId)) {
@@ -960,12 +1073,16 @@ const computeTrustedTotal = async (shopId, items, coinsUsed) => {
   }
 
   // Coins: 10 coins = ₹1, capped at 10% of item total (mirrors Cart.jsx logic).
-  const safeCoinsUsed = Math.max(0, Math.floor(Number(coinsUsed) || 0));
+  // If the user tries to spend more than the 10% cap allows, the extra coins
+  // are NOT debited — old behaviour silently burned the surplus.
+  const requestedCoins = Math.max(0, Math.floor(Number(coinsUsed) || 0));
   const maxDiscountAllowed = itemTotal * 0.10;
-  const coinDiscount = Math.min(safeCoinsUsed / 10, maxDiscountAllowed);
+  const maxCoinsConsumable = Math.floor(maxDiscountAllowed * 10);
+  const actualCoinsUsed = Math.min(requestedCoins, maxCoinsConsumable);
+  const coinDiscount = actualCoinsUsed / 10;
   const finalAmount = Math.max(0, Number((itemTotal - coinDiscount).toFixed(2)));
 
-  return { itemTotal, coinDiscount, finalAmount, trustedItems, coinsUsed: safeCoinsUsed };
+  return { itemTotal, coinDiscount, finalAmount, trustedItems, coinsUsed: actualCoinsUsed };
 };
 
 app.post("/payments/create-order", async (req, res) => {
@@ -1022,6 +1139,29 @@ app.post("/payments/verify", async (req, res) => {
       return res.status(400).json({ error: "Payment signature verification failed." });
     }
 
+    // Idempotency — if a previous /verify call already booked this payment as
+    // an order, just return it. Without this, the client could replay /verify
+    // (intentionally or via retry) and create duplicate orders + double-debit
+    // coins. The unique index on Order.razorpayPaymentId is the backstop.
+    const existing = await Order.findOne({ razorpayPaymentId: razorpay_payment_id });
+    if (existing) {
+      return res.json({ success: true, order: existing, duplicate: true });
+    }
+
+    // Cross-check that the Razorpay order's notes match the userId/shopId the
+    // client claims — defeats a "pay for tiny order, verify as someone else"
+    // attack where userId/shopId are forged in the body.
+    try {
+      const rzpOrder = await razorpay.orders.fetch(razorpay_order_id);
+      const notedUserId = rzpOrder?.notes?.userId;
+      const notedShopId = rzpOrder?.notes?.shopId;
+      if (notedUserId && notedShopId && (String(notedUserId) !== String(userId) || String(notedShopId) !== String(shopId))) {
+        return res.status(400).json({ error: "Order/user mismatch" });
+      }
+    } catch (e) {
+      console.error("Razorpay order fetch failed (continuing):", e.message);
+    }
+
     // Recompute trusted total — never trust the client.
     const { finalAmount, trustedItems, coinsUsed: safeCoinsUsed } =
       await computeTrustedTotal(shopId, items, coinsUsed);
@@ -1041,9 +1181,13 @@ app.post("/payments/verify", async (req, res) => {
       statusHistory: [{ status: "Pending", at: new Date() }],
     });
 
-    // Deduct coins after the order is safely persisted.
+    // Deduct coins after the order is safely persisted. Use a guarded
+    // updateOne so we never let the balance go negative under race conditions.
     if (safeCoinsUsed > 0 && mongoose.Types.ObjectId.isValid(userId)) {
-      await User.findByIdAndUpdate(userId, { $inc: { coins: -safeCoinsUsed } });
+      await User.updateOne(
+        { _id: userId, coins: { $gte: safeCoinsUsed } },
+        { $inc: { coins: -safeCoinsUsed } }
+      );
     }
 
     const shortOrder = order._id.toString().slice(-5).toUpperCase();
@@ -1059,6 +1203,15 @@ app.post("/payments/verify", async (req, res) => {
 });
 
 // --- ORDER ROUTES ---
+// Fields the client is allowed to set on a new order. Status / paymentStatus /
+// totalAmount / razorpay* are computed server-side — the old behaviour spread
+// req.body straight into the model, so a client could POST status="Delivered ✅",
+// paymentStatus="Paid", totalAmount=0 and bypass payment entirely.
+const ORDER_CREATE_WRITABLE = [
+  'userId', 'shopId', 'items', 'imageUrl', 'paymentMethod',
+  'pickupTime', 'isUrgent',
+];
+
 app.post("/orders", async (req, res) => {
   // Track any coin debit so we can refund it if the order save later fails.
   // Coin deduction MUST happen server-side and atomically — the COD path used
@@ -1066,26 +1219,66 @@ app.post("/orders", async (req, res) => {
   // network failures and was trivially exploitable.
   let coinRefund = null;
   try {
+    const body = pickFields(req.body || {}, ORDER_CREATE_WRITABLE);
+    if (!body.userId || !mongoose.Types.ObjectId.isValid(body.userId)) {
+      return res.status(400).json({ error: "Valid userId required." });
+    }
+    if (!body.shopId || !mongoose.Types.ObjectId.isValid(body.shopId)) {
+      return res.status(400).json({ error: "Valid shopId required." });
+    }
+    if (!Array.isArray(body.items) || body.items.length === 0) {
+      return res.status(400).json({ error: "items array required." });
+    }
+    // Validate pickupTime: must be in the next 24h if set, never in the past.
+    if (body.pickupTime) {
+      const dt = new Date(body.pickupTime);
+      const now = Date.now();
+      if (Number.isNaN(dt.getTime()) || dt.getTime() < now - 60_000 || dt.getTime() > now + 24 * 60 * 60 * 1000) {
+        return res.status(400).json({ error: "pickupTime must be within the next 24 hours." });
+      }
+    }
+
+    // Recompute the price + items from the shop's actual inventory so the
+    // client can't claim a 0₹ total or sneak in items not in stock.
+    const { finalAmount, trustedItems, coinsUsed: actualCoinsUsed } =
+      await computeTrustedTotal(body.shopId, body.items, req.body.coinsUsed);
+
     const requestedCoins = Math.max(0, Math.floor(Number(req.body.coinsUsed) || 0));
-    if (requestedCoins > 0 && req.body.userId && mongoose.Types.ObjectId.isValid(req.body.userId)) {
+    if (actualCoinsUsed > 0) {
       const r = await User.updateOne(
-        { _id: req.body.userId, coins: { $gte: requestedCoins } },
-        { $inc: { coins: -requestedCoins } }
+        { _id: body.userId, coins: { $gte: actualCoinsUsed } },
+        { $inc: { coins: -actualCoinsUsed } }
       );
       if (r.matchedCount === 0) {
         return res.status(400).json({ error: "Insufficient coin balance." });
       }
-      coinRefund = { userId: req.body.userId, amount: requestedCoins };
+      coinRefund = { userId: body.userId, amount: actualCoinsUsed };
     }
 
-    const initialStatus = req.body.status || "Pending";
+    const initialStatus = "Pending"; // server-controlled — never trust client
     const o = new Order({
-      ...req.body,
-      coinsUsed: requestedCoins,
+      ...body,
+      items: trustedItems,
+      totalAmount: finalAmount,
+      coinsUsed: actualCoinsUsed,
+      status: initialStatus,
+      paymentStatus: (body.paymentMethod || '').toUpperCase() === 'COD' ? 'Unpaid' : 'Unpaid',
+      isUrgent: Boolean(body.isUrgent),
       statusHistory: [{ status: initialStatus, at: new Date() }],
     });
     await o.save();
-    if (req.body.imageUrl) await Parchi.updateOne({ imageUrl: req.body.imageUrl }, { $set: { status: 'processed' } });
+    // Mark the parchi as processed by ID, not by URL — multiple users can share
+    // a cached image URL, and the URL filter has no shop scope.
+    const parchiId = req.body.parchiId;
+    if (parchiId && mongoose.Types.ObjectId.isValid(parchiId)) {
+      await Parchi.updateOne({ _id: parchiId }, { $set: { status: 'processed' } });
+    } else if (req.body.imageUrl) {
+      // Legacy fallback — keep working for old clients but scope to user+shop.
+      await Parchi.updateOne(
+        { imageUrl: req.body.imageUrl, shopId: String(body.shopId), userId: String(body.userId) },
+        { $set: { status: 'processed' } }
+      );
+    }
 
     const shortId = o._id.toString().slice(-5).toUpperCase();
 
@@ -1128,7 +1321,41 @@ app.post("/orders", async (req, res) => {
     res.status(500).json({ error: err.message });
   }
 });
-app.get("/orders", async (req, res) => res.json(await Order.find().populate('userId').populate('shopId').sort({createdAt: -1})));
+// Admin-only firehose, capped at 500 rows. Used by the AdminDashboard global
+// orders tab. The user/shop populates exclude their password fields via the
+// `select:false` set on the schema. Old behaviour returned every order ever,
+// fully populated, with no auth — a real outage waiting to happen.
+app.get("/orders", requireAdmin, async (req, res) => {
+  try {
+    const limit = Math.min(500, Math.max(1, parseInt(req.query.limit, 10) || 200));
+    const orders = await Order.find()
+      .populate('userId', 'name phone pincode coins')
+      .populate('shopId', 'name phone pincode')
+      .sort({ createdAt: -1 })
+      .limit(limit);
+    res.json(orders);
+  } catch (err) { res.status(500).json({ error: "Failed to fetch orders" }); }
+});
+
+// Slim per-shop feed for the ShopDashboard. The old behaviour was for every
+// shop dashboard to poll GET /orders every 10s, pulling every order on the
+// platform, populating it, and filtering client-side — leaking other shops'
+// orders and growing linearly with platform volume. This scopes to one shop.
+app.get("/orders/shop/:shopId", requireShop, async (req, res) => {
+  try {
+    if (req.shop._id.toString() !== req.params.shopId) {
+      return res.status(403).json({ error: "Not your shop" });
+    }
+    const limit = Math.min(500, Math.max(1, parseInt(req.query.limit, 10) || 200));
+    const orders = await Order.find({ shopId: req.params.shopId })
+      .populate('userId', 'name phone')
+      // re-populate shopId so frontend code that reads order.shopId.name still works
+      .populate('shopId', 'name phone pincode')
+      .sort({ createdAt: -1 })
+      .limit(limit);
+    res.json(orders);
+  } catch (err) { res.status(500).json({ error: "Failed to fetch shop orders" }); }
+});
 
 // Slim per-user feed for the customer feed's "Buy It Again" widget. The old
 // approach was to fetch /orders (every order, every user, populated) and filter
@@ -1164,14 +1391,18 @@ app.patch("/orders/:id", requireShop, async (req, res) => {
 
     // Final pickup → award loyalty coins (1 coin per ₹10 spent). Match both the
     // new "Picked Up ✅" status and the legacy "Delivered ✅" so older orders
-    // still in flight at deploy time keep working.
+    // still in flight at deploy time keep working. Idempotent: the coinsAwarded
+    // flag is set atomically via a conditional update — if two PATCHes race or
+    // the shop toggles status back-and-forth, coins are credited at most once.
     const isFinalNow = req.body.status === "Picked Up ✅" || req.body.status === "Delivered ✅";
-    const wasFinalAlready = order.status === "Picked Up ✅" || order.status === "Delivered ✅";
-    if (isFinalNow && !wasFinalAlready) {
+    if (isFinalNow && !order.coinsAwarded) {
       const safeAmount = Number(order.totalAmount) || 0;
       const earnedCoins = Math.floor(safeAmount / 10);
-
-      if (order.userId && mongoose.Types.ObjectId.isValid(order.userId)) {
+      const claim = await Order.updateOne(
+        { _id: order._id, coinsAwarded: { $ne: true } },
+        { $set: { coinsAwarded: true } }
+      );
+      if (claim.modifiedCount === 1 && earnedCoins > 0 && order.userId && mongoose.Types.ObjectId.isValid(order.userId)) {
         await User.findByIdAndUpdate(order.userId, { $inc: { coins: earnedCoins } });
       }
     }
@@ -1287,19 +1518,35 @@ app.post("/orders/:id/user-cancel", requireUser, async (req, res) => {
 });
 
 // --- 🌟 REVIEW ROUTES ---
-app.post("/reviews/order-review", async (req, res) => {
+// requireUser + ownership check. Old behaviour let anyone forge reviews for
+// any order, mark anyone's order isReviewed, and sink any shop's rating to 1
+// by spamming the endpoint. userId is now taken from the session, not the body.
+app.post("/reviews/order-review", requireUser, async (req, res) => {
   try {
-    const { orderId, shop, items, userId, userName } = req.body;
-    const reviewsToInsert = [];
-
-    if (shop && shop.rating > 0) {
-      reviewsToInsert.push({ userId, userName, orderId, targetId: shop.shopId, targetType: 'shop', rating: shop.rating, comment: shop.reviewText || '' });
+    const { orderId, shop, items } = req.body || {};
+    if (!orderId || !mongoose.Types.ObjectId.isValid(orderId)) {
+      return res.status(400).json({ error: "Valid orderId required" });
     }
 
-    if (items && items.length > 0) {
+    const order = await Order.findById(orderId);
+    if (!order) return res.status(404).json({ error: "Order not found" });
+    if (order.userId.toString() !== req.user._id.toString()) {
+      return res.status(403).json({ error: "Not your order" });
+    }
+    if (order.isReviewed) return res.status(409).json({ error: "Order already reviewed" });
+
+    const userId = req.user._id;
+    const userName = req.user.name || 'Customer';
+    const reviewsToInsert = [];
+
+    if (shop && shop.rating > 0 && shop.shopId && mongoose.Types.ObjectId.isValid(shop.shopId)) {
+      reviewsToInsert.push({ userId, userName, orderId, targetId: shop.shopId, targetType: 'shop', rating: Math.max(1, Math.min(5, Number(shop.rating))), comment: String(shop.reviewText || '').slice(0, 1000) });
+    }
+
+    if (Array.isArray(items)) {
       items.forEach(item => {
-        if (item.rating > 0) {
-          reviewsToInsert.push({ userId, userName, orderId, targetId: item.productId, targetType: 'product', rating: item.rating, comment: '' });
+        if (item.rating > 0 && item.productId && mongoose.Types.ObjectId.isValid(item.productId)) {
+          reviewsToInsert.push({ userId, userName, orderId, targetId: item.productId, targetType: 'product', rating: Math.max(1, Math.min(5, Number(item.rating))), comment: '' });
         }
       });
     }
@@ -1308,11 +1555,15 @@ app.post("/reviews/order-review", async (req, res) => {
       await Review.insertMany(reviewsToInsert);
     }
 
-    if (shop && shop.rating > 0) {
-      const allShopReviews = await Review.find({ targetId: shop.shopId, targetType: 'shop' });
-      const totalScore = allShopReviews.reduce((sum, rev) => sum + rev.rating, 0);
-      const avgRating = (totalScore / allShopReviews.length).toFixed(1);
-      await Shop.findByIdAndUpdate(shop.shopId, { rating: Number(avgRating), totalReviews: allShopReviews.length });
+    if (shop && shop.rating > 0 && shop.shopId) {
+      // O(1) recompute instead of pulling every review into memory.
+      const [agg] = await Review.aggregate([
+        { $match: { targetId: new mongoose.Types.ObjectId(shop.shopId), targetType: 'shop' } },
+        { $group: { _id: null, avg: { $avg: '$rating' }, count: { $sum: 1 } } },
+      ]);
+      if (agg) {
+        await Shop.findByIdAndUpdate(shop.shopId, { rating: Number(agg.avg.toFixed(1)), totalReviews: agg.count });
+      }
     }
 
     await Order.findByIdAndUpdate(orderId, { $set: { isReviewed: true } });
@@ -1392,13 +1643,14 @@ app.post("/complaints", async (req, res) => {
 });
 
 // Admin — all complaints, newest first, with shop populated for display.
-app.get("/complaints", async (req, res) => {
+app.get("/complaints", requireAdmin, async (req, res) => {
   try {
     const list = await Complaint.find()
       .populate('shopId', 'name phone')
-      .sort({ createdAt: -1 });
+      .sort({ createdAt: -1 })
+      .limit(500);
     res.json(list);
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { res.status(500).json({ error: "Failed to fetch complaints" }); }
 });
 
 // Shop view — only complaints filed against this shop.
@@ -1578,8 +1830,13 @@ app.post("/register", async (req, res) => {
     const refCode = baseName + Math.floor(1000 + Math.random() * 9000);
     let startingCoins = 0;
     if (referredBy) {
-      const referrer = await User.findOne({ referralCode: referredBy });
-      if (referrer) { referrer.coins += 50; await referrer.save(); startingCoins = 50; }
+      // Atomic $inc instead of read-modify-write — two concurrent registrations
+      // with the same code used to award the referrer only once across both.
+      const result = await User.updateOne(
+        { referralCode: referredBy },
+        { $inc: { coins: 50 } }
+      );
+      if (result.matchedCount === 1) startingCoins = 50;
     }
 
     const passwordHash = await bcrypt.hash(password, 10);
@@ -1647,27 +1904,64 @@ app.post("/login", async (req, res) => {
     res.status(500).json({ error: "Login failed. Please try again." });
   }
 });
-app.get("/users", async (req, res) => res.json(await User.find().sort({createdAt: -1})));
+// Admin-only directory, capped at 500 rows. password/sessionTokens are
+// schema-level select:false so they never leak.
+app.get("/users", requireAdmin, async (req, res) => {
+  try {
+    const limit = Math.min(500, Math.max(1, parseInt(req.query.limit, 10) || 200));
+    const users = await User.find().sort({ createdAt: -1 }).limit(limit);
+    res.json(users);
+  } catch (err) { res.status(500).json({ error: "Failed to fetch users" }); }
+});
 app.get("/users/:id", async (req, res) => {
   try { res.json(await User.findById(req.params.id).populate('primaryShop')); } catch (err) { res.status(500).json({ error: err.message }); }
 });
-app.patch("/users/:id", async (req, res) => {
+// Field whitelist — anything not in this list is dropped before the update.
+// Closes the mass-assignment hole where a client could PATCH /users/:id with
+// { coins: 999999 } or push a forged sessionTokens entry to hijack the account.
+const USER_WRITABLE = ['name', 'pincode', 'address', 'primaryShop'];
+app.patch("/users/:id", requireUser, async (req, res) => {
   try {
-    const updateData = { ...req.body };
+    if (req.user._id.toString() !== req.params.id) {
+      return res.status(403).json({ error: "Cannot modify another user's profile" });
+    }
+    const updateData = pickFields(req.body || {}, USER_WRITABLE);
     if (updateData.primaryShop === "") updateData.primaryShop = null;
+    if (updateData.pincode && !validatePincode(updateData.pincode)) {
+      return res.status(400).json({ error: "Pincode must be exactly 6 digits." });
+    }
     res.json(await User.findByIdAndUpdate(req.params.id, updateData, { new: true }).populate('primaryShop'));
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
 // --- SHOP ROUTES ---
-app.get("/shops", async (req, res) => res.json(await Shop.find()));
-app.post("/shops", async (req, res) => {
-  try { const newShop = new Shop(req.body); await newShop.save(); res.json(newShop); } catch (err) { res.status(500).json({ error: "Exists" }); }
+// Public — used by the admin dashboard's Shops tab. password is schema-level
+// select:false so it no longer leaks here. Cap to 500 rows.
+app.get("/shops", async (req, res) => {
+  try {
+    res.json(await Shop.find().sort({ name: 1 }).limit(500));
+  } catch (err) { res.status(500).json({ error: "Failed to fetch shops" }); }
+});
+// Admin-only shop creation. Previously unauth'd — anyone could create a shop
+// with any phone (provided it didn't collide) and a known password.
+app.post("/shops", requireAdmin, async (req, res) => {
+  try {
+    const newShop = new Shop(req.body);
+    await newShop.save();
+    const safe = newShop.toObject();
+    delete safe.password;
+    delete safe.sessionTokens;
+    res.json(safe);
+  } catch (err) {
+    if (err && err.code === 11000) return res.status(409).json({ error: "A shop with that phone already exists." });
+    res.status(500).json({ error: "Failed to create shop" });
+  }
 });
 app.post("/shop-login", async (req, res) => {
   try {
-    const shop = await Shop.findOne({ phone: req.body.phone, password: req.body.password }).populate('inventory.product');
-    if (!shop) return res.status(401).json({ error: "Invalid" });
+    // password is now select:false, so must opt in explicitly to compare.
+    const shop = await Shop.findOne({ phone: req.body.phone }).select('+password').populate('inventory.product');
+    if (!shop || shop.password !== req.body.password) return res.status(401).json({ error: "Invalid" });
 
     // Issue a fresh session token — front-end stores it and sends in
     // Authorization: Bearer for every order-mutating request.
@@ -1758,8 +2052,11 @@ app.get("/shops/:id/menu/lean", async (req, res) => {
     res.json(shop);
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
-app.post("/shops/:shopId/inventory", async (req, res) => {
+app.post("/shops/:shopId/inventory", requireShop, async (req, res) => {
   try {
+    if (req.shop._id.toString() !== req.params.shopId) {
+      return res.status(403).json({ error: "Cannot edit another shop's inventory" });
+    }
     const { productId, sellingPrice, inStock } = req.body;
     const shop = await Shop.findById(req.params.shopId);
     const existingIndex = shop.inventory.findIndex(item => item.product && item.product.toString() === productId);
@@ -1774,24 +2071,35 @@ app.post("/shops/:shopId/inventory", async (req, res) => {
     res.json(await Shop.findById(req.params.shopId).populate('inventory.product'));
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
-app.patch("/shops/:id/admin-edit", async (req, res) => {
-  try { const updatedShop = await Shop.findByIdAndUpdate(req.params.id, req.body, { new: true }); res.json(updatedShop); } catch (err) { res.status(500).json({ error: err.message }); }
+// Admin can edit a broader set of fields than the shop itself can — e.g.
+// rotating a password or correcting the shop's phone number. password is set
+// directly (admin reset) — for now plaintext to match existing /shop-login.
+const SHOP_ADMIN_WRITABLE = [
+  'name', 'ownerName', 'fullAddress', 'operatingHours', 'shopImage', 'phone',
+  'password', 'pincode', 'serviceablePincodes', 'isOpen', 'isAcceptingOrders',
+  'fssai', 'gst', 'panNumber', 'upiId', 'inventoryMode',
+];
+app.patch("/shops/:id/admin-edit", requireAdmin, async (req, res) => {
+  try {
+    const updateData = pickFields(req.body || {}, SHOP_ADMIN_WRITABLE);
+    const updatedShop = await Shop.findByIdAndUpdate(req.params.id, updateData, { new: true });
+    res.json(updatedShop);
+  } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
 // Upload / replace shop photo. Cloudinary holds the file; the Shop doc stores the URL.
-app.post("/shops/:id/upload-image", upload.single('shopImage'), async (req, res) => {
+app.post("/shops/:id/upload-image", requireShop, upload.single('shopImage'), async (req, res) => {
+  if (!req.file) return res.status(400).json({ error: "No image." });
   try {
-    if (!req.file) return res.status(400).json({ error: "No image." });
-    const shop = await Shop.findById(req.params.id);
-    if (!shop) {
-      fs.unlinkSync(req.file.path);
-      return res.status(404).json({ error: "Shop not found." });
+    if (req.shop._id.toString() !== req.params.id) {
+      return res.status(403).json({ error: "Cannot upload to another shop" });
     }
+    const shop = await Shop.findById(req.params.id);
+    if (!shop) return res.status(404).json({ error: "Shop not found." });
     const result = await cloudinary.uploader.upload(req.file.path, {
       folder: 'packitout_shops',
       transformation: [{ width: 1200, height: 1200, crop: 'limit', quality: 'auto:good' }],
     });
-    fs.unlinkSync(req.file.path);
     shop.shopImage = result.secure_url;
     await shop.save();
     const populated = await Shop.findById(shop._id).populate('inventory.product');
@@ -1799,18 +2107,58 @@ app.post("/shops/:id/upload-image", upload.single('shopImage'), async (req, res)
   } catch (err) {
     console.error("Shop image upload failed:", err);
     res.status(500).json({ error: "Upload failed." });
+  } finally {
+    safeUnlink(req.file?.path);
   }
 });
 
-app.patch("/shops/:id", async (req, res) => {
-  try { res.json(await Shop.findByIdAndUpdate(req.params.id, req.body, { new: true }).populate('inventory.product')); } catch (err) { res.status(500).json({ error: err.message }); }
+// Shop edits its own profile. Narrower whitelist than admin-edit — phone,
+// password, serviceablePincodes etc. need admin intervention.
+const SHOP_SELF_WRITABLE = [
+  'name', 'ownerName', 'fullAddress', 'operatingHours', 'shopImage',
+  'isOpen', 'isAcceptingOrders', 'fssai', 'gst', 'panNumber', 'upiId',
+  'inventoryMode',
+];
+app.patch("/shops/:id", requireShop, async (req, res) => {
+  try {
+    if (req.shop._id.toString() !== req.params.id) {
+      return res.status(403).json({ error: "Cannot modify another shop's profile" });
+    }
+    const updateData = pickFields(req.body || {}, SHOP_SELF_WRITABLE);
+    res.json(await Shop.findByIdAndUpdate(req.params.id, updateData, { new: true }).populate('inventory.product'));
+  } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
 // --- MASTER PRODUCTS ---
 
-app.post("/master-products", async (req, res) => {
+// Whitelist of fields the admin can write into a MasterProduct. Anything else
+// in the body is ignored — prevents callers from sneaking in fields not in the
+// schema or overwriting computed/ref-only fields.
+const MASTER_PRODUCT_WRITABLE = [
+  'name', 'brand', 'category', 'mrp', 'qnty', 'emoji', 'image', 'searchTags',
+  'description', 'ingredients', 'manufacturer', 'manufactureraddress',
+  'energy', 'protein', 'carbs', 'sugar', 'fat', 'isVeg', 'itemGroupId',
+  'relatedProducts', 'substitutes',
+];
+const pickFields = (src, allow) => {
+  const out = {};
+  for (const k of allow) if (src && Object.prototype.hasOwnProperty.call(src, k)) out[k] = src[k];
+  return out;
+};
+// Accept searchTags either as a CSV string (legacy admin form) or an array.
+const normaliseSearchTags = (val) => {
+  if (Array.isArray(val)) return val.map(t => String(t).trim()).filter(Boolean);
+  if (typeof val === 'string') return val.split(',').map(t => t.trim()).filter(Boolean);
+  return undefined;
+};
+
+app.post("/master-products", requireAdmin, async (req, res) => {
   try {
-    const p = new MasterProduct({ ...req.body, mrp: Number(req.body.mrp), searchTags: req.body.searchTags?.split(',').map(t => t.trim()) });
+    const body = pickFields(req.body || {}, MASTER_PRODUCT_WRITABLE);
+    if (body.mrp !== undefined) body.mrp = Number(body.mrp);
+    const tags = normaliseSearchTags(req.body?.searchTags);
+    if (tags !== undefined) body.searchTags = tags;
+    const p = new MasterProduct(body);
     await p.save(); res.json(p);
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
@@ -1828,16 +2176,21 @@ app.get("/master-products/:id", async (req, res) => {
 });
 
 // ⚠️ THE KILL SWITCH: PURGE ALL PRODUCTS (For Pydroid Script)
-// Note: Placed above /:id to ensure Express routes it correctly
-app.delete("/master-products/purge-all", async (req, res) => {
+// Note: Placed above /:id to ensure Express routes it correctly. Now admin-
+// gated AND requires an explicit confirm body so a stray DELETE can't wipe
+// the catalog. To purge: send { "confirm": "PURGE-ALL-PRODUCTS" } in the body.
+app.delete("/master-products/purge-all", requireAdmin, async (req, res) => {
   try {
+    if (req.body?.confirm !== 'PURGE-ALL-PRODUCTS') {
+      return res.status(400).json({ error: 'Missing confirmation. Pass {"confirm":"PURGE-ALL-PRODUCTS"}' });
+    }
     const masterResult = await MasterProduct.deleteMany({});
-    
+
     // Wipe them from all shop inventories too so your React app doesn't crash trying to load deleted products
     await Shop.updateMany({}, { $set: { inventory: [] } });
 
-    res.json({ 
-      message: "🧹 Master Database & Shop Inventories wiped clean!", 
+    res.json({
+      message: "🧹 Master Database & Shop Inventories wiped clean!",
       deletedCount: masterResult.deletedCount
     });
   } catch (error) {
@@ -1846,7 +2199,7 @@ app.delete("/master-products/purge-all", async (req, res) => {
 });
 
 // 🗑️  DELETE A SINGLE PRODUCT (For Admin UI)
-app.delete("/master-products/:id", async (req, res) => {
+app.delete("/master-products/:id", requireAdmin, async (req, res) => {
   try {
     const deletedProduct = await MasterProduct.findByIdAndDelete(req.params.id);
     if (!deletedProduct) {
@@ -1862,20 +2215,21 @@ app.delete("/master-products/:id", async (req, res) => {
   }
 });
 
-app.patch("/master-products/:id", async (req, res) => {
+app.patch("/master-products/:id", requireAdmin, async (req, res) => {
   try {
-    let updateData = { ...req.body };
-    if (updateData.mrp) updateData.mrp = Number(updateData.mrp);
-    if (updateData.searchTags && typeof updateData.searchTags === 'string') updateData.searchTags = updateData.searchTags.split(',').map(t => t.trim());
+    const updateData = pickFields(req.body || {}, MASTER_PRODUCT_WRITABLE);
+    if (updateData.mrp !== undefined) updateData.mrp = Number(updateData.mrp);
+    const tags = normaliseSearchTags(req.body?.searchTags);
+    if (tags !== undefined) updateData.searchTags = tags;
     const updatedProduct = await MasterProduct.findByIdAndUpdate(req.params.id, updateData, { new: true });
     res.json(updatedProduct);
-  } catch (err) { 
-    res.status(500).json({ error: err.message }); 
+  } catch (err) {
+    res.status(500).json({ error: err.message });
   }
 });
 
 // 🌟 UPDATED BULK UPLOAD WITH QC GATEKEEPER 🌟
-app.post("/master-products/bulk-upload", memoryUpload.single('file'), async (req, res) => {
+app.post("/master-products/bulk-upload", requireAdmin, memoryUpload.single('file'), async (req, res) => {
   try {
     if (!req.file) return res.status(400).json({ error: 'No CSV file was uploaded.' });
     const jsonArray = await csv().fromString(req.file.buffer.toString('utf8'));
@@ -1930,16 +2284,34 @@ app.post("/master-products/bulk-upload", memoryUpload.single('file'), async (req
 // ==========================================
 // ⚡ DYNAMIC BULK IMPORT ROUTE
 // ==========================================
-app.post("/shops/:shopId/bulk-import", async (req, res) => {
+// Now gated by either the shop's own bearer token (the shop is editing its own
+// inventory from the dashboard) OR the admin X-Admin-Token (admin one-click
+// stocking). Previously anonymous — any visitor could replace any shop's
+// inventory at any discount.
+const requireShopOrAdmin = async (req, res, next) => {
+  const adminToken = req.headers['x-admin-token'];
+  if (adminToken && process.env.ADMIN_TOKEN && adminToken === process.env.ADMIN_TOKEN) {
+    req.isAdmin = true;
+    return next();
+  }
+  return requireShop(req, res, next);
+};
+
+app.post("/shops/:shopId/bulk-import", requireShopOrAdmin, async (req, res) => {
   try {
     const { shopId } = req.params;
-    
+    // Shop callers can only stock their own store; admin can stock any.
+    if (!req.isAdmin && req.shop && req.shop._id.toString() !== shopId) {
+      return res.status(403).json({ error: "Cannot bulk-import into another shop" });
+    }
+
     // 🚀 Grab the dynamic discount from the frontend (defaults to 0 if not sent)
-    const discountPercent = Number(req.body.discountPercent) || 0;
+    // Clamp 0–95% — keeps a typo (or malicious 99) from torching margins.
+    const discountPercent = Math.max(0, Math.min(95, Number(req.body.discountPercent) || 0));
 
     // 1. Fetch ALL Master Products
     const masterProducts = await MasterProduct.find({});
-    
+
     if (!masterProducts || masterProducts.length === 0) {
       return res.status(400).json({ error: "Master catalog is empty!" });
     }
@@ -1947,27 +2319,28 @@ app.post("/shops/:shopId/bulk-import", async (req, res) => {
     // 2. Format them for your Shop.inventory schema with the dynamic discount
     const newInventoryArray = masterProducts.map(product => {
       const baseMrp = Number(product.mrp) || 0;
-      
-      // 🧮 Math: If input is 10%, multiplier becomes 0.90
-      const discountMultiplier = (100 - discountPercent) / 100; 
-      const discountedPrice = Math.floor(baseMrp * discountMultiplier); 
+
+      // 🧮 Math: If input is 10%, multiplier becomes 0.90. Round (don't floor)
+      // so consistent under-rounding doesn't quietly erode revenue.
+      const discountMultiplier = (100 - discountPercent) / 100;
+      const discountedPrice = Math.round(baseMrp * discountMultiplier);
 
       return {
         product: product._id,         // References MasterProduct
         sellingPrice: discountedPrice, // Dynamically discounted price
-        stockCount: 100,               
-        inStock: true                  
+        stockCount: 100,
+        inStock: true
       };
     });
 
     // 3. Completely replace the shop's existing inventory array
-    await Shop.findByIdAndUpdate(shopId, { 
-      $set: { inventory: newInventoryArray } 
+    await Shop.findByIdAndUpdate(shopId, {
+      $set: { inventory: newInventoryArray }
     });
 
-    res.status(200).json({ 
+    res.status(200).json({
       success: true,
-      message: `Successfully imported ${newInventoryArray.length} products with a ${discountPercent}% discount!` 
+      message: `Successfully imported ${newInventoryArray.length} products with a ${discountPercent}% discount!`
     });
 
   } catch (error) {
@@ -2039,7 +2412,7 @@ app.get("/missed-searches", async (req, res) => {
 
 // Toggle resolved state — admin clicks "Mark resolved" once a matching
 // product is added, or unticks if they were wrong.
-app.patch("/missed-searches/:id/resolve", async (req, res) => {
+app.patch("/missed-searches/:id/resolve", requireAdmin, async (req, res) => {
   try {
     if (!mongoose.isValidObjectId(req.params.id)) {
       return res.status(400).json({ error: "Invalid id" });
@@ -2058,7 +2431,7 @@ app.patch("/missed-searches/:id/resolve", async (req, res) => {
   }
 });
 
-app.delete("/missed-searches/:id", async (req, res) => {
+app.delete("/missed-searches/:id", requireAdmin, async (req, res) => {
   try {
     if (!mongoose.isValidObjectId(req.params.id)) {
       return res.status(400).json({ error: "Invalid id" });
@@ -2095,7 +2468,7 @@ app.get("/ranking-config", async (_req, res) => {
 // Admin save. Whole-document replace of the editable fields; brand names
 // are lowercased + trimmed + de-duped here so the frontend doesn't have
 // to be careful.
-app.put("/ranking-config", async (req, res) => {
+app.put("/ranking-config", requireAdmin, async (req, res) => {
   try {
     const enabled = req.body?.enabled !== false; // default true on save
     const rawList = Array.isArray(req.body?.brandOrder) ? req.body.brandOrder : [];
@@ -2199,6 +2572,21 @@ async function cancelOrderWithRefund(order, opts) {
   const { statusLabel, customerTitle, customerMsg, shopTitle, shopMsg } = opts;
   const shortId = order._id.toString().slice(-5).toUpperCase();
 
+  // Atomic claim — only one caller can move the order from "not-closed" to
+  // the cancellation status. Two concurrent cancels (admin + worker, e.g.)
+  // used to double-refund coins and double-fire Razorpay refunds.
+  const claim = await Order.updateOne(
+    {
+      _id: order._id,
+      status: { $not: /❌|✅/ },
+    },
+    { $set: { status: statusLabel } }
+  );
+  if (claim.modifiedCount !== 1) {
+    // Someone else already closed it — drop out, leave their work intact.
+    return;
+  }
+
   // Refund coins regardless of payment method — they were debited at checkout.
   if (order.coinsUsed > 0 && order.userId && mongoose.Types.ObjectId.isValid(order.userId._id || order.userId)) {
     const userId = order.userId._id || order.userId;
@@ -2217,10 +2605,18 @@ async function cancelOrderWithRefund(order, opts) {
     };
   }
 
+  // statusHistory + refund flag piggyback on the local doc; status is already
+  // set via the conditional update above. Use updateOne to avoid the full-doc
+  // .save() race that would overwrite a shop-side accept that landed in between.
+  await Order.updateOne(
+    { _id: order._id },
+    {
+      $push: { statusHistory: { status: statusLabel, at: new Date() } },
+      $set: { refund: refundFlag },
+    }
+  );
+  // Keep the in-memory copy in sync for callers that read order.status downstream.
   order.status = statusLabel;
-  order.statusHistory = [...(order.statusHistory || []), { status: statusLabel, at: new Date() }];
-  order.refund = refundFlag;
-  await order.save();
 
   // Notify customer.
   const customerId = order.userId?._id || order.userId;
@@ -2275,9 +2671,16 @@ async function runEscalationScan() {
         if (tier.tier <= currentTier) continue;
         if (ageMs < tier.afterMs) break;
         try {
+          // Claim the tier atomically — only fire if the order is still
+          // Pending AND no other worker beat us to this tier. Without this,
+          // the previous `.save()` of the whole doc could overwrite a shop's
+          // accept that landed in between, un-accepting the order.
+          const claim = await Order.updateOne(
+            { _id: order._id, status: 'Pending', 'escalation.tier': { $lt: tier.tier } },
+            { $set: { escalation: { tier: tier.tier, lastFiredAt: new Date() } } }
+          );
+          if (claim.modifiedCount !== 1) break;
           await fireEscalationTier(order, tier);
-          order.escalation = { tier: tier.tier, lastFiredAt: new Date() };
-          await order.save();
           // If auto-cancel just ran, the order is no longer Pending — stop here.
           if (tier.tier === 3) break;
         } catch (e) {
