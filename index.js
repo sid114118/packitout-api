@@ -302,7 +302,7 @@ const Complaint = mongoose.model("Complaint", complaintSchema);
 const otpRequestSchema = new mongoose.Schema({
   phone: { type: String, required: true, index: true },
   otp: { type: String, required: true },
-  purpose: { type: String, enum: ['register', 'login'], default: 'register' },
+  purpose: { type: String, enum: ['register', 'login', 'reset'], default: 'register' },
   attempts: { type: Number, default: 0 },
   verified: { type: Boolean, default: false },
   consumed: { type: Boolean, default: false },
@@ -1751,7 +1751,8 @@ app.post("/complaints/:id/replies", async (req, res) => {
 app.post("/auth/send-otp", async (req, res) => {
   try {
     const phone = String(req.body.phone || "").trim();
-    const purpose = req.body.purpose === 'login' ? 'login' : 'register';
+    const incomingPurpose = String(req.body.purpose || 'register');
+    const purpose = (incomingPurpose === 'login' || incomingPurpose === 'reset') ? incomingPurpose : 'register';
 
     if (!validatePhone(phone)) {
       return res.status(400).json({ error: "Enter a valid 10-digit Indian mobile number." });
@@ -1760,10 +1761,14 @@ app.post("/auth/send-otp", async (req, res) => {
       return res.status(429).json({ error: "Too many OTP requests. Try again in 15 minutes." });
     }
 
-    // For registration, refuse if the number is already an account.
+    // Registration: phone must NOT already exist. Reset: phone MUST already
+    // exist (otherwise someone could probe whether a number is registered).
     if (purpose === 'register') {
       const existing = await User.findOne({ phone }).select('_id').lean();
       if (existing) return res.status(409).json({ error: "Phone already registered. Please log in." });
+    } else if (purpose === 'reset') {
+      const existing = await User.findOne({ phone }).select('_id').lean();
+      if (!existing) return res.status(404).json({ error: "No account found with that number." });
     }
 
     const otp = String(Math.floor(100000 + Math.random() * 900000));
@@ -1790,7 +1795,8 @@ app.post("/auth/verify-otp", async (req, res) => {
   try {
     const phone = String(req.body.phone || "").trim();
     const otp = String(req.body.otp || "").trim();
-    const purpose = req.body.purpose === 'login' ? 'login' : 'register';
+    const incomingPurpose = String(req.body.purpose || 'register');
+    const purpose = (incomingPurpose === 'login' || incomingPurpose === 'reset') ? incomingPurpose : 'register';
 
     if (!validatePhone(phone)) return res.status(400).json({ error: "Invalid phone number." });
     if (!/^\d{6}$/.test(otp)) return res.status(400).json({ error: "Enter the 6-digit OTP." });
@@ -1814,6 +1820,49 @@ app.post("/auth/verify-otp", async (req, res) => {
   } catch (err) {
     console.error("verify-otp error:", err);
     res.status(500).json({ error: "Could not verify OTP." });
+  }
+});
+
+// Reset password using a verified OTP token. Mirrors /register's token check:
+// only a verified, unconsumed 'reset' OtpRequest tied to the same phone is
+// accepted, and the token is burned on success so it can't reset twice.
+app.post("/auth/reset-password", async (req, res) => {
+  try {
+    const { phone, newPassword, verificationToken } = req.body || {};
+    const phoneStr = String(phone || "").trim();
+
+    if (!validatePhone(phoneStr)) return res.status(400).json({ error: "Enter a valid 10-digit Indian mobile number." });
+    if (!validatePassword(newPassword)) return res.status(400).json({ error: "Password must be at least 6 characters." });
+    if (!verificationToken) return res.status(400).json({ error: "Please verify your phone number first." });
+    if (!mongoose.Types.ObjectId.isValid(verificationToken)) {
+      return res.status(400).json({ error: "Invalid verification token." });
+    }
+
+    const otpRecord = await OtpRequest.findById(verificationToken);
+    if (!otpRecord || otpRecord.phone !== phoneStr || otpRecord.purpose !== 'reset' || !otpRecord.verified || otpRecord.consumed || otpRecord.expiresAt < new Date()) {
+      return res.status(400).json({ error: "Phone verification expired or invalid. Please request a new OTP." });
+    }
+
+    // select:+password so we can write the new hash to the doc and save.
+    const user = await User.findOne({ phone: phoneStr }).select('+password').populate('primaryShop');
+    if (!user) return res.status(404).json({ error: "No account found with that number." });
+
+    user.password = await bcrypt.hash(newPassword, 10);
+    await user.save();
+
+    otpRecord.consumed = true;
+    await otpRecord.save();
+
+    // Auto-login on reset — same shape as /login and /register so the frontend
+    // can drop straight into the app.
+    const sessionToken = await issueSessionToken(User, user._id);
+    const safe = user.toObject();
+    delete safe.password;
+    delete safe.sessionTokens;
+    res.json({ ...safe, sessionToken });
+  } catch (err) {
+    console.error("reset-password error:", err);
+    res.status(500).json({ error: "Could not reset password. Please try again." });
   }
 });
 
