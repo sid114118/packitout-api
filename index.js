@@ -1889,7 +1889,10 @@ app.post("/login", async (req, res) => {
     if (!validatePhone(phone)) return res.status(400).json({ error: "Enter a valid 10-digit Indian mobile number." });
     if (!password) return res.status(400).json({ error: "Enter your password." });
 
-    const user = await User.findOne({ phone }).populate('primaryShop');
+    // password is schema-level select:false (so it doesn't leak via GET /users)
+    // — must opt in explicitly here or bcrypt.compare sees undefined and every
+    // login fails as "Invalid phone or password" even for correct credentials.
+    const user = await User.findOne({ phone }).select('+password').populate('primaryShop');
     if (!user) return res.status(400).json({ error: "Invalid phone or password." });
 
     let matches = false;
