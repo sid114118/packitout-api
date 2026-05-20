@@ -559,16 +559,30 @@ const buildNewOrderShopNotif = (shortId, totalAmount, isUrgent, pickupTime) => {
 // ==========================================
 // 🚀 ONESIGNAL PUSH NOTIFICATION HELPER
 // ==========================================
-// OneSignal credentials. Hardcoded values are kept as a fallback during
-// rollout — ROTATE on the OneSignal dashboard, set ONESIGNAL_APP_ID +
-// ONESIGNAL_API_KEY on Hostinger, then strip the fallbacks.
-const ONE_SIGNAL_APP_ID = process.env.ONESIGNAL_APP_ID || "1da2e78d-0874-4965-a895-42c9237ee92b";
-const ONE_SIGNAL_API_KEY = process.env.ONESIGNAL_API_KEY || "26vkocoebe75v5dljzlncxcnx";
+// OneSignal credentials. REST API key MUST come from env. App ID is public
+// (it ships in the SDK init in the browser), so the hardcoded fallback is fine.
+const ONE_SIGNAL_APP_ID = process.env.ONE_SIGNAL_APP_ID || "1da2e78d-0874-4965-a895-42c9237ee92b";
+const ONE_SIGNAL_API_KEY = process.env.ONE_SIGNAL_API_KEY;
+if (!ONE_SIGNAL_API_KEY) {
+  console.error("[OneSignal] ONE_SIGNAL_API_KEY env var is missing — push notifications will not be sent.");
+}
+// v16 SDK registers users via OneSignal.login(id), which creates an External ID
+// alias. The legacy `include_external_user_ids` field is deprecated and silently
+// drops on accounts created in 2024+; use `include_aliases.external_id` with an
+// explicit `target_channel` instead.
 const sendPushNotification = async (targetUserId, title, message) => {
+  if (!ONE_SIGNAL_API_KEY) return;
   try {
     const response = await fetch("https://onesignal.com/api/v1/notifications", {
-      method: "POST", headers: { "Content-Type": "application/json; charset=utf-8", "Authorization": `Basic ${ONE_SIGNAL_API_KEY}` },
-      body: JSON.stringify({ app_id: ONE_SIGNAL_APP_ID, include_external_user_ids: [targetUserId.toString()], headings: { en: title }, contents: { en: message } })
+      method: "POST",
+      headers: { "Content-Type": "application/json; charset=utf-8", "Authorization": `Basic ${ONE_SIGNAL_API_KEY}` },
+      body: JSON.stringify({
+        app_id: ONE_SIGNAL_APP_ID,
+        target_channel: "push",
+        include_aliases: { external_id: [targetUserId.toString()] },
+        headings: { en: title },
+        contents: { en: message },
+      })
     });
     const data = await response.json();
     console.log("Push Sent Result:", data);
