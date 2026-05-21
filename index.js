@@ -27,15 +27,18 @@ const razorpay = (process.env.RAZORPAY_KEY_ID && process.env.RAZORPAY_KEY_SECRET
 // ==========================================
 // 🧾 PARCHI UPLOAD PACKAGES
 // ==========================================
-// Cloudinary credentials. The old hardcoded values are kept as a fallback so
-// existing deploys don't break before .env is filled in, but the committed
-// values are now public — ROTATE them on the Cloudinary dashboard, set
-// CLOUDINARY_API_SECRET (+ key + cloud_name) on Hostinger, then strip the
-// fallbacks.
+// Cloudinary credentials are required from env. The old hardcoded fallback
+// values were committed to the repo and so are considered public — they MUST
+// be rotated on the Cloudinary dashboard and the new values set on Hostinger
+// as CLOUDINARY_CLOUD_NAME / CLOUDINARY_API_KEY / CLOUDINARY_API_SECRET
+// before deploying. Until that's done image upload routes will fail loud.
+if (!process.env.CLOUDINARY_CLOUD_NAME || !process.env.CLOUDINARY_API_KEY || !process.env.CLOUDINARY_API_SECRET) {
+  console.error("[Cloudinary] CLOUDINARY_CLOUD_NAME / CLOUDINARY_API_KEY / CLOUDINARY_API_SECRET env vars are required. Image uploads will fail until set.");
+}
 cloudinary.config({
-  cloud_name: process.env.CLOUDINARY_CLOUD_NAME || 'dj48tkcsw',
-  api_key:    process.env.CLOUDINARY_API_KEY    || '272175433165944',
-  api_secret: process.env.CLOUDINARY_API_SECRET || 'Oum12kRi9FjCa5kPe0ZaEoLTAvQ',
+  cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
+  api_key:    process.env.CLOUDINARY_API_KEY,
+  api_secret: process.env.CLOUDINARY_API_SECRET,
 });
 
 // File uploads: cap at 8 MB and reject anything that isn't an image. Without
@@ -152,12 +155,29 @@ const masterProductSchema = new mongoose.Schema({
 });
 const MasterProduct = mongoose.model("MasterProduct", masterProductSchema);
 
+// Saved address book entry. Each user can keep multiple — Home, Work, etc.
+// At most one is `isDefault: true`, enforced in app code (Mongo can't enforce
+// "exactly one true" inside a subdoc array without an aggregation guard).
+const addressSchema = new mongoose.Schema({
+  label: { type: String, default: 'Home' },       // "Home" / "Work" / freeform
+  line1: { type: String, default: '' },
+  line2: { type: String, default: '' },
+  landmark: { type: String, default: '' },
+  pincode: { type: String, default: '' },
+  isDefault: { type: Boolean, default: false },
+}, { _id: true });
+
 const userSchema = new mongoose.Schema({
   name: String, phone: { type: String, unique: true },
   // Password hash — select:false so it never leaks via GET /users or
   // /users/:id, which used to return it on every response.
   password: { type: String, select: false },
+  // pincode + address kept for backwards-compat (legacy single-address rows
+  // and the user's PIN, which still drives serviceable-shop discovery).
+  // New saved-address book lives in `addresses` below; the frontend reads
+  // from there first and falls back to the legacy field for old users.
   pincode: String, address: String,
+  addresses: { type: [addressSchema], default: [] },
   coins: { type: Number, default: 0 }, referralCode: { type: String, unique: true },
   referredBy: String, primaryShop: { type: mongoose.Schema.Types.ObjectId, ref: 'Shop' },
   // 🔐 Session tokens — same pattern as Shop.sessionTokens. select:false so they
@@ -205,10 +225,14 @@ const orderSchema = new mongoose.Schema({
   // 🔁 Refund bookkeeping for auto-cancelled paid orders. When the SMS/voice
   // pipeline gives up at T+15min, coins are auto-returned and Razorpay refund is
   // flagged for admin (or auto-fired if AUTO_REFUND_ENABLED=true env is set).
+  // coinsRefunded: idempotency flag — once true, the coin refund is never
+  // re-issued, no matter how many cancel paths race or get retried. Set via an
+  // atomic update inside cancelOrderWithRefund().
   refund: {
     pending: { type: Boolean, default: false },
     razorpayRefundId: { type: String, default: "" },
     attemptedAt: { type: Date, default: null },
+    coinsRefunded: { type: Boolean, default: false },
   },
   // 📒 Ops call log — admin notes and force-actions taken on this order.
   // Surfaced in the Live Ops tab so successive admins (or later auditing)
@@ -229,9 +253,36 @@ orderSchema.index({ userId: 1, createdAt: -1 });
 orderSchema.index({ shopId: 1, createdAt: -1 });
 const Order = mongoose.model("Order", orderSchema);
 
+// Parchi (handwritten shopping list). Status lifecycle:
+//   'pending'   — uploaded by customer, awaiting shop quote
+//   'quoted'    — shop has built a bill and sent it; customer is choosing payment
+//   'accepted'  — customer accepted via UPI or pay-on-pickup; order created
+//   'processed' — legacy terminal state from before the bill flow existed
+//   'cancelled' — explicitly closed without becoming an order
+// The bill embeds the shop's UPI ID at quote time so a later edit to the
+// shop's profile doesn't retroactively change what the customer paid against.
+const parchiBillItemSchema = new mongoose.Schema({
+  productId: { type: mongoose.Schema.Types.ObjectId, ref: 'MasterProduct', default: null },
+  name: { type: String, default: '' },
+  qty: { type: Number, default: 1 },
+  price: { type: Number, default: 0 },
+  image: { type: String, default: '' },
+  emoji: { type: String, default: '' },
+}, { _id: false });
+
 const parchiSchema = new mongoose.Schema({
   userId: String, shopId: String, customerName: String, imageUrl: String,
-  status: { type: String, default: 'pending' }, createdAt: { type: Date, default: Date.now }
+  status: { type: String, default: 'pending' },
+  bill: {
+    items: { type: [parchiBillItemSchema], default: [] },
+    totalAmount: { type: Number, default: 0 },
+    sentAt: { type: Date, default: null },
+    shopUpiId: { type: String, default: '' },
+    shopName: { type: String, default: '' },
+  },
+  acceptedPaymentMethod: { type: String, default: '' }, // 'UPI' | 'POP'
+  orderId: { type: mongoose.Schema.Types.ObjectId, ref: 'Order', default: null },
+  createdAt: { type: Date, default: Date.now },
 });
 parchiSchema.index({ shopId: 1, status: 1, createdAt: -1 });
 parchiSchema.index({ userId: 1, status: 1, createdAt: -1 });
@@ -346,6 +397,24 @@ const RankingConfig = mongoose.model("RankingConfig", rankingConfigSchema);
 const validatePhone = (phone) => /^[6-9]\d{9}$/.test(String(phone || "").trim());
 const validatePincode = (pincode) => /^\d{6}$/.test(String(pincode || "").trim());
 const validatePassword = (password) => typeof password === 'string' && password.length >= 6;
+
+// Lightweight in-memory rate limiter — keyed by IP + route bucket. Drops the
+// oldest hits outside the window so a steady stream of allowed requests doesn't
+// keep them tagged as rate-limited forever. Single-process only; behind a load
+// balancer we'd switch to Redis. Routes call rateLimit('bucket', max, windowMs).
+const rateLimitBuckets = new Map(); // key -> [timestamps]
+const rateLimit = (bucket, max, windowMs) => (req, res, next) => {
+  const ip = (req.headers['x-forwarded-for']?.toString().split(',')[0] || req.ip || req.connection?.remoteAddress || 'unknown').trim();
+  const key = `${bucket}:${ip}`;
+  const now = Date.now();
+  const past = (rateLimitBuckets.get(key) || []).filter(t => now - t < windowMs);
+  if (past.length >= max) {
+    return res.status(429).json({ error: "Too many requests. Please slow down." });
+  }
+  past.push(now);
+  rateLimitBuckets.set(key, past);
+  next();
+};
 
 // Treat any password starting with $2a$/$2b$/$2y$ as a bcrypt hash. Otherwise plaintext (legacy).
 const looksHashed = (pwd) => typeof pwd === 'string' && /^\$2[aby]\$/.test(pwd);
@@ -596,11 +665,24 @@ const sendPushNotification = async (targetUserId, title, message) => {
 app.get("/ping", (req, res) => res.send("PackItOut Server is ALIVE! 🟢"));
 
 // --- NOTIFICATION ROUTES ---
-app.get("/notifications/user/:userId", async (req, res) => {
-  try { res.json(await Notification.find({ userId: req.params.userId }).sort({ createdAt: -1 }).limit(20)); } catch (err) { res.status(500).json({ error: err.message }); }
+// Bearer-token gated — :userId / :shopId must match the session that's asking.
+// Previously unauth'd, so any visitor with a guessed/leaked ObjectId could
+// scrape another user's notification history (order statuses, refund pings, etc).
+app.get("/notifications/user/:userId", requireUser, async (req, res) => {
+  try {
+    if (req.user._id.toString() !== req.params.userId) {
+      return res.status(403).json({ error: "Not your notifications" });
+    }
+    res.json(await Notification.find({ userId: req.params.userId }).sort({ createdAt: -1 }).limit(20));
+  } catch (err) { res.status(500).json({ error: err.message }); }
 });
-app.get("/notifications/shop/:shopId", async (req, res) => {
-  try { res.json(await Notification.find({ shopId: req.params.shopId }).sort({ createdAt: -1 }).limit(20)); } catch (err) { res.status(500).json({ error: err.message }); }
+app.get("/notifications/shop/:shopId", requireShop, async (req, res) => {
+  try {
+    if (req.shop._id.toString() !== req.params.shopId) {
+      return res.status(403).json({ error: "Not your notifications" });
+    }
+    res.json(await Notification.find({ shopId: req.params.shopId }).sort({ createdAt: -1 }).limit(20));
+  } catch (err) { res.status(500).json({ error: err.message }); }
 });
 app.patch("/notifications/read-all", async (req, res) => {
   try {
@@ -753,11 +835,21 @@ app.post("/admin/orders/:id/ops-log", requireAdmin, async (req, res) => {
 });
 
 // --- PARCHI ROUTES ---
-app.post("/upload-parchi", upload.single('parchiImage'), async (req, res) => {
+// Bearer-token gated. userId is taken from the session, not the body — used to
+// be unauth'd, which let anyone forge uploads attributed to any user or shop.
+// Rate-limited: 10 uploads per minute per IP to stop spam fills of Cloudinary.
+app.post("/upload-parchi", rateLimit('upload-parchi', 10, 60 * 1000), requireUser, upload.single('parchiImage'), async (req, res) => {
   if (!req.file) return res.status(400).json({ error: "No image." });
   try {
+    const shopId = req.body?.shopId && mongoose.isValidObjectId(req.body.shopId) ? req.body.shopId : null;
+    if (!shopId) return res.status(400).json({ error: "Valid shopId required" });
     const result = await cloudinary.uploader.upload(req.file.path, { folder: 'packitout_parchis' });
-    const newParchi = new Parchi({ userId: req.body.userId, shopId: req.body.shopId, customerName: req.body.customerName, imageUrl: result.secure_url });
+    const newParchi = new Parchi({
+      userId: req.user._id.toString(),
+      shopId,
+      customerName: req.user.name || req.body.customerName || 'Customer',
+      imageUrl: result.secure_url,
+    });
     await newParchi.save();
     res.status(200).json({ success: true, parchi: newParchi });
   } catch (error) {
@@ -767,8 +859,11 @@ app.post("/upload-parchi", upload.single('parchiImage'), async (req, res) => {
   }
 });
 
-// 🤖 AI PARCHI EXTRACTION — reads handwritten list with Gemini and matches to catalog
-app.post("/extract-parchi", upload.single('parchiImage'), async (req, res) => {
+// 🤖 AI PARCHI EXTRACTION — reads handwritten list with Gemini and matches to catalog.
+// Login-gated: response includes per-shop selling prices, which previously
+// leaked to any unauthenticated caller who knew/guessed a shopId.
+// Rate-limited: Gemini calls cost money — 6/min/IP cap.
+app.post("/extract-parchi", rateLimit('extract-parchi', 6, 60 * 1000), requireUser, upload.single('parchiImage'), async (req, res) => {
   if (!genAI) return res.status(500).json({ error: "GEMINI_API_KEY not configured on the server." });
   if (!req.file) return res.status(400).json({ error: "No image." });
 
@@ -912,14 +1007,202 @@ Return ONLY a JSON array — no prose, no markdown fences. Shape:
     safeUnlink(req.file?.path);
   }
 });
-app.get("/parchis/:shopId", async (req, res) => {
-  try { res.json(await Parchi.find({ shopId: req.params.shopId, status: 'pending' }).sort({createdAt: -1})); } catch(err) { res.status(500).json({ error: err.message }); }
+// Parchi (handwritten shopping list) lookups. Bearer-token gated — only the
+// shop that owns the parchis or the user who uploaded them can read them.
+// Previously unauth'd, which let any visitor list another shop's pending
+// parchis or another user's uploads.
+app.get("/parchis/:shopId", requireShop, async (req, res) => {
+  try {
+    if (req.shop._id.toString() !== req.params.shopId) {
+      return res.status(403).json({ error: "Not your shop" });
+    }
+    res.json(await Parchi.find({ shopId: req.params.shopId, status: 'pending' }).sort({createdAt: -1}));
+  } catch(err) { res.status(500).json({ error: err.message }); }
 });
-app.get("/parchis/user/:userId", async (req, res) => {
-  try { res.json(await Parchi.find({ userId: req.params.userId, status: 'pending' }).sort({createdAt: -1})); } catch (err) { res.status(500).json({ error: err.message }); }
+app.get("/parchis/user/:userId", requireUser, async (req, res) => {
+  try {
+    if (req.user._id.toString() !== req.params.userId) {
+      return res.status(403).json({ error: "Not your parchis" });
+    }
+    res.json(await Parchi.find({ userId: req.params.userId, status: 'pending' }).sort({createdAt: -1}));
+  } catch (err) { res.status(500).json({ error: err.message }); }
 });
 app.get("/admin/all-parchis", requireAdmin, async (req, res) => {
   try { res.json(await Parchi.find({ status: 'pending' }).sort({ createdAt: -1 })); } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// 🧾 PARCHI BILL — shop builds a quote for a customer's handwritten list.
+// Bearer-token gated; shop must own the parchi. Items are re-validated against
+// the shop's live inventory so a shop can't quote out-of-stock items and
+// prices snap back to the shop's current sellingPrice (the dashboard UI is
+// already wired to the same numbers, but the server is the source of truth).
+app.post("/parchis/:id/send-bill", requireShop, async (req, res) => {
+  try {
+    if (!mongoose.isValidObjectId(req.params.id)) return res.status(400).json({ error: "Invalid parchi id" });
+    const parchi = await Parchi.findById(req.params.id);
+    if (!parchi) return res.status(404).json({ error: "Parchi not found" });
+    if (String(parchi.shopId) !== req.shop._id.toString()) {
+      return res.status(403).json({ error: "Not your parchi" });
+    }
+    if (parchi.status !== 'pending') {
+      return res.status(400).json({ error: `Bill already ${parchi.status}` });
+    }
+
+    const items = Array.isArray(req.body?.items) ? req.body.items : [];
+    if (items.length === 0) return res.status(400).json({ error: "items required" });
+
+    const shop = await Shop.findById(req.shop._id).populate('inventory.product');
+    if (!shop) return res.status(404).json({ error: "Shop not found" });
+    if (!shop.upiId || !String(shop.upiId).includes('@')) {
+      return res.status(400).json({ error: "Set your UPI ID in shop profile before sending a bill." });
+    }
+
+    // Build the inventory lookup, then snap each requested item to the shop's
+    // canonical product + sellingPrice. Drops anything not in stock — we won't
+    // quote items the shop can't actually fulfill.
+    const invByProduct = new Map();
+    for (const inv of (shop.inventory || [])) {
+      if (!inv.product || inv.inStock === false) continue;
+      invByProduct.set(inv.product._id.toString(), { inv, product: inv.product });
+    }
+
+    const billItems = [];
+    let totalAmount = 0;
+    for (const raw of items) {
+      const pid = raw?.productId && mongoose.isValidObjectId(raw.productId) ? raw.productId.toString() : null;
+      if (!pid) continue;
+      const match = invByProduct.get(pid);
+      if (!match) continue; // not in stock at this shop — silently drop
+      const qty = Math.max(1, Math.min(99, Math.floor(Number(raw.qty) || 1)));
+      const price = Number(match.inv.sellingPrice || match.product.mrp || 0);
+      billItems.push({
+        productId: match.product._id,
+        name: match.product.name,
+        qty,
+        price,
+        image: match.product.image || '',
+        emoji: match.product.emoji || '',
+      });
+      totalAmount += price * qty;
+    }
+    if (billItems.length === 0) {
+      return res.status(400).json({ error: "None of the items are currently in stock at this shop." });
+    }
+
+    parchi.bill = {
+      items: billItems,
+      totalAmount,
+      sentAt: new Date(),
+      shopUpiId: shop.upiId,
+      shopName: shop.name || '',
+    };
+    parchi.status = 'quoted';
+    await parchi.save();
+
+    // Tell the customer their bill is ready.
+    if (parchi.userId && mongoose.isValidObjectId(parchi.userId)) {
+      const title = '🧾 Your Bill is Ready';
+      const body = `${shop.name || 'The shop'} prepared your parchi: ₹${totalAmount}. Tap to pay or choose pay-on-pickup.`;
+      try {
+        await Notification.create({ userId: parchi.userId, type: 'system', title, message: body });
+        await sendPushNotification(parchi.userId, title, body);
+      } catch (e) { console.log('parchi bill notify skipped:', e.message); }
+    }
+
+    res.json({ success: true, parchi });
+  } catch (err) {
+    console.error('send-bill error:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// 🧾 PARCHI BILL — customer accepts a quoted bill. paymentMethod is either:
+//   'UPI' — customer has already paid via UPI deep link to shop's UPI ID
+//   'POP' — pay on pickup (cash/UPI to shop at the counter)
+// Either way, an Order is created with the bill's items + total so the order
+// shows up in OrdersPage and the shop's OrdersTab like a normal order.
+app.post("/parchis/:id/accept-bill", requireUser, async (req, res) => {
+  try {
+    if (!mongoose.isValidObjectId(req.params.id)) return res.status(400).json({ error: "Invalid parchi id" });
+    const parchi = await Parchi.findById(req.params.id);
+    if (!parchi) return res.status(404).json({ error: "Parchi not found" });
+    if (String(parchi.userId) !== req.user._id.toString()) {
+      return res.status(403).json({ error: "Not your parchi" });
+    }
+    if (parchi.status !== 'quoted') {
+      return res.status(400).json({ error: `Bill is ${parchi.status}, not awaiting confirmation` });
+    }
+    const method = String(req.body?.paymentMethod || '').toUpperCase();
+    if (!['UPI', 'POP'].includes(method)) {
+      return res.status(400).json({ error: "paymentMethod must be 'UPI' or 'POP'." });
+    }
+    const bill = parchi.bill || {};
+    if (!Array.isArray(bill.items) || bill.items.length === 0 || !(bill.totalAmount > 0)) {
+      return res.status(400).json({ error: "Bill is incomplete." });
+    }
+    if (!mongoose.isValidObjectId(parchi.shopId)) {
+      return res.status(400).json({ error: "Invalid shop reference on parchi." });
+    }
+
+    // Atomic state transition so two concurrent accepts don't both create
+    // an order. The losing call sees modifiedCount=0 and bails.
+    const claim = await Parchi.updateOne(
+      { _id: parchi._id, status: 'quoted' },
+      { $set: { status: 'accepted', acceptedPaymentMethod: method } }
+    );
+    if (claim.modifiedCount !== 1) {
+      return res.status(409).json({ error: "Bill was already accepted or cancelled." });
+    }
+
+    const orderItems = bill.items.map(it => ({
+      productId: it.productId,
+      name: it.name,
+      qty: it.qty,
+      price: it.price,
+      sellingPrice: it.price,
+      image: it.image,
+      emoji: it.emoji,
+    }));
+    const order = await Order.create({
+      userId: req.user._id,
+      shopId: parchi.shopId,
+      items: orderItems,
+      totalAmount: bill.totalAmount,
+      paymentMethod: method === 'UPI' ? 'UPI' : 'POP',
+      paymentStatus: method === 'UPI' ? 'Paid' : 'Unpaid',
+      status: 'Pending',
+      imageUrl: parchi.imageUrl || '',
+      statusHistory: [{ status: 'Pending', at: new Date() }],
+    });
+    await Parchi.updateOne({ _id: parchi._id }, { $set: { orderId: order._id } });
+
+    // Notify shop — same shape as the regular new-order notif.
+    const shortId = order._id.toString().slice(-5).toUpperCase();
+    const { title: shopTitle, message: shopMessage } = buildNewOrderShopNotif(shortId, order.totalAmount, false, null);
+    try {
+      await Notification.create({ shopId: parchi.shopId, orderId: order._id, type: 'new_order', title: shopTitle, message: shopMessage });
+      await sendPushNotification(parchi.shopId, shopTitle, shopMessage);
+    } catch (e) { console.log('parchi accept shop notify skipped:', e.message); }
+
+    res.json({ success: true, order });
+  } catch (err) {
+    console.error('accept-bill error:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// User's own parchis with any status — fuels the "My Bills" list so customers
+// can find a quote they missed in the bell.
+app.get("/parchis/user/:userId/all", requireUser, async (req, res) => {
+  try {
+    if (req.user._id.toString() !== req.params.userId) {
+      return res.status(403).json({ error: "Not your parchis" });
+    }
+    const list = await Parchi.find({ userId: req.params.userId })
+      .sort({ createdAt: -1 })
+      .limit(50);
+    res.json(list);
+  } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
 // Admin manual coin adjustment. Set or add to a user's coin balance from the
@@ -1374,8 +1657,13 @@ app.get("/orders/shop/:shopId", requireShop, async (req, res) => {
 // Slim per-user feed for the customer feed's "Buy It Again" widget. The old
 // approach was to fetch /orders (every order, every user, populated) and filter
 // client-side — this avoids the global scan and the populate join.
-app.get("/orders/user/:userId", async (req, res) => {
+// Bearer-token gated — :userId must match the session. Previously unauth'd,
+// which let any visitor dump another customer's full order history by ID.
+app.get("/orders/user/:userId", requireUser, async (req, res) => {
   try {
+    if (req.user._id.toString() !== req.params.userId) {
+      return res.status(403).json({ error: "Not your orders" });
+    }
     // Populate just the shop fields the OrdersPage card needs — keeps the
     // payload small while still letting the customer see who they ordered from.
     const orders = await Order.find({ userId: req.params.userId })
@@ -1475,8 +1763,10 @@ app.post("/orders/:id/shop-cancel", requireShop, async (req, res) => {
       statusLabel: 'Cancelled ❌ (by shop)',
       customerTitle: 'Order Cancelled ❌',
       customerMsg:   `Sorry — the shop cancelled your order #${shortId}. Refund is being processed.`,
-      // No shop-side push: the shop just cancelled it themselves, so don't ping them.
-      shopTitle: null,
+      // Confirmation push to the shop too, so multi-device shops see the
+      // cancellation reflected even on the device that didn't trigger it.
+      shopTitle: 'Order Cancelled by You ❌',
+      shopMsg:   `Order #${shortId} has been cancelled. The customer was notified and the refund is being processed.`,
     });
     // Stamp the ops trail so admin / future audits see who cancelled and why.
     try {
@@ -1513,8 +1803,10 @@ app.post("/orders/:id/user-cancel", requireUser, async (req, res) => {
     const shortId = order._id.toString().slice(-5).toUpperCase();
     await cancelOrderWithRefund(order, {
       statusLabel: 'Cancelled ❌ (by customer)',
-      // No customer push — they just clicked the cancel button, they know.
-      customerTitle: null,
+      // Confirmation push so the customer has a receipt in their notification
+      // history and any other device they're logged in on reflects the cancel.
+      customerTitle: 'Order Cancelled ❌',
+      customerMsg:   `Your order #${shortId} has been cancelled. Any coins or payment will be refunded shortly.`,
       shopTitle: 'Order Cancelled by Customer ❌',
       shopMsg: `The customer cancelled order #${shortId} before you accepted it.`,
     });
@@ -1553,8 +1845,16 @@ app.post("/reviews/order-review", requireUser, async (req, res) => {
     const userName = req.user.name || 'Customer';
     const reviewsToInsert = [];
 
-    if (shop && shop.rating > 0 && shop.shopId && mongoose.Types.ObjectId.isValid(shop.shopId)) {
-      reviewsToInsert.push({ userId, userName, orderId, targetId: shop.shopId, targetType: 'shop', rating: Math.max(1, Math.min(5, Number(shop.rating))), comment: String(shop.reviewText || '').slice(0, 1000) });
+    // Resolve the target shopId once, falling back to the order's own shopId
+    // when the client forgot to send it. Used to silently drop the rating if
+    // shop.shopId was missing, so older orders' reviews never counted toward
+    // the shop's average.
+    const resolvedShopId = (shop && shop.shopId && mongoose.Types.ObjectId.isValid(shop.shopId))
+      ? shop.shopId
+      : (order.shopId ? order.shopId.toString() : null);
+
+    if (shop && shop.rating > 0 && resolvedShopId) {
+      reviewsToInsert.push({ userId, userName, orderId, targetId: resolvedShopId, targetType: 'shop', rating: Math.max(1, Math.min(5, Number(shop.rating))), comment: String(shop.reviewText || '').slice(0, 1000) });
     }
 
     if (Array.isArray(items)) {
@@ -1569,15 +1869,8 @@ app.post("/reviews/order-review", requireUser, async (req, res) => {
       await Review.insertMany(reviewsToInsert);
     }
 
-    if (shop && shop.rating > 0 && shop.shopId) {
-      // O(1) recompute instead of pulling every review into memory.
-      const [agg] = await Review.aggregate([
-        { $match: { targetId: new mongoose.Types.ObjectId(shop.shopId), targetType: 'shop' } },
-        { $group: { _id: null, avg: { $avg: '$rating' }, count: { $sum: 1 } } },
-      ]);
-      if (agg) {
-        await Shop.findByIdAndUpdate(shop.shopId, { rating: Number(agg.avg.toFixed(1)), totalReviews: agg.count });
-      }
+    if (shop && shop.rating > 0 && resolvedShopId) {
+      await recomputeShopRating(resolvedShopId);
     }
 
     await Order.findByIdAndUpdate(orderId, { $set: { isReviewed: true } });
@@ -1618,24 +1911,101 @@ app.get("/reviews/order/:orderId", async (req, res) => {
   }
 });
 
+// Recompute and persist the aggregate rating + total review count for a shop.
+// Used after PATCH/DELETE so the shop's headline rating stays accurate.
+async function recomputeShopRating(shopId) {
+  if (!shopId || !mongoose.isValidObjectId(shopId)) return;
+  const [agg] = await Review.aggregate([
+    { $match: { targetId: new mongoose.Types.ObjectId(shopId), targetType: 'shop' } },
+    { $group: { _id: null, avg: { $avg: '$rating' }, count: { $sum: 1 } } },
+  ]);
+  await Shop.findByIdAndUpdate(shopId, {
+    rating: agg ? Number(agg.avg.toFixed(1)) : 5.0,
+    totalReviews: agg ? agg.count : 0,
+  });
+}
+
+// PATCH /reviews/:id — owner-only edit of rating + comment.
+app.patch("/reviews/:id", requireUser, async (req, res) => {
+  try {
+    if (!mongoose.isValidObjectId(req.params.id)) return res.status(400).json({ error: "Invalid review id" });
+    const review = await Review.findById(req.params.id);
+    if (!review) return res.status(404).json({ error: "Review not found" });
+    if (review.userId.toString() !== req.user._id.toString()) {
+      return res.status(403).json({ error: "Not your review" });
+    }
+    const next = {};
+    if (req.body?.rating !== undefined) {
+      const r = Math.max(1, Math.min(5, Number(req.body.rating)));
+      if (!Number.isFinite(r)) return res.status(400).json({ error: "Rating must be 1–5." });
+      next.rating = r;
+    }
+    if (typeof req.body?.comment === 'string') {
+      next.comment = req.body.comment.slice(0, 1000);
+    }
+    if (Object.keys(next).length === 0) return res.status(400).json({ error: "Nothing to update." });
+    Object.assign(review, next);
+    await review.save();
+
+    if (review.targetType === 'shop' && 'rating' in next) {
+      await recomputeShopRating(review.targetId);
+    }
+    res.json(review);
+  } catch (err) {
+    console.error('review update error:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// DELETE /reviews/:id — owner-only. If the order had only one review and it's
+// deleted, the order is allowed to be reviewed again (isReviewed=false), so a
+// user who deleted a wrong review can submit a fresh one.
+app.delete("/reviews/:id", requireUser, async (req, res) => {
+  try {
+    if (!mongoose.isValidObjectId(req.params.id)) return res.status(400).json({ error: "Invalid review id" });
+    const review = await Review.findById(req.params.id);
+    if (!review) return res.status(404).json({ error: "Review not found" });
+    if (review.userId.toString() !== req.user._id.toString()) {
+      return res.status(403).json({ error: "Not your review" });
+    }
+    const { targetType, targetId, orderId } = review;
+    await Review.deleteOne({ _id: review._id });
+
+    if (targetType === 'shop') await recomputeShopRating(targetId);
+
+    // If no reviews remain on this order, let the user re-submit one.
+    const remaining = await Review.countDocuments({ orderId });
+    if (remaining === 0 && orderId) {
+      await Order.updateOne({ _id: orderId }, { $set: { isReviewed: false } });
+    }
+    res.json({ success: true });
+  } catch (err) {
+    console.error('review delete error:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // --- 📣 COMPLAINT ROUTES ---
 // Customer files a complaint. Notifies the admin in-app, and pings the shop
-// when the complaint is targeted at one.
-app.post("/complaints", async (req, res) => {
+// when the complaint is targeted at one. Bearer-token gated — userId / userName
+// / userPhone come from the session so the caller can't impersonate someone.
+// Rate-limited: 5 complaints per 10 min/IP to stop spam against a shop.
+app.post("/complaints", rateLimit('complaints', 5, 10 * 60 * 1000), requireUser, async (req, res) => {
   try {
     const { targetType, message } = req.body || {};
     if (!targetType || !message || !message.trim()) {
       return res.status(400).json({ error: "targetType and message are required." });
     }
 
+    const shopId = req.body.shopId && mongoose.isValidObjectId(req.body.shopId) ? req.body.shopId : null;
     const complaint = new Complaint({
-      userId: req.body.userId || null,
-      userName: req.body.userName || 'Customer',
-      userPhone: req.body.userPhone || '',
+      userId: req.user._id,
+      userName: req.user.name || 'Customer',
+      userPhone: req.user.phone || '',
       targetType,
-      shopId: req.body.shopId || null,
-      itemName: req.body.itemName || '',
-      message: message.trim(),
+      shopId,
+      itemName: (req.body.itemName || '').toString().slice(0, 200),
+      message: message.trim().slice(0, 2000),
     });
     await complaint.save();
 
@@ -1667,9 +2037,12 @@ app.get("/complaints", requireAdmin, async (req, res) => {
   } catch (err) { res.status(500).json({ error: "Failed to fetch complaints" }); }
 });
 
-// Shop view — only complaints filed against this shop.
-app.get("/complaints/shop/:shopId", async (req, res) => {
+// Shop view — only complaints filed against this shop. Bearer-token gated.
+app.get("/complaints/shop/:shopId", requireShop, async (req, res) => {
   try {
+    if (req.shop._id.toString() !== req.params.shopId) {
+      return res.status(403).json({ error: "Not your shop" });
+    }
     const list = await Complaint.find({ shopId: req.params.shopId })
       .sort({ createdAt: -1 });
     res.json(list);
@@ -1677,9 +2050,12 @@ app.get("/complaints/shop/:shopId", async (req, res) => {
 });
 
 // User view — every complaint a given customer filed, newest first. Used by
-// the "My Complaints" screen so the user can read replies.
-app.get("/complaints/user/:userId", async (req, res) => {
+// the "My Complaints" screen so the user can read replies. Bearer-token gated.
+app.get("/complaints/user/:userId", requireUser, async (req, res) => {
   try {
+    if (req.user._id.toString() !== req.params.userId) {
+      return res.status(403).json({ error: "Not your complaints" });
+    }
     const list = await Complaint.find({ userId: req.params.userId })
       .populate('shopId', 'name')
       .sort({ createdAt: -1 });
@@ -1687,31 +2063,46 @@ app.get("/complaints/user/:userId", async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
+// Either the admin OR the targeted shop can change status. Used to be unauth'd
+// (anyone could mark complaints resolved to bury them).
+const requireShopOrAdmin2 = async (req, res, next) => {
+  const adminToken = req.headers['x-admin-token'];
+  if (adminToken && process.env.ADMIN_TOKEN && adminToken === process.env.ADMIN_TOKEN) {
+    req.isAdmin = true;
+    return next();
+  }
+  return requireShop(req, res, next);
+};
+
 // Status updates: open ↔ reviewed ↔ resolved.
-app.patch("/complaints/:id", async (req, res) => {
+app.patch("/complaints/:id", requireShopOrAdmin2, async (req, res) => {
   try {
     const { status } = req.body || {};
     if (!['open', 'reviewed', 'resolved'].includes(status)) {
       return res.status(400).json({ error: "Invalid status." });
     }
-    const updated = await Complaint.findByIdAndUpdate(
-      req.params.id,
-      { $set: { status } },
-      { new: true }
-    );
-    if (!updated) return res.status(404).json({ error: "Complaint not found." });
-    res.json(updated);
+    const complaint = await Complaint.findById(req.params.id);
+    if (!complaint) return res.status(404).json({ error: "Complaint not found." });
+    // Shop can only mutate complaints filed against itself.
+    if (!req.isAdmin) {
+      const complaintShopId = complaint.shopId ? complaint.shopId.toString() : '';
+      if (complaintShopId !== req.shop._id.toString()) {
+        return res.status(403).json({ error: "Not your complaint" });
+      }
+    }
+    complaint.status = status;
+    await complaint.save();
+    res.json(complaint);
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
 // Shop or admin posts a reply onto a complaint. The original customer is
 // notified in-app + via OneSignal so they know to come back and read it.
-app.post("/complaints/:id/replies", async (req, res) => {
+// Bearer-token / admin-token gated; authorType is derived from the credential,
+// not the body, so a logged-in shop can't pose as "admin" or vice versa.
+app.post("/complaints/:id/replies", requireShopOrAdmin2, async (req, res) => {
   try {
-    const { authorType, authorName, message } = req.body || {};
-    if (!['shop', 'admin'].includes(authorType)) {
-      return res.status(400).json({ error: "authorType must be 'shop' or 'admin'." });
-    }
+    const { message } = req.body || {};
     if (!message || !message.trim()) {
       return res.status(400).json({ error: "Reply message is required." });
     }
@@ -1719,10 +2110,24 @@ app.post("/complaints/:id/replies", async (req, res) => {
     const complaint = await Complaint.findById(req.params.id);
     if (!complaint) return res.status(404).json({ error: "Complaint not found." });
 
+    let authorType, authorName;
+    if (req.isAdmin) {
+      authorType = 'admin';
+      authorName = (req.body.authorName || 'PackItOut Support').toString().slice(0, 120);
+    } else {
+      // Shop reply — must own the complaint.
+      const complaintShopId = complaint.shopId ? complaint.shopId.toString() : '';
+      if (complaintShopId !== req.shop._id.toString()) {
+        return res.status(403).json({ error: "Not your complaint" });
+      }
+      authorType = 'shop';
+      authorName = (req.shop.name || 'Shop').toString().slice(0, 120);
+    }
+
     complaint.replies.push({
       authorType,
-      authorName: (authorName || '').toString().slice(0, 120),
-      message: message.trim(),
+      authorName,
+      message: message.trim().slice(0, 2000),
     });
     // A fresh reply implies someone is engaging with it — auto-bump 'open' to
     // 'reviewed' so the admin queue reflects reality.
@@ -1979,8 +2384,16 @@ app.get("/users", requireAdmin, async (req, res) => {
     res.json(users);
   } catch (err) { res.status(500).json({ error: "Failed to fetch users" }); }
 });
-app.get("/users/:id", async (req, res) => {
-  try { res.json(await User.findById(req.params.id).populate('primaryShop')); } catch (err) { res.status(500).json({ error: err.message }); }
+// Bearer-token gated — :id must match the session. Previously unauth'd,
+// which let any visitor read another user's phone, pincode, address, coin
+// balance, and primaryShop. Admin path goes through /admin/users/:id/profile.
+app.get("/users/:id", requireUser, async (req, res) => {
+  try {
+    if (req.user._id.toString() !== req.params.id) {
+      return res.status(403).json({ error: "Not your profile" });
+    }
+    res.json(await User.findById(req.params.id).populate('primaryShop'));
+  } catch (err) { res.status(500).json({ error: err.message }); }
 });
 // Field whitelist — anything not in this list is dropped before the update.
 // Closes the mass-assignment hole where a client could PATCH /users/:id with
@@ -2000,6 +2413,104 @@ app.patch("/users/:id", requireUser, async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
+// ==========================================
+// 📍 USER ADDRESS BOOK ROUTES
+// ==========================================
+// Multi-address CRUD. Each user has User.addresses[] — Home, Work, etc.
+// At most one is isDefault:true; the helper below clears the previous default
+// on each set-default so the constraint can't drift. All routes are bearer-
+// token gated and confined to the requesting user's own document.
+const ADDRESS_WRITABLE = ['label', 'line1', 'line2', 'landmark', 'pincode'];
+const sanitizeAddressBody = (src = {}) => {
+  const out = {};
+  for (const k of ADDRESS_WRITABLE) {
+    if (src[k] !== undefined) out[k] = String(src[k] || '').slice(0, 200);
+  }
+  return out;
+};
+
+app.get("/users/:id/addresses", requireUser, async (req, res) => {
+  try {
+    if (req.user._id.toString() !== req.params.id) {
+      return res.status(403).json({ error: "Not your addresses" });
+    }
+    const u = await User.findById(req.params.id).select('addresses').lean();
+    res.json(u?.addresses || []);
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.post("/users/:id/addresses", requireUser, async (req, res) => {
+  try {
+    if (req.user._id.toString() !== req.params.id) {
+      return res.status(403).json({ error: "Not your addresses" });
+    }
+    const body = sanitizeAddressBody(req.body);
+    if (!body.line1 || !body.line1.trim()) {
+      return res.status(400).json({ error: "Address line 1 is required." });
+    }
+    if (body.pincode && !validatePincode(body.pincode)) {
+      return res.status(400).json({ error: "Pincode must be exactly 6 digits." });
+    }
+    const wantDefault = !!req.body?.isDefault;
+    const user = await User.findById(req.params.id).select('addresses');
+    if (!user) return res.status(404).json({ error: "User not found" });
+    // If the user has no addresses yet, the first one is the default regardless.
+    const isFirst = (user.addresses || []).length === 0;
+    const isDefault = wantDefault || isFirst;
+    if (isDefault) {
+      // Clear any previous default before pushing the new one.
+      user.addresses.forEach(a => { a.isDefault = false; });
+    }
+    user.addresses.push({ ...body, isDefault });
+    await user.save();
+    res.status(201).json(user.addresses);
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.patch("/users/:id/addresses/:addrId", requireUser, async (req, res) => {
+  try {
+    if (req.user._id.toString() !== req.params.id) {
+      return res.status(403).json({ error: "Not your addresses" });
+    }
+    const user = await User.findById(req.params.id).select('addresses');
+    if (!user) return res.status(404).json({ error: "User not found" });
+    const addr = user.addresses.id(req.params.addrId);
+    if (!addr) return res.status(404).json({ error: "Address not found" });
+
+    const body = sanitizeAddressBody(req.body);
+    if (body.pincode && !validatePincode(body.pincode)) {
+      return res.status(400).json({ error: "Pincode must be exactly 6 digits." });
+    }
+    Object.assign(addr, body);
+    if (req.body?.isDefault === true) {
+      user.addresses.forEach(a => { a.isDefault = a._id.toString() === addr._id.toString(); });
+    }
+    await user.save();
+    res.json(user.addresses);
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.delete("/users/:id/addresses/:addrId", requireUser, async (req, res) => {
+  try {
+    if (req.user._id.toString() !== req.params.id) {
+      return res.status(403).json({ error: "Not your addresses" });
+    }
+    const user = await User.findById(req.params.id).select('addresses');
+    if (!user) return res.status(404).json({ error: "User not found" });
+    const addr = user.addresses.id(req.params.addrId);
+    if (!addr) return res.status(404).json({ error: "Address not found" });
+    const wasDefault = !!addr.isDefault;
+    addr.deleteOne();
+    // If we removed the default, promote whichever address is now first so the
+    // user always has exactly one default (when they have any addresses).
+    if (wasDefault && user.addresses.length > 0) {
+      user.addresses[0].isDefault = true;
+    }
+    await user.save();
+    res.json(user.addresses);
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
 // --- SHOP ROUTES ---
 // Public — used by the admin dashboard's Shops tab. password is schema-level
 // select:false so it no longer leaks here. Cap to 500 rows.
@@ -2009,10 +2520,17 @@ app.get("/shops", async (req, res) => {
   } catch (err) { res.status(500).json({ error: "Failed to fetch shops" }); }
 });
 // Admin-only shop creation. Previously unauth'd — anyone could create a shop
-// with any phone (provided it didn't collide) and a known password.
+// with any phone (provided it didn't collide) and a known password. Password
+// is bcrypt-hashed before save (validatePassword enforces ≥6 chars).
 app.post("/shops", requireAdmin, async (req, res) => {
   try {
-    const newShop = new Shop(req.body);
+    const body = { ...(req.body || {}) };
+    const pw = body.password;
+    if (!validatePassword(pw)) {
+      return res.status(400).json({ error: "Password must be at least 6 characters." });
+    }
+    body.password = await bcrypt.hash(String(pw), 10);
+    const newShop = new Shop(body);
     await newShop.save();
     const safe = newShop.toObject();
     delete safe.password;
@@ -2023,11 +2541,32 @@ app.post("/shops", requireAdmin, async (req, res) => {
     res.status(500).json({ error: "Failed to create shop" });
   }
 });
+// Shop login with bcrypt + lazy migration. Legacy plaintext rows still in the
+// DB are detected via looksHashed(); on a successful plaintext match we
+// re-hash and persist before issuing the token, so within one login per shop
+// the entire collection migrates to bcrypt without admin intervention.
 app.post("/shop-login", async (req, res) => {
   try {
-    // password is now select:false, so must opt in explicitly to compare.
-    const shop = await Shop.findOne({ phone: req.body.phone }).select('+password').populate('inventory.product');
-    if (!shop || shop.password !== req.body.password) return res.status(401).json({ error: "Invalid" });
+    const phone = String(req.body?.phone || '').trim();
+    const password = String(req.body?.password || '');
+    // password is select:false, so must opt in explicitly to compare.
+    const shop = await Shop.findOne({ phone }).select('+password').populate('inventory.product');
+    if (!shop) return res.status(401).json({ error: "Invalid" });
+
+    let ok = false;
+    if (looksHashed(shop.password)) {
+      ok = await bcrypt.compare(password, shop.password);
+    } else {
+      ok = shop.password === password;
+      // Lazy upgrade: hash + persist so the next login goes through bcrypt.
+      if (ok) {
+        try {
+          const newHash = await bcrypt.hash(password, 10);
+          await Shop.updateOne({ _id: shop._id }, { $set: { password: newHash } });
+        } catch (e) { console.error('shop password rehash failed:', e.message); }
+      }
+    }
+    if (!ok) return res.status(401).json({ error: "Invalid" });
 
     // Issue a fresh session token — front-end stores it and sends in
     // Authorization: Bearer for every order-mutating request.
@@ -2138,8 +2677,9 @@ app.post("/shops/:shopId/inventory", requireShop, async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 // Admin can edit a broader set of fields than the shop itself can — e.g.
-// rotating a password or correcting the shop's phone number. password is set
-// directly (admin reset) — for now plaintext to match existing /shop-login.
+// rotating a password or correcting the shop's phone number. Password resets
+// are bcrypt-hashed inline so admin-set passwords land in the same shape as
+// shop-set ones.
 const SHOP_ADMIN_WRITABLE = [
   'name', 'ownerName', 'fullAddress', 'operatingHours', 'shopImage', 'phone',
   'password', 'pincode', 'serviceablePincodes', 'isOpen', 'isAcceptingOrders',
@@ -2148,6 +2688,12 @@ const SHOP_ADMIN_WRITABLE = [
 app.patch("/shops/:id/admin-edit", requireAdmin, async (req, res) => {
   try {
     const updateData = pickFields(req.body || {}, SHOP_ADMIN_WRITABLE);
+    if (updateData.password !== undefined) {
+      if (!validatePassword(updateData.password)) {
+        return res.status(400).json({ error: "Password must be at least 6 characters." });
+      }
+      updateData.password = await bcrypt.hash(String(updateData.password), 10);
+    }
     const updatedShop = await Shop.findByIdAndUpdate(req.params.id, updateData, { new: true });
     res.json(updatedShop);
   } catch (err) { res.status(500).json({ error: err.message }); }
@@ -2399,10 +2945,18 @@ app.post("/shops/:shopId/bulk-import", requireShopOrAdmin, async (req, res) => {
       };
     });
 
-    // 3. Completely replace the shop's existing inventory array
-    await Shop.findByIdAndUpdate(shopId, {
-      $set: { inventory: newInventoryArray }
-    });
+    // 3. Completely replace the shop's existing inventory array. Use the
+    // updated doc to detect "no such shop" — silent no-op used to return 200
+    // even if the shopId was garbage or pointed at a deleted shop.
+    if (!mongoose.isValidObjectId(shopId)) {
+      return res.status(400).json({ error: "Invalid shopId" });
+    }
+    const updated = await Shop.findByIdAndUpdate(
+      shopId,
+      { $set: { inventory: newInventoryArray } },
+      { new: true }
+    );
+    if (!updated) return res.status(404).json({ error: "Shop not found" });
 
     res.status(200).json({
       success: true,
@@ -2423,8 +2977,9 @@ app.post("/shops/:shopId/bulk-import", requireShopOrAdmin, async (req, res) => {
 // Log a search that returned zero results. Upsert on lowercased term —
 // count++, dedupe userIds/pincodes, refresh lastSearchedAt. Idempotent
 // from the client's POV; the frontend can call once per zero-result
-// term and we won't blow up on repeats.
-app.post("/missed-searches", async (req, res) => {
+// term and we won't blow up on repeats. Rate-limited to keep a single
+// abusive client from spawning thousands of MissedSearch docs per minute.
+app.post("/missed-searches", rateLimit('missed-searches', 30, 60 * 1000), async (req, res) => {
   try {
     const rawTerm = String(req.body?.term || "").trim().toLowerCase();
     if (rawTerm.length < 2 || rawTerm.length > 80) {
@@ -2654,21 +3209,30 @@ async function cancelOrderWithRefund(order, opts) {
   }
 
   // Refund coins regardless of payment method — they were debited at checkout.
+  // Idempotent: claim refund.coinsRefunded atomically before crediting. Two
+  // racing cancels (admin + worker, retry, etc.) used to double-refund coins;
+  // now the second one sees refund.coinsRefunded=true and skips.
   if (order.coinsUsed > 0 && order.userId && mongoose.Types.ObjectId.isValid(order.userId._id || order.userId)) {
     const userId = order.userId._id || order.userId;
-    try { await User.findByIdAndUpdate(userId, { $inc: { coins: order.coinsUsed } }); }
-    catch (e) { console.error('[cancel] coin refund failed:', e.message); }
+    const refundClaim = await Order.updateOne(
+      { _id: order._id, 'refund.coinsRefunded': { $ne: true } },
+      { $set: { 'refund.coinsRefunded': true } }
+    );
+    if (refundClaim.modifiedCount === 1) {
+      try { await User.findByIdAndUpdate(userId, { $inc: { coins: order.coinsUsed } }); }
+      catch (e) { console.error('[cancel] coin refund failed:', e.message); }
+    }
   }
 
-  // Razorpay refund — fires only if AUTO_REFUND_ENABLED=true, otherwise flagged for admin.
-  let refundFlag = { pending: false, razorpayRefundId: '', attemptedAt: null };
+  // Razorpay refund — fires only if AUTO_REFUND_ENABLED=true, otherwise flagged
+  // for admin. Use $set on individual sub-fields so we don't clobber the
+  // refund.coinsRefunded flag the coin-refund block above just claimed.
+  const refundSet = {};
   if (order.paymentStatus === 'Paid' && order.razorpayPaymentId) {
     const r = await issueRazorpayRefund(order);
-    refundFlag = {
-      pending: !r.delivered,
-      razorpayRefundId: r.refundId || '',
-      attemptedAt: new Date(),
-    };
+    refundSet['refund.pending'] = !r.delivered;
+    refundSet['refund.razorpayRefundId'] = r.refundId || '';
+    refundSet['refund.attemptedAt'] = new Date();
   }
 
   // statusHistory + refund flag piggyback on the local doc; status is already
@@ -2678,7 +3242,7 @@ async function cancelOrderWithRefund(order, opts) {
     { _id: order._id },
     {
       $push: { statusHistory: { status: statusLabel, at: new Date() } },
-      $set: { refund: refundFlag },
+      ...(Object.keys(refundSet).length ? { $set: refundSet } : {}),
     }
   );
   // Keep the in-memory copy in sync for callers that read order.status downstream.
