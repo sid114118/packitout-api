@@ -10,19 +10,29 @@ const fs = require("fs");
 const csv = require("csvtojson");
 const crypto = require("crypto");
 const bcrypt = require("bcryptjs");
-const Razorpay = require("razorpay");
 const { GoogleGenerativeAI } = require("@google/generative-ai");
 
 const genAI = process.env.GEMINI_API_KEY
   ? new GoogleGenerativeAI(process.env.GEMINI_API_KEY)
   : null;
 
-const razorpay = (process.env.RAZORPAY_KEY_ID && process.env.RAZORPAY_KEY_SECRET)
-  ? new Razorpay({
-      key_id: process.env.RAZORPAY_KEY_ID,
-      key_secret: process.env.RAZORPAY_KEY_SECRET,
-    })
-  : null;
+// ==========================================
+// 🧰 SMALL FIELD HELPERS (hoisted — used by POST /orders below)
+// ==========================================
+// Pick only whitelisted keys from a body so callers can't sneak in fields not
+// in the schema (e.g. forging status="Picked Up ✅" / paymentStatus="Paid" /
+// totalAmount=0 to bypass the trusted-server recompute).
+const pickFields = (src, allow) => {
+  const out = {};
+  for (const k of allow) if (src && Object.prototype.hasOwnProperty.call(src, k)) out[k] = src[k];
+  return out;
+};
+// Accept searchTags either as a CSV string (legacy admin form) or an array.
+const normaliseSearchTags = (val) => {
+  if (Array.isArray(val)) return val.map(t => String(t).trim()).filter(Boolean);
+  if (typeof val === 'string') return val.split(',').map(t => t.trim()).filter(Boolean);
+  return undefined;
+};
 
 // ==========================================
 // 🧾 PARCHI UPLOAD PACKAGES
@@ -195,15 +205,19 @@ const orderSchema = new mongoose.Schema({
   userId: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
   shopId: { type: mongoose.Schema.Types.ObjectId, ref: 'Shop' },
   items: Array, totalAmount: Number, imageUrl: { type: String, default: "" },
-  status: { type: String, default: "Pending" }, paymentMethod: { type: String, default: "UPI" },
-  paymentStatus: { type: String, default: "Unpaid" }, isReviewed: { type: Boolean, default: false },
+  status: { type: String, default: "Pending" },
+  // Payment model is now two-method:
+  //   'UPI' — customer transfers directly to the shop's UPI ID at checkout.
+  //           paymentStatus starts as 'PendingVerification'; the shop confirms
+  //           receipt via POST /orders/:id/mark-paid, which flips it to 'Paid'.
+  //   'POP' — pay on pickup (cash or in-person UPI at the counter). Stays
+  //           'Unpaid' until the shop marks the order Picked Up ✅.
+  // Razorpay was removed in favour of direct shop UPI (no gateway = no fees +
+  // money lands instantly in the shop's bank).
+  paymentMethod: { type: String, enum: ['UPI', 'POP'], default: 'POP' },
+  paymentStatus: { type: String, enum: ['Unpaid', 'PendingVerification', 'Paid'], default: 'Unpaid' },
+  isReviewed: { type: Boolean, default: false },
   coinsUsed: { type: Number, default: 0 },
-  razorpayOrderId: { type: String, default: "" },
-  // unique+sparse so the same Razorpay payment can never create two orders —
-  // closes the verify-replay duplicate-order hole. "" is allowed (sparse skips
-  // empty strings on most Mongo versions, but we also guard in app code).
-  razorpayPaymentId: { type: String, default: "", index: { unique: true, sparse: true } },
-  razorpaySignature: { type: String, default: "" },
   // Idempotency flag for the loyalty-coin grant at pickup. Set once, never
   // unset. Prevents shops from toggling status back and forth and re-awarding
   // coins, and prevents two concurrent PATCH /orders/:id from both crediting.
@@ -222,15 +236,16 @@ const orderSchema = new mongoose.Schema({
     tier: { type: Number, default: 0 },
     lastFiredAt: { type: Date, default: null },
   },
-  // 🔁 Refund bookkeeping for auto-cancelled paid orders. When the SMS/voice
-  // pipeline gives up at T+15min, coins are auto-returned and Razorpay refund is
-  // flagged for admin (or auto-fired if AUTO_REFUND_ENABLED=true env is set).
+  // 🔁 Refund bookkeeping for cancelled orders.
+  // Because money now flows directly to the shop's UPI (no gateway), the
+  // platform can't push the money back — it can only refund the loyalty
+  // coins the customer redeemed. If paymentStatus was 'Paid', `pending=true`
+  // tells the shop they owe the customer their UPI amount back manually.
   // coinsRefunded: idempotency flag — once true, the coin refund is never
-  // re-issued, no matter how many cancel paths race or get retried. Set via an
-  // atomic update inside cancelOrderWithRefund().
+  // re-issued, no matter how many cancel paths race. Set via an atomic
+  // update inside cancelOrderWithRefund().
   refund: {
     pending: { type: Boolean, default: false },
-    razorpayRefundId: { type: String, default: "" },
     attemptedAt: { type: Date, default: null },
     coinsRefunded: { type: Boolean, default: false },
   },
@@ -523,11 +538,11 @@ const sendOtpSms = async (phone, otp) => {
 //
 // SMS (MSG91 / Gupshup / Twilio): set MSG91_AUTH_KEY env, flip the flag.
 // Voice (Exotel / Knowlarity / Twilio Voice): set EXOTEL_SID + token, flip the flag.
-// Razorpay refund: AUTO_REFUND_ENABLED=true to actually fire — otherwise we mark
-//   `order.refund.pending=true` and admin issues the refund manually.
+// Money refunds are NOT auto-issued — payment now flows directly to the shop's
+// UPI ID with no platform gateway, so only the shop can return the cash. The
+// cancellation path just flags `order.refund.pending=true` so the shop knows.
 const ESCALATION_SMS_CONFIGURED = false;
 const ESCALATION_VOICE_CONFIGURED = false;
-const AUTO_REFUND_ENABLED = process.env.AUTO_REFUND_ENABLED === 'true';
 
 const sendSmsToPhone = async (phone, message) => {
   if (!ESCALATION_SMS_CONFIGURED) {
@@ -545,25 +560,6 @@ const placeVoiceCallToPhone = async (phone, message) => {
   }
   // TODO: provider call goes here (TTS script or pre-recorded clip URL).
   return { delivered: false, stubMode: true };
-};
-
-const issueRazorpayRefund = async (order) => {
-  if (!order?.razorpayPaymentId) return { delivered: false, reason: 'no_payment_id' };
-  if (!AUTO_REFUND_ENABLED || !razorpay) {
-    console.log(`[REFUND][STUB] orderId=${order._id} paymentId=${order.razorpayPaymentId} amount=${order.totalAmount} (set AUTO_REFUND_ENABLED=true to fire for real)`);
-    return { delivered: false, stubMode: true };
-  }
-  try {
-    const refund = await razorpay.payments.refund(order.razorpayPaymentId, {
-      amount: Math.round((Number(order.totalAmount) || 0) * 100),
-      speed: 'optimum',
-      notes: { reason: 'shop_unresponsive_auto_cancel', orderId: order._id.toString() },
-    });
-    return { delivered: true, refundId: refund.id };
-  } catch (err) {
-    console.error('[REFUND] failed:', err.message);
-    return { delivered: false, error: err.message };
-  }
 };
 
 // ==========================================
@@ -630,23 +626,24 @@ const buildNewOrderShopNotif = (shortId, totalAmount, isUrgent, pickupTime) => {
 // ==========================================
 // OneSignal credentials. REST API key MUST come from env. App ID is public
 // (it ships in the SDK init in the browser), so the hardcoded fallback is fine.
-const ONE_SIGNAL_APP_ID = process.env.ONE_SIGNAL_APP_ID || "1da2e78d-0874-4965-a895-42c9237ee92b";
-const ONE_SIGNAL_API_KEY = process.env.ONE_SIGNAL_API_KEY;
-if (!ONE_SIGNAL_API_KEY) {
-  console.error("[OneSignal] ONE_SIGNAL_API_KEY env var is missing — push notifications will not be sent.");
+// Env var names match .env.example: ONESIGNAL_APP_ID / ONESIGNAL_API_KEY.
+const ONESIGNAL_APP_ID = process.env.ONESIGNAL_APP_ID || process.env.ONE_SIGNAL_APP_ID || "1da2e78d-0874-4965-a895-42c9237ee92b";
+const ONESIGNAL_API_KEY = process.env.ONESIGNAL_API_KEY || process.env.ONE_SIGNAL_API_KEY;
+if (!ONESIGNAL_API_KEY) {
+  console.error("[OneSignal] ONESIGNAL_API_KEY env var is missing — push notifications will not be sent.");
 }
 // v16 SDK registers users via OneSignal.login(id), which creates an External ID
 // alias. The legacy `include_external_user_ids` field is deprecated and silently
 // drops on accounts created in 2024+; use `include_aliases.external_id` with an
 // explicit `target_channel` instead.
 const sendPushNotification = async (targetUserId, title, message) => {
-  if (!ONE_SIGNAL_API_KEY) return;
+  if (!ONESIGNAL_API_KEY) return;
   try {
     const response = await fetch("https://onesignal.com/api/v1/notifications", {
       method: "POST",
-      headers: { "Content-Type": "application/json; charset=utf-8", "Authorization": `Basic ${ONE_SIGNAL_API_KEY}` },
+      headers: { "Content-Type": "application/json; charset=utf-8", "Authorization": `Basic ${ONESIGNAL_API_KEY}` },
       body: JSON.stringify({
-        app_id: ONE_SIGNAL_APP_ID,
+        app_id: ONESIGNAL_APP_ID,
         target_channel: "push",
         include_aliases: { external_id: [targetUserId.toString()] },
         headings: { en: title },
@@ -741,7 +738,7 @@ app.post("/admin/ping-shop", requireAdmin, async (req, res) => {
 // --- 🛡️ OPS CONSOLE: admin force actions on stalled orders ---
 
 // POST /admin/orders/:id/force-cancel — runs the same auto-cancel path the
-// T+15min worker uses: refunds coins, flags Razorpay refund, notifies both
+// T+15min worker uses: refunds coins, flags pending UPI refund, notifies both
 // sides. Use when the shop can't be reached or the customer asks to cancel.
 app.post("/admin/orders/:id/force-cancel", requireAdmin, async (req, res) => {
   try {
@@ -1169,7 +1166,12 @@ app.post("/parchis/:id/accept-bill", requireUser, async (req, res) => {
       items: orderItems,
       totalAmount: bill.totalAmount,
       paymentMethod: method === 'UPI' ? 'UPI' : 'POP',
-      paymentStatus: method === 'UPI' ? 'Paid' : 'Unpaid',
+      // UPI starts as 'PendingVerification' — the shop confirms receipt via
+      // POST /orders/:id/mark-paid once the money lands in their UPI app.
+      // The previous behaviour saved UPI orders as 'Paid' before any proof
+      // of payment, which let a customer "accept-bill via UPI" and never
+      // actually transfer the money.
+      paymentStatus: method === 'UPI' ? 'PendingVerification' : 'Unpaid',
       status: 'Pending',
       imageUrl: parchi.imageUrl || '',
       statusHistory: [{ status: 'Pending', at: new Date() }],
@@ -1329,8 +1331,16 @@ app.get("/admin/users/:id/profile", requireAdmin, async (req, res) => {
 });
 
 // ==========================================
-// 💳 PAYMENT ROUTES (Razorpay)
+// 💳 PAYMENT (direct UPI to shop + pay-on-pickup)
 // ==========================================
+// We deliberately do NOT have a payment gateway. Two methods are supported:
+//   'UPI' — customer transfers to the shop's UPI ID via deep link at checkout,
+//           order is created with paymentStatus='PendingVerification', shop
+//           confirms receipt from OrdersTab via POST /orders/:id/mark-paid.
+//   'POP' — pay on pickup (cash / in-person UPI), paymentStatus='Unpaid' until
+//           the shop marks the order Picked Up ✅.
+// computeTrustedTotal is still the source of truth for the cart total in
+// either case — the client price/total fields are never trusted.
 
 // Recompute the trusted cart total from the shop's current inventory.
 // Frontend prices/totals are NEVER trusted — we always recompute server-side.
@@ -1382,150 +1392,45 @@ const computeTrustedTotal = async (shopId, items, coinsUsed) => {
   return { itemTotal, coinDiscount, finalAmount, trustedItems, coinsUsed: actualCoinsUsed };
 };
 
-app.post("/payments/create-order", async (req, res) => {
-  try {
-    if (!razorpay) return res.status(503).json({ error: "Payment gateway not configured." });
-    const { userId, shopId, items, coinsUsed } = req.body;
-    if (!userId || !shopId || !Array.isArray(items) || items.length === 0) {
-      return res.status(400).json({ error: "Missing userId, shopId, or items." });
-    }
-
-    const { finalAmount } = await computeTrustedTotal(shopId, items, coinsUsed);
-    if (finalAmount <= 0) return res.status(400).json({ error: "Order total must be greater than zero." });
-
-    const rzpOrder = await razorpay.orders.create({
-      amount: Math.round(finalAmount * 100), // paise
-      currency: "INR",
-      receipt: `rcpt_${Date.now()}_${userId.toString().slice(-6)}`,
-      notes: { userId: userId.toString(), shopId: shopId.toString() },
-    });
-
-    res.json({
-      razorpayOrderId: rzpOrder.id,
-      amount: rzpOrder.amount,
-      currency: rzpOrder.currency,
-      keyId: process.env.RAZORPAY_KEY_ID,
-      computedTotal: finalAmount,
-    });
-  } catch (err) {
-    console.error("create-order error:", err);
-    res.status(500).json({ error: err.message || "Failed to create payment order." });
-  }
-});
-
-app.post("/payments/verify", async (req, res) => {
-  try {
-    if (!razorpay) return res.status(503).json({ error: "Payment gateway not configured." });
-    const {
-      razorpay_order_id, razorpay_payment_id, razorpay_signature,
-      userId, shopId, items, paymentMethod, coinsUsed,
-      pickupTime, isUrgent,
-    } = req.body;
-
-    if (!razorpay_order_id || !razorpay_payment_id || !razorpay_signature) {
-      return res.status(400).json({ error: "Missing payment signature fields." });
-    }
-
-    // HMAC SHA256 verification — Razorpay's prescribed signature check.
-    const expectedSignature = crypto
-      .createHmac("sha256", process.env.RAZORPAY_KEY_SECRET)
-      .update(`${razorpay_order_id}|${razorpay_payment_id}`)
-      .digest("hex");
-
-    if (expectedSignature !== razorpay_signature) {
-      return res.status(400).json({ error: "Payment signature verification failed." });
-    }
-
-    // Idempotency — if a previous /verify call already booked this payment as
-    // an order, just return it. Without this, the client could replay /verify
-    // (intentionally or via retry) and create duplicate orders + double-debit
-    // coins. The unique index on Order.razorpayPaymentId is the backstop.
-    const existing = await Order.findOne({ razorpayPaymentId: razorpay_payment_id });
-    if (existing) {
-      return res.json({ success: true, order: existing, duplicate: true });
-    }
-
-    // Cross-check that the Razorpay order's notes match the userId/shopId the
-    // client claims — defeats a "pay for tiny order, verify as someone else"
-    // attack where userId/shopId are forged in the body.
-    try {
-      const rzpOrder = await razorpay.orders.fetch(razorpay_order_id);
-      const notedUserId = rzpOrder?.notes?.userId;
-      const notedShopId = rzpOrder?.notes?.shopId;
-      if (notedUserId && notedShopId && (String(notedUserId) !== String(userId) || String(notedShopId) !== String(shopId))) {
-        return res.status(400).json({ error: "Order/user mismatch" });
-      }
-    } catch (e) {
-      console.error("Razorpay order fetch failed (continuing):", e.message);
-    }
-
-    // Recompute trusted total — never trust the client.
-    const { finalAmount, trustedItems, coinsUsed: safeCoinsUsed } =
-      await computeTrustedTotal(shopId, items, coinsUsed);
-
-    const order = await Order.create({
-      userId, shopId,
-      items: trustedItems,
-      totalAmount: finalAmount,
-      paymentMethod: paymentMethod || "UPI",
-      paymentStatus: "Paid",
-      coinsUsed: safeCoinsUsed,
-      razorpayOrderId: razorpay_order_id,
-      razorpayPaymentId: razorpay_payment_id,
-      razorpaySignature: razorpay_signature,
-      pickupTime: pickupTime || null,
-      isUrgent: Boolean(isUrgent),
-      statusHistory: [{ status: "Pending", at: new Date() }],
-    });
-
-    // Deduct coins after the order is safely persisted. Use a guarded
-    // updateOne so we never let the balance go negative under race conditions.
-    if (safeCoinsUsed > 0 && mongoose.Types.ObjectId.isValid(userId)) {
-      await User.updateOne(
-        { _id: userId, coins: { $gte: safeCoinsUsed } },
-        { $inc: { coins: -safeCoinsUsed } }
-      );
-    }
-
-    const shortOrder = order._id.toString().slice(-5).toUpperCase();
-    const { title: shopTitle, message: shopMessage } = buildNewOrderShopNotif(shortOrder, finalAmount, order.isUrgent, order.pickupTime);
-    await Notification.create({ shopId, orderId: order._id, type: 'new_order', title: shopTitle, message: shopMessage });
-    await sendPushNotification(shopId, shopTitle, shopMessage);
-
-    res.json({ success: true, order });
-  } catch (err) {
-    console.error("verify error:", err);
-    res.status(500).json({ error: err.message || "Payment verification failed." });
-  }
-});
-
 // --- ORDER ROUTES ---
-// Fields the client is allowed to set on a new order. Status / paymentStatus /
-// totalAmount / razorpay* are computed server-side — the old behaviour spread
-// req.body straight into the model, so a client could POST status="Delivered ✅",
-// paymentStatus="Paid", totalAmount=0 and bypass payment entirely.
+// Fields the client is allowed to set on a new order. status / paymentStatus /
+// totalAmount are computed server-side — the old behaviour spread req.body
+// straight into the model, so a client could POST status="Picked Up ✅",
+// paymentStatus="Paid", totalAmount=0 and bypass payment entirely. userId is
+// NOT in this list — it comes from the bearer-token session (req.user._id) so
+// callers can't impersonate other users.
 const ORDER_CREATE_WRITABLE = [
-  'userId', 'shopId', 'items', 'imageUrl', 'paymentMethod',
+  'shopId', 'items', 'imageUrl', 'paymentMethod',
   'pickupTime', 'isUrgent',
 ];
 
-app.post("/orders", async (req, res) => {
+// 🔐 Bearer-token gated. The old route was unauth'd, so anyone could POST an
+// order on any user's behalf, drain their coins, or attribute it to any shop.
+// userId now comes from the session, not the body.
+app.post("/orders", requireUser, async (req, res) => {
   // Track any coin debit so we can refund it if the order save later fails.
-  // Coin deduction MUST happen server-side and atomically — the COD path used
-  // to trust a client PATCH after the order was saved, which leaked coins on
-  // network failures and was trivially exploitable.
+  // Coin deduction happens server-side and atomically — guarded $inc so the
+  // balance never goes negative even under concurrent checkout attempts.
   let coinRefund = null;
   try {
     const body = pickFields(req.body || {}, ORDER_CREATE_WRITABLE);
-    if (!body.userId || !mongoose.Types.ObjectId.isValid(body.userId)) {
-      return res.status(400).json({ error: "Valid userId required." });
-    }
+    const userId = req.user._id;
+
     if (!body.shopId || !mongoose.Types.ObjectId.isValid(body.shopId)) {
       return res.status(400).json({ error: "Valid shopId required." });
     }
     if (!Array.isArray(body.items) || body.items.length === 0) {
       return res.status(400).json({ error: "items array required." });
     }
+    // paymentMethod is required and limited to the two supported flows.
+    // Anything else (legacy "COD" callers, missing field) is rejected so the
+    // frontend can't accidentally book an order in a state the shop UI can't
+    // settle from.
+    const method = String(body.paymentMethod || '').toUpperCase();
+    if (!['UPI', 'POP'].includes(method)) {
+      return res.status(400).json({ error: "paymentMethod must be 'UPI' or 'POP'." });
+    }
+    body.paymentMethod = method;
     // Validate pickupTime: must be in the next 24h if set, never in the past.
     if (body.pickupTime) {
       const dt = new Date(body.pickupTime);
@@ -1535,31 +1440,45 @@ app.post("/orders", async (req, res) => {
       }
     }
 
+    // If UPI is chosen, the shop must have a UPI ID on file — otherwise the
+    // customer has nowhere to send the money. Surface the error at checkout
+    // time, not silently later.
+    if (method === 'UPI') {
+      const shop = await Shop.findById(body.shopId).select('upiId');
+      if (!shop || !shop.upiId || !String(shop.upiId).includes('@')) {
+        return res.status(400).json({ error: "This shop has not set a UPI ID — please choose Pay on Pickup instead." });
+      }
+    }
+
     // Recompute the price + items from the shop's actual inventory so the
     // client can't claim a 0₹ total or sneak in items not in stock.
     const { finalAmount, trustedItems, coinsUsed: actualCoinsUsed } =
       await computeTrustedTotal(body.shopId, body.items, req.body.coinsUsed);
 
-    const requestedCoins = Math.max(0, Math.floor(Number(req.body.coinsUsed) || 0));
     if (actualCoinsUsed > 0) {
       const r = await User.updateOne(
-        { _id: body.userId, coins: { $gte: actualCoinsUsed } },
+        { _id: userId, coins: { $gte: actualCoinsUsed } },
         { $inc: { coins: -actualCoinsUsed } }
       );
       if (r.matchedCount === 0) {
         return res.status(400).json({ error: "Insufficient coin balance." });
       }
-      coinRefund = { userId: body.userId, amount: actualCoinsUsed };
+      coinRefund = { userId, amount: actualCoinsUsed };
     }
 
+    // paymentStatus depends on method:
+    //   UPI → 'PendingVerification' (shop must confirm receipt via mark-paid)
+    //   POP → 'Unpaid' (flips to Paid when shop marks Picked Up ✅)
+    const initialPaymentStatus = method === 'UPI' ? 'PendingVerification' : 'Unpaid';
     const initialStatus = "Pending"; // server-controlled — never trust client
     const o = new Order({
       ...body,
+      userId,
       items: trustedItems,
       totalAmount: finalAmount,
       coinsUsed: actualCoinsUsed,
       status: initialStatus,
-      paymentStatus: (body.paymentMethod || '').toUpperCase() === 'COD' ? 'Unpaid' : 'Unpaid',
+      paymentStatus: initialPaymentStatus,
       isUrgent: Boolean(body.isUrgent),
       statusHistory: [{ status: initialStatus, at: new Date() }],
     });
@@ -1572,7 +1491,7 @@ app.post("/orders", async (req, res) => {
     } else if (req.body.imageUrl) {
       // Legacy fallback — keep working for old clients but scope to user+shop.
       await Parchi.updateOne(
-        { imageUrl: req.body.imageUrl, shopId: String(body.shopId), userId: String(body.userId) },
+        { imageUrl: req.body.imageUrl, shopId: String(body.shopId), userId: String(userId) },
         { $set: { status: 'processed' } }
       );
     }
@@ -1680,6 +1599,29 @@ app.get("/orders/user/:userId", requireUser, async (req, res) => {
 // attaches req.shop. Ownership is checked inside (shop can only mutate its
 // own orders). Cancellation is rejected here — must go through the dedicated
 // /shop-cancel endpoint so refunds always fire.
+//
+// Status transitions are validated against an allowed-predecessors graph so a
+// shop can't jump straight from Pending → "Picked Up ✅" (which would trigger
+// the loyalty-coin payout before any preparation happens). Anything outside
+// the graph is rejected with 400.
+// Allowed forward transitions per status. Status strings here must match
+// EXACTLY what the shop dashboard sends (matters for emojis + spacing — the
+// "Ready to Collect 🛍️" label is verbatim from OrdersTab.jsx).
+const ORDER_STATUS_GRAPH = {
+  'Pending':                  ['Accepted 👨‍🍳'],
+  'Accepted 👨‍🍳':             ['Packing 📦', 'Ready to Collect 🛍️', 'Picked Up ✅'],
+  'Packing 📦':               ['Ready to Collect 🛍️', 'Picked Up ✅'],
+  'Ready to Collect 🛍️':      ['Picked Up ✅'],
+  'Picked Up ✅':             [],
+  'Delivered ✅':             [], // legacy terminal state
+};
+const isValidOrderTransition = (from, to) => {
+  if (!to || typeof to !== 'string') return false;
+  if (to === from) return true; // no-op PATCH (e.g. resending current state) is fine
+  const allowed = ORDER_STATUS_GRAPH[from] || [];
+  return allowed.includes(to);
+};
+
 app.patch("/orders/:id", requireShop, async (req, res) => {
   try {
     const order = await Order.findById(req.params.id);
@@ -1687,8 +1629,15 @@ app.patch("/orders/:id", requireShop, async (req, res) => {
     if (order.shopId.toString() !== req.shop._id.toString()) {
       return res.status(403).json({ error: "Not your order" });
     }
-    if (req.body.status && /cancel|reject/i.test(req.body.status)) {
+    const nextStatus = req.body?.status;
+    if (!nextStatus) return res.status(400).json({ error: "status required" });
+    if (/cancel|reject/i.test(nextStatus)) {
       return res.status(400).json({ error: "Use POST /orders/:id/shop-cancel to cancel — keeps refunds consistent" });
+    }
+    if (!isValidOrderTransition(order.status, nextStatus)) {
+      return res.status(400).json({
+        error: `Cannot move order from "${order.status}" to "${nextStatus}".`,
+      });
     }
 
     // Final pickup → award loyalty coins (1 coin per ₹10 spent). Match both the
@@ -1696,7 +1645,7 @@ app.patch("/orders/:id", requireShop, async (req, res) => {
     // still in flight at deploy time keep working. Idempotent: the coinsAwarded
     // flag is set atomically via a conditional update — if two PATCHes race or
     // the shop toggles status back-and-forth, coins are credited at most once.
-    const isFinalNow = req.body.status === "Picked Up ✅" || req.body.status === "Delivered ✅";
+    const isFinalNow = nextStatus === "Picked Up ✅" || nextStatus === "Delivered ✅";
     if (isFinalNow && !order.coinsAwarded) {
       const safeAmount = Number(order.totalAmount) || 0;
       const earnedCoins = Math.floor(safeAmount / 10);
@@ -1709,16 +1658,23 @@ app.patch("/orders/:id", requireShop, async (req, res) => {
       }
     }
 
-    if (req.body.status && req.body.status !== order.status) {
-      order.statusHistory = [...(order.statusHistory || []), { status: req.body.status, at: new Date() }];
+    // POP orders flip to Paid when the customer takes possession — that's the
+    // moment the shop has the cash in hand. UPI orders are flipped separately
+    // by POST /orders/:id/mark-paid the moment the shop confirms receipt.
+    if (isFinalNow && order.paymentMethod === 'POP' && order.paymentStatus !== 'Paid') {
+      order.paymentStatus = 'Paid';
     }
-    order.status = req.body.status;
+
+    if (nextStatus !== order.status) {
+      order.statusHistory = [...(order.statusHistory || []), { status: nextStatus, at: new Date() }];
+    }
+    order.status = nextStatus;
     await order.save();
 
     if (order.userId && mongoose.Types.ObjectId.isValid(order.userId)) {
       try {
         const shortId = order._id.toString().slice(-5).toUpperCase();
-        const { type, title, message } = orderNotificationFor(req.body.status, shortId);
+        const { type, title, message } = orderNotificationFor(nextStatus, shortId);
         await Notification.create({
           userId: order.userId,
           orderId: order._id,
@@ -1735,6 +1691,64 @@ app.patch("/orders/:id", requireShop, async (req, res) => {
     res.json(order);
   } catch (err) {
     console.error("Backend Status Update Error:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// 🔐 Shop confirms UPI payment receipt. The order was created with
+// paymentStatus='PendingVerification' when the customer chose UPI at checkout;
+// the shop opens OrdersTab, sees the order with a "Mark as paid" button, and
+// hits this endpoint after checking their UPI app. Customer gets a push so
+// they know the shop has acknowledged the payment.
+//
+// Bearer-token gated; the order must (a) belong to this shop, (b) be UPI, and
+// (c) currently be PendingVerification. Idempotent — repeat hits return the
+// already-paid order without re-firing notifications.
+app.post("/orders/:id/mark-paid", requireShop, async (req, res) => {
+  try {
+    if (!mongoose.isValidObjectId(req.params.id)) {
+      return res.status(400).json({ error: "Invalid order id" });
+    }
+    const order = await Order.findById(req.params.id);
+    if (!order) return res.status(404).json({ error: "Order not found" });
+    if (order.shopId.toString() !== req.shop._id.toString()) {
+      return res.status(403).json({ error: "Not your order" });
+    }
+    if (order.paymentMethod !== 'UPI') {
+      return res.status(400).json({ error: "This order is not a UPI order." });
+    }
+    if (order.paymentStatus === 'Paid') {
+      return res.json({ success: true, order, duplicate: true });
+    }
+    if (order.paymentStatus !== 'PendingVerification') {
+      return res.status(400).json({ error: `Cannot mark paid — current status: ${order.paymentStatus}.` });
+    }
+
+    // Atomic flip so two devices on the shop's account can't both notify the
+    // customer that "we received your UPI."
+    const claim = await Order.updateOne(
+      { _id: order._id, paymentStatus: 'PendingVerification' },
+      { $set: { paymentStatus: 'Paid' } }
+    );
+    if (claim.modifiedCount !== 1) {
+      const fresh = await Order.findById(order._id);
+      return res.json({ success: true, order: fresh, duplicate: true });
+    }
+    order.paymentStatus = 'Paid';
+
+    if (order.userId && mongoose.Types.ObjectId.isValid(order.userId)) {
+      const shortId = order._id.toString().slice(-5).toUpperCase();
+      const title = 'Payment Confirmed ✅';
+      const message = `The shop confirmed your UPI payment for order #${shortId}.`;
+      try {
+        await Notification.create({ userId: order.userId, orderId: order._id, type: 'order', title, message });
+        await sendPushNotification(order.userId, title, message);
+      } catch (e) { console.error('mark-paid notify failed:', e.message); }
+    }
+
+    res.json({ success: true, order });
+  } catch (err) {
+    console.error("mark-paid error:", err);
     res.status(500).json({ error: err.message });
   }
 });
@@ -2512,11 +2526,27 @@ app.delete("/users/:id/addresses/:addrId", requireUser, async (req, res) => {
 });
 
 // --- SHOP ROUTES ---
-// Public — used by the admin dashboard's Shops tab. password is schema-level
-// select:false so it no longer leaks here. Cap to 500 rows.
-app.get("/shops", async (req, res) => {
+// 🛡️ Admin-only firehose with every field except password/sessionTokens.
+// Used by the admin Shops tab. Previously this was public and dumped phone,
+// fssai, gst, panNumber and upiId for every shop on the platform to any
+// unauthenticated visitor — a PII / financial-id leak.
+app.get("/shops", requireAdmin, async (req, res) => {
   try {
     res.json(await Shop.find().sort({ name: 1 }).limit(500));
+  } catch (err) { res.status(500).json({ error: "Failed to fetch shops" }); }
+});
+// Public, slim variant for the customer storefront. Returns ONLY the fields a
+// customer screen actually needs: name, image, hours, rating, pincode, open
+// status. No phone / fssai / gst / pan / upiId leakage. The Nearby page and
+// any other unauthenticated discovery view should use this.
+app.get("/shops/public", async (req, res) => {
+  try {
+    const shops = await Shop.find({}, {
+      name: 1, shopImage: 1, operatingHours: 1, fullAddress: 1, pincode: 1,
+      serviceablePincodes: 1, isOpen: 1, isAcceptingOrders: 1,
+      rating: 1, totalReviews: 1, totalOrdersFulfilled: 1, location: 1,
+    }).sort({ name: 1 }).limit(500);
+    res.json(shops);
   } catch (err) { res.status(500).json({ error: "Failed to fetch shops" }); }
 });
 // Admin-only shop creation. Previously unauth'd — anyone could create a shop
@@ -2663,15 +2693,31 @@ app.post("/shops/:shopId/inventory", requireShop, async (req, res) => {
       return res.status(403).json({ error: "Cannot edit another shop's inventory" });
     }
     const { productId, sellingPrice, inStock } = req.body;
+    if (!productId || !mongoose.isValidObjectId(productId)) {
+      return res.status(400).json({ error: "Valid productId required." });
+    }
+    // sellingPrice: must be a finite, non-negative number. The old route would
+    // happily accept negatives or NaN, which let a shop list items at -₹5 and
+    // break every downstream cart-total calculation.
+    let priceVal;
+    if (sellingPrice !== undefined) {
+      priceVal = Number(sellingPrice);
+      if (!Number.isFinite(priceVal) || priceVal < 0) {
+        return res.status(400).json({ error: "sellingPrice must be a non-negative number." });
+      }
+    }
     const shop = await Shop.findById(req.params.shopId);
     const existingIndex = shop.inventory.findIndex(item => item.product && item.product.toString() === productId);
     if (existingIndex > -1) {
       const updateData = {};
-      if (sellingPrice !== undefined) updateData[`inventory.${existingIndex}.sellingPrice`] = Number(sellingPrice);
-      if (inStock !== undefined) updateData[`inventory.${existingIndex}.inStock`] = inStock;
+      if (priceVal !== undefined) updateData[`inventory.${existingIndex}.sellingPrice`] = priceVal;
+      if (inStock !== undefined) updateData[`inventory.${existingIndex}.inStock`] = Boolean(inStock);
       await Shop.updateOne({ _id: req.params.shopId }, { $set: updateData });
     } else {
-      await Shop.updateOne({ _id: req.params.shopId }, { $push: { inventory: { product: productId, sellingPrice: Number(sellingPrice), inStock: true } } });
+      if (priceVal === undefined) {
+        return res.status(400).json({ error: "sellingPrice required when adding a new inventory item." });
+      }
+      await Shop.updateOne({ _id: req.params.shopId }, { $push: { inventory: { product: productId, sellingPrice: priceVal, inStock: true } } });
     }
     res.json(await Shop.findById(req.params.shopId).populate('inventory.product'));
   } catch (err) { res.status(500).json({ error: err.message }); }
@@ -2752,17 +2798,8 @@ const MASTER_PRODUCT_WRITABLE = [
   'energy', 'protein', 'carbs', 'sugar', 'fat', 'isVeg', 'itemGroupId',
   'relatedProducts', 'substitutes',
 ];
-const pickFields = (src, allow) => {
-  const out = {};
-  for (const k of allow) if (src && Object.prototype.hasOwnProperty.call(src, k)) out[k] = src[k];
-  return out;
-};
-// Accept searchTags either as a CSV string (legacy admin form) or an array.
-const normaliseSearchTags = (val) => {
-  if (Array.isArray(val)) return val.map(t => String(t).trim()).filter(Boolean);
-  if (typeof val === 'string') return val.split(',').map(t => t.trim()).filter(Boolean);
-  return undefined;
-};
+// pickFields / normaliseSearchTags are hoisted near the top of the file so
+// they're available for POST /orders, which runs before this section.
 
 app.post("/master-products", requireAdmin, async (req, res) => {
   try {
@@ -3137,7 +3174,7 @@ app.get("/brands", async (_req, res) => {
 // Scans every 30s for Pending orders and escalates by age:
 //   T+2min  → loud push + SMS to shop owner
 //   T+5min  → automated voice call to shop owner
-//   T+15min → auto-cancel, refund coins, flag/issue Razorpay refund, notify both
+//   T+15min → auto-cancel, refund coins, flag UPI refund (if paid), notify both
 // Tier progress is persisted on the order so restarts don't double-fire and
 // shops that accept mid-escalation stop receiving further escalation events.
 const ESCALATION_TIERS = [
@@ -3195,7 +3232,7 @@ async function cancelOrderWithRefund(order, opts) {
 
   // Atomic claim — only one caller can move the order from "not-closed" to
   // the cancellation status. Two concurrent cancels (admin + worker, e.g.)
-  // used to double-refund coins and double-fire Razorpay refunds.
+  // used to double-refund coins and double-flag UPI refunds.
   const claim = await Order.updateOne(
     {
       _id: order._id,
@@ -3224,14 +3261,13 @@ async function cancelOrderWithRefund(order, opts) {
     }
   }
 
-  // Razorpay refund — fires only if AUTO_REFUND_ENABLED=true, otherwise flagged
-  // for admin. Use $set on individual sub-fields so we don't clobber the
-  // refund.coinsRefunded flag the coin-refund block above just claimed.
+  // Money refund — payment flows directly to the shop's UPI ID so the platform
+  // can't push the money back. If the customer had already paid (paymentStatus
+  // was Paid), flag refund.pending=true so the shop knows they owe a manual
+  // UPI return. POP orders had no money in flight, so no flag is needed.
   const refundSet = {};
-  if (order.paymentStatus === 'Paid' && order.razorpayPaymentId) {
-    const r = await issueRazorpayRefund(order);
-    refundSet['refund.pending'] = !r.delivered;
-    refundSet['refund.razorpayRefundId'] = r.refundId || '';
+  if (order.paymentStatus === 'Paid' && order.paymentMethod === 'UPI') {
+    refundSet['refund.pending'] = true;
     refundSet['refund.attemptedAt'] = new Date();
   }
 
