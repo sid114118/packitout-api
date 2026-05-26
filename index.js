@@ -17,6 +17,44 @@ const genAI = process.env.GEMINI_API_KEY
   : null;
 
 // ==========================================
+// 🔥 FIREBASE ADMIN SDK — verifies idTokens from Google + email/password
+//                          signin on the frontend (UserAuth.jsx).
+// ==========================================
+// Service-account JSON lives in env (FIREBASE_SERVICE_ACCOUNT_JSON). If the
+// var is missing we leave firebaseAdmin null and the /auth/oauth-login route
+// returns 503 — keeps the rest of the server alive during a misconfigured deploy.
+let firebaseAdmin = null;
+try {
+  const admin = require("firebase-admin");
+  const raw = process.env.FIREBASE_SERVICE_ACCOUNT_JSON;
+  if (raw) {
+    const serviceAccount = JSON.parse(raw);
+    firebaseAdmin = admin.initializeApp({ credential: admin.credential.cert(serviceAccount) });
+    console.log("[firebase-admin] initialized for project:", serviceAccount.project_id);
+  } else {
+    console.warn("[firebase-admin] FIREBASE_SERVICE_ACCOUNT_JSON env var missing — OAuth routes will 503.");
+  }
+} catch (e) {
+  console.error("[firebase-admin] failed to initialize:", e.message);
+}
+
+// Verify a Firebase ID token. Returns decoded claims or throws. Centralized so
+// all auth endpoints reject the same way when the SDK isn't configured.
+const verifyFirebaseIdToken = async (idToken) => {
+  if (!firebaseAdmin) {
+    const err = new Error("Firebase Admin not configured on server.");
+    err.statusCode = 503;
+    throw err;
+  }
+  if (!idToken || typeof idToken !== "string") {
+    const err = new Error("Missing idToken.");
+    err.statusCode = 400;
+    throw err;
+  }
+  return await firebaseAdmin.auth().verifyIdToken(idToken);
+};
+
+// ==========================================
 // 🧰 SMALL FIELD HELPERS (hoisted — used by POST /orders below)
 // ==========================================
 // Pick only whitelisted keys from a body so callers can't sneak in fields not
@@ -178,9 +216,24 @@ const addressSchema = new mongoose.Schema({
 }, { _id: true });
 
 const userSchema = new mongoose.Schema({
-  name: String, phone: { type: String, unique: true },
+  name: String,
+  // phone is now optional — new email/Google signups don't have one until the
+  // user adds it at checkout via /users/:id/phone. sparse:true so the unique
+  // index allows multiple docs with no phone.
+  phone: { type: String, unique: true, sparse: true },
+  // Email-first identity. sparse:true so legacy phone-only users (email=null)
+  // don't collide on the unique index. Stored lowercase to keep lookups normal.
+  email: { type: String, unique: true, sparse: true, lowercase: true, trim: true },
+  // Firebase uid — the stable cross-provider identifier. Set on first OAuth
+  // login. unique+sparse so phone-only legacy users (no firebaseUid yet) coexist.
+  firebaseUid: { type: String, unique: true, sparse: true },
+  // Which sign-in methods this account has linked. e.g. ["password", "google.com"].
+  // Used to decide what to show in UI ("manage sign-in methods").
+  authProviders: { type: [String], default: [] },
   // Password hash — select:false so it never leaks via GET /users or
-  // /users/:id, which used to return it on every response.
+  // /users/:id, which used to return it on every response. Legacy phone+pw
+  // users still authenticate via /login; new email users authenticate via
+  // Firebase (Firebase stores the hash), so this stays empty for them.
   password: { type: String, select: false },
   // pincode + address kept for backwards-compat (legacy single-address rows
   // and the user's PIN, which still drives serviceable-shop discovery).
@@ -2389,6 +2442,178 @@ app.post("/login", async (req, res) => {
     res.status(500).json({ error: "Login failed. Please try again." });
   }
 });
+
+// ==========================================
+// 🔥 OAUTH LOGIN — single entry point for Google + email/password (Firebase)
+// ==========================================
+// Frontend calls this with a Firebase ID token from one of:
+//   - signInWithPopup(googleProvider)           → sign_in_provider="google.com"
+//   - signInWithEmailAndPassword                → sign_in_provider="password"
+//   - createUserWithEmailAndPassword (verified) → sign_in_provider="password"
+// We verify the token, find-or-create a User row keyed by firebaseUid (with
+// email as a secondary lookup so a user who later changes their email still
+// resolves to the same account), and issue a session token.
+app.post("/auth/oauth-login", async (req, res) => {
+  try {
+    const decoded = await verifyFirebaseIdToken(req.body?.idToken);
+
+    const provider = decoded.firebase?.sign_in_provider || "unknown";
+    const email = decoded.email ? String(decoded.email).toLowerCase().trim() : null;
+    const emailVerified = !!decoded.email_verified;
+    const displayName = decoded.name || (email ? email.split("@")[0] : "User");
+    const uid = decoded.uid;
+
+    // Reject unverified email/password — they shouldn't be able to log in
+    // until they click the verification link.
+    if (provider === "password" && !emailVerified) {
+      return res.status(403).json({ error: "Please verify your email first. Check your inbox for the link." });
+    }
+    if (!email && provider !== "phone") {
+      return res.status(400).json({ error: "No email associated with this sign-in method." });
+    }
+
+    // Find by firebaseUid first (the canonical key). Fall back to email so an
+    // existing email/password account auto-resolves when the same user later
+    // signs in with Google — Firebase considers them the same identity under
+    // "one account per email", so they share a uid; but if email-enumeration
+    // protection caused Firebase to issue a separate uid, the email match
+    // catches it and we merge by setting firebaseUid below.
+    let user = await User.findOne({ firebaseUid: uid });
+    if (!user && email) user = await User.findOne({ email });
+
+    if (!user) {
+      // New signup. Build a referral code from the display name (matches the
+      // pattern /register uses for legacy users).
+      const baseName = (displayName || "USER").substring(0, 4).toUpperCase().replace(/\s/g, '') || "PACK";
+      const refCode = baseName + Math.floor(1000 + Math.random() * 9000);
+      user = new User({
+        name: displayName,
+        email,
+        firebaseUid: uid,
+        authProviders: [provider],
+        referralCode: refCode,
+      });
+      await user.save();
+    } else {
+      // Returning user — backfill any missing identity fields and the new
+      // provider. updateOne so we don't trip validators on legacy docs.
+      const toSet = {};
+      if (!user.firebaseUid) toSet.firebaseUid = uid;
+      if (!user.email && email) toSet.email = email;
+      const providers = new Set(user.authProviders || []);
+      providers.add(provider);
+      const newProviders = [...providers];
+      if (newProviders.length !== (user.authProviders || []).length) toSet.authProviders = newProviders;
+      if (Object.keys(toSet).length) {
+        await User.updateOne({ _id: user._id }, { $set: toSet });
+        Object.assign(user, toSet);
+      }
+    }
+
+    // Populate primaryShop the same way /login does so the frontend renders
+    // the shop badge correctly on first paint.
+    await user.populate('primaryShop');
+
+    const sessionToken = await issueSessionToken(User, user._id);
+    const safe = user.toObject();
+    delete safe.password;
+    delete safe.sessionTokens;
+    res.json({ ...safe, sessionToken });
+  } catch (err) {
+    const status = err.statusCode || 500;
+    if (status === 500) console.error("oauth-login error:", err);
+    res.status(status).json({ error: err.message || "OAuth login failed." });
+  }
+});
+
+// ==========================================
+// 🔁 ADD EMAIL — legacy phone+password user attaches an email
+// ==========================================
+// Flow (frontend):
+//   1. User signs in with phone OTP via Firebase → gets a phone-provider Firebase user
+//   2. linkWithCredential(EmailAuthProvider.credential(email, pw)) → attaches email
+//   3. sendEmailVerification
+//   4. POST here with the freshly-issued idToken + the original phone, so we can
+//      attach the firebaseUid + email to the existing User row.
+// Verification can wait — the link itself proves ownership of both phone (OTP)
+// and (after the user clicks the email link) email. We just record the link.
+app.post("/auth/add-email", async (req, res) => {
+  try {
+    const decoded = await verifyFirebaseIdToken(req.body?.idToken);
+    const phoneFromBody = String(req.body?.phone || "").trim();
+    const phoneFromToken = decoded.phone_number ? String(decoded.phone_number).replace(/^\+91/, '') : null;
+    const email = decoded.email ? String(decoded.email).toLowerCase().trim() : null;
+
+    if (!email) return res.status(400).json({ error: "Token has no email. Did the link step run?" });
+    if (!phoneFromBody && !phoneFromToken) return res.status(400).json({ error: "No phone to attach this email to." });
+
+    // Trust the phone embedded in the Firebase token over the request body.
+    const phone = phoneFromToken || phoneFromBody;
+
+    const user = await User.findOne({ phone });
+    if (!user) return res.status(404).json({ error: "No account found for that phone." });
+
+    // Guard against attaching an email already used by another account.
+    const emailOwner = await User.findOne({ email });
+    if (emailOwner && String(emailOwner._id) !== String(user._id)) {
+      return res.status(409).json({ error: "This email is already linked to a different account." });
+    }
+
+    const providers = new Set(user.authProviders || []);
+    providers.add("password");
+    providers.add("phone");
+    await User.updateOne({ _id: user._id }, {
+      $set: {
+        email,
+        firebaseUid: decoded.uid,
+        authProviders: [...providers],
+      },
+    });
+
+    res.json({ ok: true });
+  } catch (err) {
+    const status = err.statusCode || 500;
+    if (status === 500) console.error("add-email error:", err);
+    res.status(status).json({ error: err.message || "Could not link email." });
+  }
+});
+
+// ==========================================
+// 📞 ADD PHONE — email/Google user adds phone at checkout
+// ==========================================
+// Frontend collects + verifies phone via Firebase phone OTP, then POSTs here
+// with the idToken (which now has phone_number after linkWithCredential).
+// Session bearer proves who's adding the phone; Firebase token proves the
+// phone is real.
+app.post("/users/:id/phone", requireUser, async (req, res) => {
+  try {
+    if (String(req.user._id) !== String(req.params.id)) {
+      return res.status(403).json({ error: "Cannot set phone for another user." });
+    }
+    const decoded = await verifyFirebaseIdToken(req.body?.idToken);
+    const phoneFromToken = decoded.phone_number ? String(decoded.phone_number).replace(/^\+91/, '') : null;
+    if (!phoneFromToken) return res.status(400).json({ error: "Token has no phone_number. Did the OTP step run?" });
+    if (!/^[6-9]\d{9}$/.test(phoneFromToken)) return res.status(400).json({ error: "Phone is not a valid Indian mobile." });
+
+    const owner = await User.findOne({ phone: phoneFromToken });
+    if (owner && String(owner._id) !== String(req.user._id)) {
+      return res.status(409).json({ error: "This phone is already linked to a different account." });
+    }
+
+    const providers = new Set(req.user.authProviders || []);
+    providers.add("phone");
+    await User.updateOne({ _id: req.user._id }, {
+      $set: { phone: phoneFromToken, authProviders: [...providers] },
+    });
+
+    res.json({ phone: phoneFromToken });
+  } catch (err) {
+    const status = err.statusCode || 500;
+    if (status === 500) console.error("add-phone error:", err);
+    res.status(status).json({ error: err.message || "Could not save phone." });
+  }
+});
+
 // Admin-only directory, capped at 500 rows. password/sessionTokens are
 // schema-level select:false so they never leak.
 app.get("/users", requireAdmin, async (req, res) => {
