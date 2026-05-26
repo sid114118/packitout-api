@@ -167,7 +167,25 @@ app.use(express.json({ limit: '1mb' }));
 
 const MONGO_URI = process.env.MONGO_URI;
 mongoose.connect(MONGO_URI)
-  .then(() => console.log("✅ DB Connected"))
+  .then(async () => {
+    console.log("✅ DB Connected");
+    // 🔧 Sync User indexes — the old schema had phone as plain unique (no sparse),
+    // which made two email/Google signups (both with phone: null) collide.
+    // syncIndexes drops indexes whose definition changed and recreates them
+    // from the current schema (phone is now sparse). Idempotent — safe to run
+    // on every boot. Wrapped in try/catch so a Mongo permission hiccup never
+    // takes the whole API down.
+    try {
+      const result = await mongoose.model("User").syncIndexes();
+      if (Array.isArray(result) && result.length) {
+        console.log("✅ User indexes synced — dropped stale:", result);
+      } else {
+        console.log("✅ User indexes already in sync");
+      }
+    } catch (e) {
+      console.error("⚠️ User.syncIndexes failed:", e.message);
+    }
+  })
   .catch(err => console.log(err));
 
 // ==========================================
