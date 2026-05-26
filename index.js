@@ -38,9 +38,28 @@ try {
   let privateKey = process.env.FIREBASE_PRIVATE_KEY;
 
   if (projectId && clientEmail && privateKey) {
-    // Many env panels store newlines as the literal two chars \ + n. Convert
-    // back to real newlines so the PEM parser accepts the key.
-    privateKey = privateKey.replace(/\\n/g, "\n");
+    // Normalise the private key value defensively. Env panels mangle it in
+    // several ways depending on the host:
+    //   - wrap the value in extra "..." or '...' quotes
+    //   - escape '\n' as the literal 2 chars (\ + n)
+    //   - double-escape backslashes (\\n → 4 chars on disk)
+    //   - already contain real newlines (multi-line panel)
+    privateKey = privateKey.trim();
+    if ((privateKey.startsWith('"') && privateKey.endsWith('"')) ||
+        (privateKey.startsWith("'") && privateKey.endsWith("'"))) {
+      privateKey = privateKey.slice(1, -1);
+    }
+    // Order matters: collapse double-escape first, then single-escape.
+    privateKey = privateKey.replace(/\\\\n/g, "\n").replace(/\\n/g, "\n");
+
+    // Diagnostic log — describes the shape without revealing the value.
+    console.log("[firebase-admin] privateKey shape:",
+      "len=" + privateKey.length,
+      "startsWithBegin=" + privateKey.startsWith("-----BEGIN"),
+      "endsWithEnd=" + privateKey.trimEnd().endsWith("-----END PRIVATE KEY-----"),
+      "newlineCount=" + (privateKey.match(/\n/g) || []).length,
+    );
+
     firebaseAdmin = admin.initializeApp({
       credential: admin.credential.cert({ projectId, clientEmail, privateKey }),
     });
