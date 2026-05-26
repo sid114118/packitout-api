@@ -20,19 +20,40 @@ const genAI = process.env.GEMINI_API_KEY
 // 🔥 FIREBASE ADMIN SDK — verifies idTokens from Google + email/password
 //                          signin on the frontend (UserAuth.jsx).
 // ==========================================
-// Service-account JSON lives in env (FIREBASE_SERVICE_ACCOUNT_JSON). If the
-// var is missing we leave firebaseAdmin null and the /auth/oauth-login route
-// returns 503 — keeps the rest of the server alive during a misconfigured deploy.
+// Two supported configs, in priority order:
+//   1. Three separate env vars (recommended for Hostinger / most panels):
+//        FIREBASE_PROJECT_ID
+//        FIREBASE_CLIENT_EMAIL
+//        FIREBASE_PRIVATE_KEY    (paste as-is including \n; we un-escape below)
+//   2. Single-blob env var (works for local dev / Vercel / Netlify):
+//        FIREBASE_SERVICE_ACCOUNT_JSON   (raw JSON, no surrounding quotes)
+// Hostinger's env panel adds a leading '\' before '{' when storing JSON, which
+// breaks JSON.parse — hence the 3-var primary path.
 let firebaseAdmin = null;
 try {
   const admin = require("firebase-admin");
-  const raw = process.env.FIREBASE_SERVICE_ACCOUNT_JSON;
-  if (raw) {
+
+  const projectId = process.env.FIREBASE_PROJECT_ID;
+  const clientEmail = process.env.FIREBASE_CLIENT_EMAIL;
+  let privateKey = process.env.FIREBASE_PRIVATE_KEY;
+
+  if (projectId && clientEmail && privateKey) {
+    // Many env panels store newlines as the literal two chars \ + n. Convert
+    // back to real newlines so the PEM parser accepts the key.
+    privateKey = privateKey.replace(/\\n/g, "\n");
+    firebaseAdmin = admin.initializeApp({
+      credential: admin.credential.cert({ projectId, clientEmail, privateKey }),
+    });
+    console.log("[firebase-admin] initialized (3-var) for project:", projectId);
+  } else if (process.env.FIREBASE_SERVICE_ACCOUNT_JSON) {
+    let raw = String(process.env.FIREBASE_SERVICE_ACCOUNT_JSON).trim();
+    // Some panels prepend '\' before the leading '{'. Strip it defensively.
+    if (raw.startsWith("\\")) raw = raw.slice(1);
     const serviceAccount = JSON.parse(raw);
     firebaseAdmin = admin.initializeApp({ credential: admin.credential.cert(serviceAccount) });
-    console.log("[firebase-admin] initialized for project:", serviceAccount.project_id);
+    console.log("[firebase-admin] initialized (json-blob) for project:", serviceAccount.project_id);
   } else {
-    console.warn("[firebase-admin] FIREBASE_SERVICE_ACCOUNT_JSON env var missing — OAuth routes will 503.");
+    console.warn("[firebase-admin] No credentials configured (need FIREBASE_PROJECT_ID + FIREBASE_CLIENT_EMAIL + FIREBASE_PRIVATE_KEY, or FIREBASE_SERVICE_ACCOUNT_JSON). OAuth routes will 503.");
   }
 } catch (e) {
   console.error("[firebase-admin] failed to initialize:", e.message);
