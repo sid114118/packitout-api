@@ -2639,32 +2639,34 @@ app.post("/auth/add-email", async (req, res) => {
 // ==========================================
 // 📞 ADD PHONE — email/Google user adds phone at checkout
 // ==========================================
-// Frontend collects + verifies phone via Firebase phone OTP, then POSTs here
-// with the idToken (which now has phone_number after linkWithCredential).
-// Session bearer proves who's adding the phone; Firebase token proves the
-// phone is real.
+// No OTP — bearer-token session is the only auth. The phone is recorded
+// unverified; we still gate on Indian-mobile shape and reject collisions
+// with another account so two users can't share a number.
 app.post("/users/:id/phone", requireUser, async (req, res) => {
   try {
     if (String(req.user._id) !== String(req.params.id)) {
       return res.status(403).json({ error: "Cannot set phone for another user." });
     }
-    const decoded = await verifyFirebaseIdToken(req.body?.idToken);
-    const phoneFromToken = decoded.phone_number ? String(decoded.phone_number).replace(/^\+91/, '') : null;
-    if (!phoneFromToken) return res.status(400).json({ error: "Token has no phone_number. Did the OTP step run?" });
-    if (!/^[6-9]\d{9}$/.test(phoneFromToken)) return res.status(400).json({ error: "Phone is not a valid Indian mobile." });
+    const raw = String(req.body?.phone || "").trim();
+    const phone = raw.replace(/^\+?91/, '').replace(/\D/g, '');
+    if (!/^[6-9]\d{9}$/.test(phone)) {
+      return res.status(400).json({ error: "Enter a valid 10-digit Indian mobile number." });
+    }
 
-    const owner = await User.findOne({ phone: phoneFromToken });
+    const owner = await User.findOne({ phone });
     if (owner && String(owner._id) !== String(req.user._id)) {
       return res.status(409).json({ error: "This phone is already linked to a different account." });
     }
 
     const providers = new Set(req.user.authProviders || []);
-    providers.add("phone");
-    await User.updateOne({ _id: req.user._id }, {
-      $set: { phone: phoneFromToken, authProviders: [...providers] },
-    });
+    providers.add("phone-unverified");
+    const updated = await User.findByIdAndUpdate(
+      req.user._id,
+      { $set: { phone, authProviders: [...providers] } },
+      { new: true },
+    ).populate('primaryShop');
 
-    res.json({ phone: phoneFromToken });
+    res.json(updated);
   } catch (err) {
     const status = err.statusCode || 500;
     if (status === 500) console.error("add-phone error:", err);
