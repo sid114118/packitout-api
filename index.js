@@ -770,7 +770,50 @@ const sendPushNotification = async (targetUserId, title, message) => {
 // 📮 ROUTES
 // ==========================================
 
-app.get("/ping", (req, res) => res.send("PackItOut Server is ALIVE! 🟢"));
+
+// ==========================================
+// ⚡ SERVER-SENT EVENTS (SSE) FOR SHOPS
+// ==========================================
+const shopSSEClients = new Map();
+const notifyShopSSE = (shopId, event) => {
+  const clients = shopSSEClients.get(String(shopId));
+  if (clients) {
+    for (const res of clients) {
+      res.write(`event: ${event}\ndata: {}\n\n`);
+    }
+  }
+};
+
+app.get("/shop-events/:shopId", async (req, res) => {
+  try {
+    const token = req.query.token;
+    if (!token) return res.status(401).json({ error: "Missing token" });
+    const shop = await Shop.findOne({ "sessionTokens.token": token }).select('+sessionTokens');
+    if (!shop || shop._id.toString() !== req.params.shopId) {
+      return res.status(403).json({ error: "Invalid session or not your shop" });
+    }
+
+    res.setHeader("Content-Type", "text/event-stream");
+    res.setHeader("Cache-Control", "no-cache");
+    res.setHeader("Connection", "keep-alive");
+    res.flushHeaders();
+
+    const shopId = req.params.shopId;
+    if (!shopSSEClients.has(shopId)) shopSSEClients.set(shopId, new Set());
+    shopSSEClients.get(shopId).add(res);
+
+    req.on("close", () => {
+      const clients = shopSSEClients.get(shopId);
+      if (clients) {
+        clients.delete(res);
+        if (clients.size === 0) shopSSEClients.delete(shopId);
+      }
+    });
+  } catch (err) {
+    res.status(500).end();
+  }
+});
+\napp.get("/ping", (req, res) => res.send("PackItOut Server is ALIVE! 🟢"));
 
 // --- NOTIFICATION ROUTES ---
 // Bearer-token gated — :userId / :shopId must match the session that's asking.
@@ -959,6 +1002,7 @@ app.post("/upload-parchi", rateLimit('upload-parchi', 10, 60 * 1000), requireUse
       imageUrl: result.secure_url,
     });
     await newParchi.save();
+    notifyShopSSE(shopId, "refresh_parchis");
     res.status(200).json({ success: true, parchi: newParchi });
   } catch (error) {
     res.status(500).json({ error: "Upload failed." });
