@@ -817,6 +817,7 @@ app.get("/shop-events/:shopId", async (req, res) => {
     res.setHeader("Content-Type", "text/event-stream");
     res.setHeader("Cache-Control", "no-cache");
     res.setHeader("Connection", "keep-alive");
+    res.setHeader("X-Accel-Buffering", "no");
     res.flushHeaders();
 
     const shopId = req.params.shopId;
@@ -870,6 +871,7 @@ app.get("/user-events/:userId", async (req, res) => {
     res.setHeader("Content-Type", "text/event-stream");
     res.setHeader("Cache-Control", "no-cache");
     res.setHeader("Connection", "keep-alive");
+    res.setHeader("X-Accel-Buffering", "no");
     res.flushHeaders();
 
     const userId = req.params.userId;
