@@ -11,6 +11,8 @@ const csv = require("csvtojson");
 const crypto = require("crypto");
 const bcrypt = require("bcryptjs");
 const { GoogleGenerativeAI } = require("@google/generative-ai");
+const EventEmitter = require('events');
+const systemEvents = new EventEmitter();
 
 const genAI = process.env.GEMINI_API_KEY
   ? new GoogleGenerativeAI(process.env.GEMINI_API_KEY)
@@ -428,6 +430,12 @@ const notificationSchema = new mongoose.Schema({
 });
 notificationSchema.index({ userId: 1, createdAt: -1 });
 notificationSchema.index({ shopId: 1, createdAt: -1 });
+
+// Automatically push SSE events when a notification is created
+notificationSchema.post('save', function(doc) {
+  if (doc.shopId) systemEvents.emit('notify_shop', String(doc.shopId), 'new_notification');
+  if (doc.userId) systemEvents.emit('notify_user', String(doc.userId), 'new_notification');
+});
 const Notification = mongoose.model("Notification", notificationSchema);
 
 // 🌟 REVIEW SCHEMA
@@ -795,6 +803,7 @@ const notifyShopSSE = (shopId, event) => {
     }
   }
 };
+systemEvents.on('notify_shop', notifyShopSSE);
 
 app.get("/shop-events/:shopId", async (req, res) => {
   try {
@@ -847,6 +856,7 @@ const notifyUserSSE = (userId, event) => {
     }
   }
 };
+systemEvents.on('notify_user', notifyUserSSE);
 
 app.get("/user-events/:userId", async (req, res) => {
   try {
