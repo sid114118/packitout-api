@@ -1684,6 +1684,7 @@ app.post("/orders", requireUser, async (req, res) => {
       }
     }
 
+    notifyShopSSE(String(o.shopId), 'refresh_orders');
     res.json(o);
   } catch (err) {
     if (coinRefund) {
