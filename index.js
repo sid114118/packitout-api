@@ -826,6 +826,58 @@ app.get("/shop-events/:shopId", async (req, res) => {
   }
 });
 
+// ==========================================
+// ⚡ SERVER-SENT EVENTS (SSE) FOR USERS
+// ==========================================
+const userSSEClients = new Map();
+
+setInterval(() => {
+  userSSEClients.forEach(clients => {
+    for (const res of clients) {
+      res.write(': heartbeat\n\n');
+    }
+  });
+}, 20000);
+
+const notifyUserSSE = (userId, event) => {
+  const clients = userSSEClients.get(String(userId));
+  if (clients) {
+    for (const res of clients) {
+      res.write(`event: ${event}\ndata: {}\n\n`);
+    }
+  }
+};
+
+app.get("/user-events/:userId", async (req, res) => {
+  try {
+    const token = req.query.token;
+    if (!token) return res.status(401).json({ error: "Missing token" });
+    const user = await User.findOne({ "sessionTokens.token": token }).select('+sessionTokens');
+    if (!user || user._id.toString() !== req.params.userId) {
+      return res.status(403).json({ error: "Invalid session or not your account" });
+    }
+
+    res.setHeader("Content-Type", "text/event-stream");
+    res.setHeader("Cache-Control", "no-cache");
+    res.setHeader("Connection", "keep-alive");
+    res.flushHeaders();
+
+    const userId = req.params.userId;
+    if (!userSSEClients.has(userId)) userSSEClients.set(userId, new Set());
+    userSSEClients.get(userId).add(res);
+
+    req.on("close", () => {
+      const clients = userSSEClients.get(userId);
+      if (clients) {
+        clients.delete(res);
+        if (clients.size === 0) userSSEClients.delete(userId);
+      }
+    });
+  } catch (err) {
+    res.status(500).end();
+  }
+});
+
 app.get("/ping", (req, res) => res.send("PackItOut Server is ALIVE! 🟢"));
 
 // --- NOTIFICATION ROUTES ---
@@ -1857,6 +1909,7 @@ app.patch("/orders/:id", requireShop, async (req, res) => {
       }
     }
 
+    notifyUserSSE(String(order.userId), 'refresh_orders');
     res.json(order);
   } catch (err) {
     console.error("Backend Status Update Error:", err);
@@ -3634,6 +3687,7 @@ async function cancelOrderWithRefund(order, opts) {
       await Notification.create({ userId: customerId, orderId: order._id, type: 'order_cancelled', title: customerTitle, message: customerMsg });
       await sendPushNotification(customerId, customerTitle, customerMsg);
     } catch (e) { console.error('[cancel] customer notify failed:', e.message); }
+    notifyUserSSE(String(customerId), 'refresh_orders');
   }
 
   // Notify shop (optional — skip for shop-initiated cancel; they already know).
