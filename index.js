@@ -775,6 +775,18 @@ const sendPushNotification = async (targetUserId, title, message) => {
 // ⚡ SERVER-SENT EVENTS (SSE) FOR SHOPS
 // ==========================================
 const shopSSEClients = new Map();
+
+// Keep connections alive through proxies (Nginx, Hostinger, Vercel) by sending
+// a comment ping every 20 seconds. Without this, idle connections are silently
+// dropped by the proxy after 30-60s and the shop stops getting live orders.
+setInterval(() => {
+  shopSSEClients.forEach(clients => {
+    for (const res of clients) {
+      res.write(': heartbeat\n\n');
+    }
+  });
+}, 20000);
+
 const notifyShopSSE = (shopId, event) => {
   const clients = shopSSEClients.get(String(shopId));
   if (clients) {
