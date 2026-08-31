@@ -813,7 +813,8 @@ app.get("/shop-events/:shopId", async (req, res) => {
     res.status(500).end();
   }
 });
-\napp.get("/ping", (req, res) => res.send("PackItOut Server is ALIVE! 🟢"));
+
+app.get("/ping", (req, res) => res.send("PackItOut Server is ALIVE! 🟢"));
 
 // --- NOTIFICATION ROUTES ---
 // Bearer-token gated — :userId / :shopId must match the session that's asking.
