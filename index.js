@@ -211,7 +211,7 @@ const shopSchema = new mongoose.Schema({
   // unset until the shop taps "Use my current location" in the dashboard, so
   // the 2dsphere index above tolerates missing docs (sparse-by-default).
   location: {
-    type: { type: String, enum: ['Point'], default: 'Point' },
+    type: { type: String, enum: ['Point'] },
     coordinates: { type: [Number], default: undefined },
   },
   fssai: { type: String, default: "" },          
