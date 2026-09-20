@@ -223,6 +223,7 @@ const shopSchema = new mongoose.Schema({
   rating: { type: Number, default: 5.0 },        
   totalOrdersFulfilled: { type: Number, default: 0 }, 
   totalReviews: { type: Number, default: 0 }, 
+  canAddMasterProducts: { type: Boolean, default: false },
   inventoryMode: { type: String, enum: ['manual', 'stock_count'], default: 'manual' },
   inventory: [{
     product: { type: mongoose.Schema.Types.ObjectId, ref: 'MasterProduct' },
@@ -3137,7 +3138,7 @@ app.post("/shops/:shopId/inventory", requireShop, async (req, res) => {
 const SHOP_ADMIN_WRITABLE = [
   'name', 'ownerName', 'fullAddress', 'operatingHours', 'shopImage', 'phone',
   'password', 'pincode', 'serviceablePincodes', 'isOpen', 'isAcceptingOrders',
-  'fssai', 'gst', 'panNumber', 'upiId', 'inventoryMode',
+  'fssai', 'gst', 'panNumber', 'upiId', 'inventoryMode', 'canAddMasterProducts',
 ];
 app.patch("/shops/:id/admin-edit", requireAdmin, async (req, res) => {
   try {
@@ -3208,9 +3209,18 @@ const MASTER_PRODUCT_WRITABLE = [
 ];
 // pickFields / normaliseSearchTags are hoisted near the top of the file so
 // they're available for POST /orders, which runs before this section.
-
-app.post("/master-products", requireAdmin, async (req, res) => {
+app.post("/master-products", async (req, res, next) => {
+  const adminToken = req.headers['x-admin-token'];
+  if (adminToken && process.env.ADMIN_TOKEN && adminToken === process.env.ADMIN_TOKEN) {
+    req.isAdmin = true;
+    return next();
+  }
+  return requireShop(req, res, next);
+}, async (req, res) => {
   try {
+    if (!req.isAdmin && !req.shop?.canAddMasterProducts) {
+      return res.status(403).json({ error: "Permission denied to add master products." });
+    }
     const body = pickFields(req.body || {}, MASTER_PRODUCT_WRITABLE);
     if (body.mrp !== undefined) body.mrp = Number(body.mrp);
     const tags = normaliseSearchTags(req.body?.searchTags);
