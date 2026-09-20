@@ -7,6 +7,7 @@ const cors = require("cors");
 const multer = require("multer");
 const cloudinary = require("cloudinary").v2;
 const fs = require("fs");
+const os = require("os");
 const csv = require("csvtojson");
 const crypto = require("crypto");
 const bcrypt = require("bcryptjs");
@@ -136,7 +137,7 @@ cloudinary.config({
 // and fill /tmp on the Hostinger box.
 const IMAGE_MIME_RE = /^image\/(jpe?g|png|webp|heic|heif)$/i;
 const imageUploadOpts = {
-  dest: '/tmp/',
+  dest: os.tmpdir(),
   limits: { fileSize: 8 * 1024 * 1024 }, // 8 MB
   fileFilter: (_req, file, cb) => cb(null, IMAGE_MIME_RE.test(file.mimetype || '')),
 };
@@ -3194,6 +3195,31 @@ app.patch("/shops/:id", requireShop, async (req, res) => {
     const updateData = pickFields(req.body || {}, SHOP_SELF_WRITABLE);
     res.json(await Shop.findByIdAndUpdate(req.params.id, updateData, { new: true }).populate('inventory.product'));
   } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.post("/master-products/upload-image", async (req, res, next) => {
+  const adminToken = req.headers['x-admin-token'];
+  if (adminToken && process.env.ADMIN_TOKEN && adminToken === process.env.ADMIN_TOKEN) {
+    req.isAdmin = true; return next();
+  }
+  return requireShop(req, res, next);
+}, upload.single('image'), async (req, res) => {
+  if (!req.file) return res.status(400).json({ error: "No image provided." });
+  try {
+    if (!req.isAdmin && !req.shop?.canAddMasterProducts) {
+      return res.status(403).json({ error: "Permission denied." });
+    }
+    const result = await cloudinary.uploader.upload(req.file.path, {
+      folder: 'packitout_products',
+      transformation: [{ width: 800, height: 800, crop: 'limit', quality: 'auto:good' }],
+    });
+    res.json({ url: result.secure_url });
+  } catch (err) {
+    console.error("Product image upload failed:", err);
+    res.status(500).json({ error: "Upload failed." });
+  } finally {
+    safeUnlink(req.file?.path);
+  }
 });
 
 // --- MASTER PRODUCTS ---
