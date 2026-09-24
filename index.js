@@ -256,6 +256,7 @@ const Shop = mongoose.model("Shop", shopSchema);
 
 const productRequestSchema = new mongoose.Schema({
   userId: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
+  shopId: { type: mongoose.Schema.Types.ObjectId, ref: 'Shop' },
   pincode: String,
   productName: String,
   brand: String,
@@ -3247,6 +3248,47 @@ app.post("/master-products/upload-image", async (req, res, next) => {
     res.status(500).json({ error: "Upload failed." });
   } finally {
     safeUnlink(req.file?.path);
+  }
+});
+
+// --- PRODUCT REQUESTS ---
+app.post("/product-requests", requireUser, async (req, res) => {
+  try {
+    const { productName, brand, shopId } = req.body;
+    if (!productName) return res.status(400).json({ error: "Product name is required" });
+    const requestData = {
+      userId: req.user._id,
+      pincode: req.user.pincode,
+      productName,
+      brand: brand || "",
+      status: "Pending"
+    };
+    if (shopId) requestData.shopId = shopId;
+    const pr = await ProductRequest.create(requestData);
+    res.json({ success: true, request: pr });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.get("/shops/:shopId/product-requests", requireShop, async (req, res) => {
+  try {
+    if (req.shop._id.toString() !== req.params.shopId) {
+      return res.status(403).json({ error: "Unauthorized" });
+    }
+    const reqs = await ProductRequest.find({ shopId: req.params.shopId }).populate('userId', 'name phone').sort({ createdAt: -1 });
+    res.json(reqs);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.get("/admin/product-requests", requireAdmin, async (req, res) => {
+  try {
+    const reqs = await ProductRequest.find().populate('userId', 'name phone').populate('shopId', 'name').sort({ createdAt: -1 });
+    res.json(reqs);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
   }
 });
 
