@@ -208,6 +208,7 @@ const shopSchema = new mongoose.Schema({
   pincode: String, 
   serviceablePincodes: { type: [String], default: [] }, 
   isOpen: { type: Boolean, default: true },
+  acceptsPreOrders: { type: Boolean, default: true },
   isAcceptingOrders: { type: Boolean, default: true },
   // Pickup location as GeoJSON Point. coordinates are [longitude, latitude]
   // — Mongo's order, NOT the lat/lng order most APIs use. The whole field is
@@ -3184,7 +3185,7 @@ app.post("/shops/:id/upload-image", requireShop, upload.single('shopImage'), asy
 // password, serviceablePincodes etc. need admin intervention.
 const SHOP_SELF_WRITABLE = [
   'name', 'ownerName', 'fullAddress', 'operatingHours', 'shopImage',
-  'isOpen', 'isAcceptingOrders', 'fssai', 'gst', 'panNumber', 'upiId',
+  'isOpen', 'acceptsPreOrders', 'isAcceptingOrders', 'fssai', 'gst', 'panNumber', 'upiId',
   'inventoryMode',
 ];
 app.patch("/shops/:id", requireShop, async (req, res) => {
@@ -3745,6 +3746,7 @@ async function cancelOrderWithRefund(order, opts) {
       await Notification.create({ shopId, orderId: order._id, type: 'order_cancelled', title: shopTitle, message: shopMsg });
       await sendPushNotification(shopId, shopTitle, shopMsg);
     } catch (e) { console.error('[cancel] shop notify failed:', e.message); }
+    notifyShopSSE(String(shopId), 'refresh_orders');
   }
 }
 
