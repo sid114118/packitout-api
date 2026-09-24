@@ -254,6 +254,15 @@ shopSchema.index({ "sessionTokens.token": 1 });
 shopSchema.index({ location: '2dsphere' });
 const Shop = mongoose.model("Shop", shopSchema);
 
+const productRequestSchema = new mongoose.Schema({
+  userId: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
+  pincode: String,
+  productName: String,
+  brand: String,
+  status: { type: String, default: 'Pending' }
+}, { timestamps: true });
+const ProductRequest = mongoose.model('ProductRequest', productRequestSchema);
+
 const masterProductSchema = new mongoose.Schema({ 
   name: String, brand: String, category: String, mrp: Number, qnty: String, emoji: String, image: String, 
   searchTags: [String], description: { type: String, default: "" }, ingredients: { type: String, default: "" },
@@ -1598,6 +1607,7 @@ const computeTrustedTotal = async (shopId, items, coinsUsed) => {
     const qty = Math.max(1, Math.floor(Number(line.qty) || 1));
     const inv = invByProductId[pid];
     if (!inv) throw new Error(`Product ${pid} not in shop inventory`);
+    if (inv.inStock === false) throw new Error(`Product ${inv.product.name} is currently out of stock.`);
     const price = Number(inv.sellingPrice) || Number(inv.product.mrp) || 0;
     itemTotal += price * qty;
     trustedItems.push({
@@ -3114,9 +3124,6 @@ app.post("/shops/:shopId/inventory", requireShop, async (req, res) => {
     if (!productId || !mongoose.isValidObjectId(productId)) {
       return res.status(400).json({ error: "Valid productId required." });
     }
-    // sellingPrice: must be a finite, non-negative number. The old route would
-    // happily accept negatives or NaN, which let a shop list items at -₹5 and
-    // break every downstream cart-total calculation.
     let priceVal;
     if (sellingPrice !== undefined) {
       priceVal = Number(sellingPrice);
@@ -3137,6 +3144,19 @@ app.post("/shops/:shopId/inventory", requireShop, async (req, res) => {
       }
       await Shop.updateOne({ _id: req.params.shopId }, { $push: { inventory: { product: productId, sellingPrice: priceVal, inStock: true } } });
     }
+    res.json(await Shop.findById(req.params.shopId).populate('inventory.product'));
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.delete("/shops/:shopId/inventory/:productId", requireShop, async (req, res) => {
+  try {
+    if (req.shop._id.toString() !== req.params.shopId) {
+      return res.status(403).json({ error: "Cannot edit another shop's inventory" });
+    }
+    await Shop.updateOne(
+      { _id: req.params.shopId },
+      { $pull: { inventory: { product: req.params.productId } } }
+    );
     res.json(await Shop.findById(req.params.shopId).populate('inventory.product'));
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
