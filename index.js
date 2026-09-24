@@ -1678,9 +1678,16 @@ app.post("/orders", requireUser, async (req, res) => {
     // If UPI is chosen, the shop must have a UPI ID on file — otherwise the
     // customer has nowhere to send the money. Surface the error at checkout
     // time, not silently later.
+    const shop = await Shop.findById(body.shopId).select('upiId isOpen acceptsPreOrders');
+    if (!shop) {
+      return res.status(404).json({ error: "Shop not found." });
+    }
+    if (!shop.isOpen && shop.acceptsPreOrders === false) {
+      return res.status(400).json({ error: "This shop is closed and is not accepting pre-orders right now." });
+    }
+
     if (method === 'UPI') {
-      const shop = await Shop.findById(body.shopId).select('upiId');
-      if (!shop || !shop.upiId || !String(shop.upiId).includes('@')) {
+      if (!shop.upiId || !String(shop.upiId).includes('@')) {
         return res.status(400).json({ error: "This shop has not set a UPI ID — please choose Pay on Pickup instead." });
       }
     }
@@ -2954,7 +2961,7 @@ app.get("/shops/public", async (req, res) => {
   try {
     const shops = await Shop.find({}, {
       name: 1, shopImage: 1, operatingHours: 1, fullAddress: 1, pincode: 1,
-      serviceablePincodes: 1, isOpen: 1, isAcceptingOrders: 1,
+      serviceablePincodes: 1, isOpen: 1, acceptsPreOrders: 1, isAcceptingOrders: 1,
       rating: 1, totalReviews: 1, totalOrdersFulfilled: 1, location: 1,
     }).sort({ name: 1 }).limit(500);
     res.json(shops);
@@ -3089,7 +3096,7 @@ app.get("/shops/:id/menu", async (req, res) => {
 app.get("/shops/:id/menu/lean", async (req, res) => {
   try {
     const shop = await Shop.findById(req.params.id)
-      .select('name isOpen isAcceptingOrders shopImage operatingHours fullAddress pincode rating totalReviews inventoryMode inventory')
+      .select('name isOpen acceptsPreOrders isAcceptingOrders shopImage operatingHours fullAddress pincode rating totalReviews inventoryMode inventory')
       .populate({
         path: 'inventory.product',
         select: 'name brand category mrp qnty emoji image searchTags isVeg itemGroupId'
