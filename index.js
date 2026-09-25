@@ -168,6 +168,18 @@ app.use(cors({
 
 app.use(express.json({ limit: '1mb' }));
 
+// 🛑 Disable all CDN and browser caching for API responses.
+// Without this, Hostinger's LiteSpeed Cache or Cloudflare edge servers will
+// aggressively cache GET requests (like /users/:id), causing the frontend to
+// randomly revert to stale state (e.g. old shop selections) after a page refresh.
+app.use((req, res, next) => {
+  res.set('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
+  res.set('Pragma', 'no-cache');
+  res.set('Expires', '0');
+  res.set('Surrogate-Control', 'no-store');
+  next();
+});
+
 const MONGO_URI = process.env.MONGO_URI;
 mongoose.connect(MONGO_URI)
   .then(async () => {
