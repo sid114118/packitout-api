@@ -168,18 +168,6 @@ app.use(cors({
 
 app.use(express.json({ limit: '1mb' }));
 
-// 🛑 Disable all CDN and browser caching for API responses.
-// Without this, Hostinger's LiteSpeed Cache or Cloudflare edge servers will
-// aggressively cache GET requests (like /users/:id), causing the frontend to
-// randomly revert to stale state (e.g. old shop selections) after a page refresh.
-app.use((req, res, next) => {
-  res.set('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
-  res.set('Pragma', 'no-cache');
-  res.set('Expires', '0');
-  res.set('Surrogate-Control', 'no-store');
-  next();
-});
-
 const MONGO_URI = process.env.MONGO_URI;
 mongoose.connect(MONGO_URI)
   .then(async () => {
@@ -601,7 +589,22 @@ const checkOtpRateLimit = (phone) => {
 // matches the bearer token to a doc and attaches it to req.
 const issueSessionToken = async (Model, docId) => {
   const token = crypto.randomBytes(32).toString('hex');
-  await Model.updateOne({ _id: docId }, { $push: { sessionTokens: { token, createdAt: new Date() } } });
+  const now = new Date();
+  // 🔑 Clean up: remove tokens older than 30 days so the array doesn't grow
+  // without bound (which was slowing down every requireUser/requireShop query).
+  const cutoff = new Date(now.getTime() - 30 * 24 * 60 * 60 * 1000);
+  await Model.updateOne({ _id: docId }, {
+    $pull: { sessionTokens: { createdAt: { $lt: cutoff } } },
+  });
+  // Push the new token and cap at 10 most recent sessions.
+  await Model.updateOne({ _id: docId }, {
+    $push: {
+      sessionTokens: {
+        $each: [{ token, createdAt: now }],
+        $slice: -10,
+      },
+    },
+  });
   return token;
 };
 
@@ -3021,7 +3024,11 @@ app.post("/shop-login", async (req, res) => {
     const phone = String(req.body?.phone || '').trim();
     const password = String(req.body?.password || '');
     // password is select:false, so must opt in explicitly to compare.
-    const shop = await Shop.findOne({ phone }).select('+password').populate('inventory.product');
+    // 🔑 Don't populate inventory at login — it was sending the shop's entire
+    // product catalog (thousands of items with all fields) on every login,
+    // making the response huge and slow. ShopDashboard fetches its own data
+    // separately via /shops/:id/menu after login succeeds.
+    const shop = await Shop.findOne({ phone }).select('+password -inventory');
     if (!shop) return res.status(401).json({ error: "Invalid" });
 
     let ok = false;
@@ -3338,7 +3345,15 @@ app.post("/master-products", async (req, res, next) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-app.get("/master-products", async (req, res) => res.json(await MasterProduct.find()));
+// 🔑 .lean() skips Mongoose hydration (faster serialization) and .select()
+// strips heavy fields the feed/guest never renders (description, ingredients,
+// nutrition, manufacturer). ProductModal lazily fetches the full doc when opened.
+app.get("/master-products", async (req, res) => {
+  const products = await MasterProduct.find()
+    .select('name brand category mrp qnty emoji image searchTags isVeg itemGroupId')
+    .lean();
+  res.json(products);
+});
 
 // Lazy-loaded by ProductModal so the customer feed can ship a slim product payload
 // and only fetch description/ingredients/nutrition when a user opens a product.
