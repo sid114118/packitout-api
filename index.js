@@ -539,6 +539,16 @@ const rankingConfigSchema = new mongoose.Schema({
 });
 const RankingConfig = mongoose.model("RankingConfig", rankingConfigSchema);
 
+// 🛒 SHARED BASKETS
+const sharedBasketSchema = new mongoose.Schema({
+  userId: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
+  name: { type: String, required: true },
+  emoji: String,
+  items: { type: Array, required: true },
+  createdAt: { type: Date, default: Date.now, expires: 60 * 60 * 24 * 30 } // Auto-delete after 30 days
+});
+const SharedBasket = mongoose.model("SharedBasket", sharedBasketSchema);
+
 // ==========================================
 // 🔐 AUTH VALIDATORS, RATE LIMIT, OTP HELPER
 // ==========================================
@@ -2871,6 +2881,32 @@ app.patch("/users/:id", requireUser, async (req, res) => {
       return res.status(400).json({ error: "Pincode must be exactly 6 digits." });
     }
     res.json(await User.findByIdAndUpdate(req.params.id, updateData, { new: true }).populate('primaryShop'));
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// ==========================================
+// ==========================================
+// 🛒 SHARED BASKETS
+// ==========================================
+app.post("/shared-baskets", requireUser, async (req, res) => {
+  try {
+    const { name, emoji, items } = req.body;
+    if (!name || !items || !items.length) return res.status(400).json({ error: "Name and items are required" });
+    const shared = await SharedBasket.create({
+      userId: req.user._id,
+      name,
+      emoji: emoji || '🧺',
+      items
+    });
+    res.json({ id: shared._id });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.get("/shared-baskets/:id", async (req, res) => {
+  try {
+    const shared = await SharedBasket.findById(req.params.id);
+    if (!shared) return res.status(404).json({ error: "Basket not found or expired" });
+    res.json(shared);
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
