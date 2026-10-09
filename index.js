@@ -314,6 +314,7 @@ const userSchema = new mongoose.Schema({
   // from there first and falls back to the legacy field for old users.
   pincode: String, address: String,
   addresses: { type: [addressSchema], default: [] },
+  savedBaskets: { type: Array, default: [] },
   coins: { type: Number, default: 0 }, referralCode: { type: String, unique: true },
   referredBy: String, primaryShop: { type: mongoose.Schema.Types.ObjectId, ref: 'Shop' },
   // 🔐 Session tokens — same pattern as Shop.sessionTokens. select:false so they
@@ -579,6 +580,23 @@ const checkOtpRateLimit = (phone) => {
   otpSendLog.set(phone, past);
   return true;
 };
+
+// Periodically clean up stale entries in rate limiters to prevent memory leaks
+setInterval(() => {
+  const now = Date.now();
+  // Clean up general rate limits (assuming max window is 10 mins, using 1 hour to be safe)
+  for (const [key, timestamps] of rateLimitBuckets.entries()) {
+    const valid = timestamps.filter(t => now - t < 60 * 60 * 1000);
+    if (valid.length === 0) rateLimitBuckets.delete(key);
+    else rateLimitBuckets.set(key, valid);
+  }
+  // Clean up OTP logs
+  for (const [phone, timestamps] of otpSendLog.entries()) {
+    const valid = timestamps.filter(t => now - t < OTP_RATE_WINDOW_MS);
+    if (valid.length === 0) otpSendLog.delete(phone);
+    else otpSendLog.set(phone, valid);
+  }
+}, 15 * 60 * 1000); // Run every 15 minutes
 
 // ==========================================
 // 🔐 SESSION TOKENS (User + Shop) and route guards
@@ -2841,7 +2859,7 @@ app.get("/users/:id", requireUser, async (req, res) => {
 // Field whitelist — anything not in this list is dropped before the update.
 // Closes the mass-assignment hole where a client could PATCH /users/:id with
 // { coins: 999999 } or push a forged sessionTokens entry to hijack the account.
-const USER_WRITABLE = ['name', 'pincode', 'address', 'primaryShop'];
+const USER_WRITABLE = ['name', 'pincode', 'address', 'primaryShop', 'savedBaskets'];
 app.patch("/users/:id", requireUser, async (req, res) => {
   try {
     if (req.user._id.toString() !== req.params.id) {
