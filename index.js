@@ -232,6 +232,7 @@ const shopSchema = new mongoose.Schema({
     sellingPrice: Number,
     stockCount: { type: Number, default: 0 },
     inStock: { type: Boolean, default: true },
+    isFeatured: { type: Boolean, default: false },
     bulkOffer: {
       isActive: { type: Boolean, default: false },
       buyQty: { type: Number, default: 0 },
@@ -3171,7 +3172,7 @@ app.post("/shops/:shopId/inventory", requireShop, async (req, res) => {
     if (req.shop._id.toString() !== req.params.shopId) {
       return res.status(403).json({ error: "Cannot edit another shop's inventory" });
     }
-    const { productId, sellingPrice, inStock } = req.body;
+    const { productId, sellingPrice, inStock, isFeatured } = req.body;
     if (!productId || !mongoose.isValidObjectId(productId)) {
       return res.status(400).json({ error: "Valid productId required." });
     }
@@ -3188,12 +3189,13 @@ app.post("/shops/:shopId/inventory", requireShop, async (req, res) => {
       const updateData = {};
       if (priceVal !== undefined) updateData[`inventory.${existingIndex}.sellingPrice`] = priceVal;
       if (inStock !== undefined) updateData[`inventory.${existingIndex}.inStock`] = Boolean(inStock);
+      if (isFeatured !== undefined) updateData[`inventory.${existingIndex}.isFeatured`] = Boolean(isFeatured);
       await Shop.updateOne({ _id: req.params.shopId }, { $set: updateData });
     } else {
       if (priceVal === undefined) {
         return res.status(400).json({ error: "sellingPrice required when adding a new inventory item." });
       }
-      await Shop.updateOne({ _id: req.params.shopId }, { $push: { inventory: { product: productId, sellingPrice: priceVal, inStock: true } } });
+      await Shop.updateOne({ _id: req.params.shopId }, { $push: { inventory: { product: productId, sellingPrice: priceVal, inStock: true, isFeatured: Boolean(isFeatured) } } });
     }
     res.json(await Shop.findById(req.params.shopId).populate('inventory.product'));
   } catch (err) { res.status(500).json({ error: err.message }); }
