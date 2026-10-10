@@ -246,6 +246,12 @@ const shopSchema = new mongoose.Schema({
     default: [],
     select: false, // never include in default queries — never want this in client payloads
   },
+  combos: [{
+    name: String,
+    emoji: { type: String, default: '🎁' },
+    productIds: [{ type: mongoose.Schema.Types.ObjectId, ref: 'MasterProduct' }],
+    isActive: { type: Boolean, default: true }
+  }]
 });
 shopSchema.index({ pincode: 1 });
 shopSchema.index({ "sessionTokens.token": 1 });
@@ -253,7 +259,18 @@ shopSchema.index({ "sessionTokens.token": 1 });
 // this once via "Use my current location" in the dashboard; without it they
 // just don't get a distance shown in the customer's Nearby grid.
 shopSchema.index({ location: '2dsphere' });
+shopSchema.index({ location: '2dsphere' });
 const Shop = mongoose.model("Shop", shopSchema);
+
+const campaignSchema = new mongoose.Schema({
+  title: String,
+  subtitle: String,
+  bannerColor: { type: String, default: 'linear-gradient(135deg, #1e3a8a 0%, #3b82f6 100%)' },
+  emoji: { type: String, default: '🎉' },
+  keywords: [String],
+  isActive: { type: Boolean, default: true }
+});
+const Campaign = mongoose.model("Campaign", campaignSchema);
 
 const productRequestSchema = new mongoose.Schema({
   userId: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
@@ -3213,6 +3230,36 @@ app.delete("/shops/:shopId/inventory/:productId", requireShop, async (req, res) 
     res.json(await Shop.findById(req.params.shopId).populate('inventory.product'));
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
+
+app.post("/shops/:shopId/combos", requireShop, async (req, res) => {
+  try {
+    if (req.shop._id.toString() !== req.params.shopId) {
+      return res.status(403).json({ error: "Cannot edit another shop's combos" });
+    }
+    const { name, emoji, productIds } = req.body;
+    if (!name || !productIds || !Array.isArray(productIds) || productIds.length === 0) {
+      return res.status(400).json({ error: "Combo name and at least one product required." });
+    }
+    await Shop.updateOne(
+      { _id: req.params.shopId }, 
+      { $push: { combos: { name, emoji, productIds, isActive: true } } }
+    );
+    res.json(await Shop.findById(req.params.shopId).populate('inventory.product'));
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.delete("/shops/:shopId/combos/:comboId", requireShop, async (req, res) => {
+  try {
+    if (req.shop._id.toString() !== req.params.shopId) {
+      return res.status(403).json({ error: "Cannot edit another shop's combos" });
+    }
+    await Shop.updateOne(
+      { _id: req.params.shopId },
+      { $pull: { combos: { _id: req.params.comboId } } }
+    );
+    res.json(await Shop.findById(req.params.shopId).populate('inventory.product'));
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
 // Admin can edit a broader set of fields than the shop itself can — e.g.
 // rotating a password or correcting the shop's phone number. Password resets
 // are bcrypt-hashed inline so admin-set passwords land in the same shape as
@@ -3933,6 +3980,31 @@ setTimeout(() => {
   console.log(`🚨 Escalation worker armed — scanning every ${ESCALATION_SCAN_INTERVAL_MS / 1000}s`);
   setInterval(runEscalationScan, ESCALATION_SCAN_INTERVAL_MS);
 }, 10 * 1000);
+
+// ==========================================
+// 🎯 CAMPAIGNS API
+// ==========================================
+app.get("/campaigns", async (req, res) => {
+  try {
+    const campaigns = await Campaign.find({ isActive: true }).sort({ createdAt: -1 });
+    res.json(campaigns);
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.post("/campaigns", requireAdmin, async (req, res) => {
+  try {
+    const campaign = new Campaign(req.body);
+    await campaign.save();
+    res.status(201).json(campaign);
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.delete("/campaigns/:id", requireAdmin, async (req, res) => {
+  try {
+    await Campaign.findByIdAndDelete(req.params.id);
+    res.json({ message: "Campaign deleted" });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
 
 // ==========================================
 // 🚀 START SERVER
