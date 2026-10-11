@@ -250,6 +250,7 @@ const shopSchema = new mongoose.Schema({
   combos: [{
     name: String,
     emoji: { type: String, default: '🎁' },
+    comboPrice: { type: Number, default: 0 },
     productIds: [{ type: mongoose.Schema.Types.ObjectId, ref: 'MasterProduct' }],
     isActive: { type: Boolean, default: true }
   }]
@@ -3172,7 +3173,7 @@ app.patch("/shops/:id/location", requireShop, async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 app.get("/shops/:id/menu", async (req, res) => {
-  try { res.json(await Shop.findById(req.params.id).populate('inventory.product')); } catch (err) { res.status(500).json({ error: err.message }); }
+  try { res.json(await Shop.findById(req.params.id).populate('inventory.product').populate('combos.productIds')); } catch (err) { res.status(500).json({ error: err.message }); }
 });
 // Slim variant for the customer feed/list views — strips description, ingredients,
 // manufacturer fields, nutrition, and related/substitute refs that the feed never renders.
@@ -3180,7 +3181,8 @@ app.get("/shops/:id/menu", async (req, res) => {
 app.get("/shops/:id/menu/lean", async (req, res) => {
   try {
     const shop = await Shop.findById(req.params.id)
-      .select('name isOpen acceptsPreOrders isAcceptingOrders shopImage operatingHours fullAddress pincode rating totalReviews inventoryMode inventory')
+      .select('name isOpen acceptsPreOrders isAcceptingOrders shopImage operatingHours fullAddress pincode rating totalReviews inventoryMode inventory combos')
+      .populate('combos.productIds')
       .lean();
     res.json(shop);
   } catch (err) { res.status(500).json({ error: err.message }); }
@@ -3216,7 +3218,7 @@ app.post("/shops/:shopId/inventory", requireShop, async (req, res) => {
       }
       await Shop.updateOne({ _id: req.params.shopId }, { $push: { inventory: { product: productId, sellingPrice: priceVal, inStock: true, isFeatured: Boolean(isFeatured), featuredRank: featuredRank !== undefined ? Number(featuredRank) : 999 } } });
     }
-    res.json(await Shop.findById(req.params.shopId).populate('inventory.product'));
+    res.json(await Shop.findById(req.params.shopId).populate('inventory.product').populate('combos.productIds'));
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
@@ -3243,7 +3245,7 @@ app.post("/shops/:shopId/inventory/featured-ranks", requireShop, async (req, res
     if (Object.keys(updateData).length > 0) {
       await Shop.updateOne({ _id: req.params.shopId }, { $set: updateData });
     }
-    res.json(await Shop.findById(req.params.shopId).populate('inventory.product'));
+    res.json(await Shop.findById(req.params.shopId).populate('inventory.product').populate('combos.productIds'));
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
@@ -3256,7 +3258,7 @@ app.delete("/shops/:shopId/inventory/:productId", requireShop, async (req, res) 
       { _id: req.params.shopId },
       { $pull: { inventory: { product: req.params.productId } } }
     );
-    res.json(await Shop.findById(req.params.shopId).populate('inventory.product'));
+    res.json(await Shop.findById(req.params.shopId).populate('inventory.product').populate('combos.productIds'));
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
@@ -3265,15 +3267,15 @@ app.post("/shops/:shopId/combos", requireShop, async (req, res) => {
     if (req.shop._id.toString() !== req.params.shopId) {
       return res.status(403).json({ error: "Cannot edit another shop's combos" });
     }
-    const { name, emoji, productIds } = req.body;
+    const { name, emoji, productIds, comboPrice } = req.body;
     if (!name || !productIds || !Array.isArray(productIds) || productIds.length === 0) {
       return res.status(400).json({ error: "Combo name and at least one product required." });
     }
     await Shop.updateOne(
       { _id: req.params.shopId }, 
-      { $push: { combos: { name, emoji, productIds, isActive: true } } }
+      { $push: { combos: { name, emoji, productIds, comboPrice: Number(comboPrice) || 0, isActive: true } } }
     );
-    res.json(await Shop.findById(req.params.shopId).populate('inventory.product'));
+    res.json(await Shop.findById(req.params.shopId).populate('inventory.product').populate('combos.productIds'));
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
@@ -3286,7 +3288,7 @@ app.delete("/shops/:shopId/combos/:comboId", requireShop, async (req, res) => {
       { _id: req.params.shopId },
       { $pull: { combos: { _id: req.params.comboId } } }
     );
-    res.json(await Shop.findById(req.params.shopId).populate('inventory.product'));
+    res.json(await Shop.findById(req.params.shopId).populate('inventory.product').populate('combos.productIds'));
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 // Admin can edit a broader set of fields than the shop itself can — e.g.
