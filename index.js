@@ -233,6 +233,7 @@ const shopSchema = new mongoose.Schema({
     stockCount: { type: Number, default: 0 },
     inStock: { type: Boolean, default: true },
     isFeatured: { type: Boolean, default: false },
+    featuredRank: { type: Number, default: 999 },
     bulkOffer: {
       isActive: { type: Boolean, default: false },
       buyQty: { type: Number, default: 0 },
@@ -3189,7 +3190,7 @@ app.post("/shops/:shopId/inventory", requireShop, async (req, res) => {
     if (req.shop._id.toString() !== req.params.shopId) {
       return res.status(403).json({ error: "Cannot edit another shop's inventory" });
     }
-    const { productId, sellingPrice, inStock, isFeatured } = req.body;
+    const { productId, sellingPrice, inStock, isFeatured, featuredRank } = req.body;
     if (!productId || !mongoose.isValidObjectId(productId)) {
       return res.status(400).json({ error: "Valid productId required." });
     }
@@ -3207,12 +3208,40 @@ app.post("/shops/:shopId/inventory", requireShop, async (req, res) => {
       if (priceVal !== undefined) updateData[`inventory.${existingIndex}.sellingPrice`] = priceVal;
       if (inStock !== undefined) updateData[`inventory.${existingIndex}.inStock`] = Boolean(inStock);
       if (isFeatured !== undefined) updateData[`inventory.${existingIndex}.isFeatured`] = Boolean(isFeatured);
+      if (featuredRank !== undefined) updateData[`inventory.${existingIndex}.featuredRank`] = Number(featuredRank);
       await Shop.updateOne({ _id: req.params.shopId }, { $set: updateData });
     } else {
       if (priceVal === undefined) {
         return res.status(400).json({ error: "sellingPrice required when adding a new inventory item." });
       }
-      await Shop.updateOne({ _id: req.params.shopId }, { $push: { inventory: { product: productId, sellingPrice: priceVal, inStock: true, isFeatured: Boolean(isFeatured) } } });
+      await Shop.updateOne({ _id: req.params.shopId }, { $push: { inventory: { product: productId, sellingPrice: priceVal, inStock: true, isFeatured: Boolean(isFeatured), featuredRank: featuredRank !== undefined ? Number(featuredRank) : 999 } } });
+    }
+    res.json(await Shop.findById(req.params.shopId).populate('inventory.product'));
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.post("/shops/:shopId/inventory/featured-ranks", requireShop, async (req, res) => {
+  try {
+    if (req.shop._id.toString() !== req.params.shopId) {
+      return res.status(403).json({ error: "Cannot edit another shop's inventory" });
+    }
+    const { ranks } = req.body; // array of { productId, featuredRank }
+    if (!Array.isArray(ranks)) {
+      return res.status(400).json({ error: "ranks array required." });
+    }
+    const shop = await Shop.findById(req.params.shopId);
+    if (!shop) return res.status(404).json({ error: "Shop not found." });
+
+    const updateData = {};
+    ranks.forEach(({ productId, featuredRank }) => {
+      const idx = shop.inventory.findIndex(item => item.product && item.product.toString() === productId);
+      if (idx > -1 && featuredRank !== undefined) {
+        updateData[`inventory.${idx}.featuredRank`] = Number(featuredRank);
+      }
+    });
+
+    if (Object.keys(updateData).length > 0) {
+      await Shop.updateOne({ _id: req.params.shopId }, { $set: updateData });
     }
     res.json(await Shop.findById(req.params.shopId).populate('inventory.product'));
   } catch (err) { res.status(500).json({ error: err.message }); }
