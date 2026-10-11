@@ -1278,16 +1278,32 @@ Return ONLY valid JSON (no markdown formatting, no commentary):
   { "rawText": "...", "cleanItem": "...", "brand": "...", "packSize": "...", "qty": 1, "unit": "..." }
 ]`;
 
-    const model = genAI.getGenerativeModel({
-      model: "gemini-2.0-flash",
-      generationConfig: {
-        responseMimeType: "application/json",
-        temperature: 0.15,
-      },
-    });
+    // 4. Generate content with automatic model fallback
+    const candidateModels = ["gemini-2.5-flash", "gemini-flash-latest", "gemini-2.5-flash-lite"];
+    let text = null;
+    let lastError = null;
 
-    const result = await model.generateContent([prompt, imagePart]);
-    const text = result.response.text();
+    for (const modelName of candidateModels) {
+      try {
+        const model = genAI.getGenerativeModel({
+          model: modelName,
+          generationConfig: {
+            responseMimeType: "application/json",
+            temperature: 0.15,
+          },
+        });
+        const result = await model.generateContent([prompt, imagePart]);
+        text = result.response.text();
+        if (text) break;
+      } catch (err) {
+        lastError = err;
+        console.warn(`Parchi OCR with ${modelName} failed, trying next candidate:`, err.message);
+      }
+    }
+
+    if (!text) {
+      throw lastError || new Error("AI could not read the image.");
+    }
 
     let extracted;
     try {
@@ -1428,7 +1444,7 @@ Return ONLY valid JSON (no markdown formatting, no commentary):
     });
   } catch (err) {
     console.error("Parchi extraction error:", err);
-    res.status(500).json({ error: "Extraction failed." });
+    res.status(500).json({ error: err.message || "Extraction failed." });
   } finally {
     safeUnlink(req.file?.path);
   }
