@@ -3279,6 +3279,32 @@ app.post("/shops/:shopId/combos", requireShop, async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
+app.put("/shops/:shopId/combos/:comboId", requireShop, async (req, res) => {
+  try {
+    if (req.shop._id.toString() !== req.params.shopId) {
+      return res.status(403).json({ error: "Cannot edit another shop's combos" });
+    }
+    const { name, emoji, productIds, comboPrice, isActive } = req.body;
+    if (!name || !productIds || !Array.isArray(productIds) || productIds.length === 0) {
+      return res.status(400).json({ error: "Combo name and at least one product required." });
+    }
+    const updateFields = {
+      "combos.$.name": name,
+      "combos.$.emoji": emoji || '🎁',
+      "combos.$.productIds": productIds,
+      "combos.$.comboPrice": Number(comboPrice) || 0,
+    };
+    if (isActive !== undefined) {
+      updateFields["combos.$.isActive"] = Boolean(isActive);
+    }
+    await Shop.updateOne(
+      { _id: req.params.shopId, "combos._id": req.params.comboId },
+      { $set: updateFields }
+    );
+    res.json(await Shop.findById(req.params.shopId).populate('inventory.product').populate('combos.productIds'));
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
 app.delete("/shops/:shopId/combos/:comboId", requireShop, async (req, res) => {
   try {
     if (req.shop._id.toString() !== req.params.shopId) {
