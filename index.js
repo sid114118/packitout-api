@@ -372,6 +372,7 @@ const orderSchema = new mongoose.Schema({
   // 🕒 Customer-chosen pickup time, set at checkout. Null when the order is urgent (ASAP).
   pickupTime: { type: Date, default: null },
   isUrgent: { type: Boolean, default: false },
+  customerArrivedAt: { type: Date, default: null },
   statusHistory: {
     type: [{ status: String, at: { type: Date, default: Date.now }, _id: false }],
     default: []
@@ -2136,6 +2137,65 @@ app.post("/orders/:id/user-cancel", requireUser, async (req, res) => {
     res.json({ success: true });
   } catch (err) {
     console.error("user-cancel error:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// 📍 CUSTOMER COUNTER ARRIVAL NOTIFICATION — "I'm at the Shop"
+// Customer taps to alert the shopkeeper they have arrived at the counter.
+// Updates order.customerArrivedAt, triggers SSE 'customer_arrived' to the shop dashboard,
+// and sends high-priority push notification so the shopkeeper is instantly alerted.
+app.post("/orders/:id/customer-arrived", requireUser, async (req, res) => {
+  try {
+    if (!mongoose.isValidObjectId(req.params.id)) {
+      return res.status(400).json({ error: "Invalid order ID" });
+    }
+    const order = await Order.findById(req.params.id);
+    if (!order) return res.status(404).json({ error: "Order not found" });
+
+    const orderUserId = (order.userId?._id || order.userId).toString();
+    if (orderUserId !== req.user._id.toString()) {
+      return res.status(403).json({ error: "Not your order" });
+    }
+
+    if (order.status?.includes('✅') || order.status?.includes('❌')) {
+      return res.status(400).json({ error: "This order is already completed or cancelled." });
+    }
+
+    const now = new Date();
+    order.customerArrivedAt = now;
+    if (!order.statusHistory) order.statusHistory = [];
+    if (!order.statusHistory.some(h => h.status === 'Customer Arrived 📍')) {
+      order.statusHistory.push({ status: 'Customer Arrived 📍', at: now });
+    }
+    await order.save();
+
+    const shortId = order._id.toString().slice(-5).toUpperCase();
+    const customerName = req.user.name || "Customer";
+
+    // 1. Live SSE update to shop dashboard (0ms latency)
+    notifyShopSSE(String(order.shopId), 'customer_arrived');
+    notifyShopSSE(String(order.shopId), 'refresh_orders');
+
+    // 2. High-priority push notification to shopkeeper
+    const shopTitle = `🚨 CUSTOMER AT COUNTER! (#${shortId})`;
+    const shopMsg = `👤 ${customerName} has arrived to pick up Order #${shortId}. Token: #${shortId}`;
+    try {
+      await Notification.create({
+        shopId: order.shopId,
+        orderId: order._id,
+        type: 'new_order',
+        title: shopTitle,
+        message: shopMsg
+      });
+      await sendPushNotification(order.shopId, shopTitle, shopMsg);
+    } catch (e) {
+      console.log('Customer arrival push notification skipped:', e.message);
+    }
+
+    res.json({ success: true, customerArrivedAt: order.customerArrivedAt, shortId });
+  } catch (err) {
+    console.error("customer-arrived error:", err);
     res.status(500).json({ error: err.message });
   }
 });
