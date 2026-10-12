@@ -373,6 +373,9 @@ const orderSchema = new mongoose.Schema({
   pickupTime: { type: Date, default: null },
   isUrgent: { type: Boolean, default: false },
   customerArrivedAt: { type: Date, default: null },
+  adjustedDelta: { type: Number, default: 0 },
+  unreadCountUser: { type: Number, default: 0 },
+  unreadCountShop: { type: Number, default: 0 },
   statusHistory: {
     type: [{ status: String, at: { type: Date, default: Date.now }, _id: false }],
     default: []
@@ -415,6 +418,42 @@ const orderSchema = new mongoose.Schema({
 orderSchema.index({ userId: 1, createdAt: -1 });
 orderSchema.index({ shopId: 1, createdAt: -1 });
 const Order = mongoose.model("Order", orderSchema);
+
+// 💬 In-App WhatsApp-Style "Shop Chat & Quick Replacement" Message Schema
+const orderMessageSchema = new mongoose.Schema({
+  orderId: { type: mongoose.Schema.Types.ObjectId, ref: 'Order', required: true, index: true },
+  senderRole: { type: String, enum: ['user', 'shop', 'system'], required: true },
+  senderName: { type: String, default: '' },
+  text: { type: String, default: '' },
+  imageUrl: { type: String, default: '' },
+  proposal: {
+    proposalId: { type: String, default: null },
+    type: { type: String, enum: ['replacement', 'add_item'], default: 'replacement' },
+    originalItem: {
+      productId: { type: String, default: '' },
+      name: { type: String, default: '' },
+      qty: { type: Number, default: 1 },
+      price: { type: Number, default: 0 },
+      image: { type: String, default: '' }
+    },
+    replacementItem: {
+      productId: { type: String, default: '' },
+      name: { type: String, default: '' },
+      brand: { type: String, default: '' },
+      qty: { type: Number, default: 1 },
+      price: { type: Number, default: 0 },
+      image: { type: String, default: '' }
+    },
+    priceDelta: { type: Number, default: 0 },
+    status: { type: String, enum: ['pending', 'accepted', 'declined', 'expired'], default: 'pending' },
+    respondedAt: { type: Date, default: null }
+  },
+  readByUser: { type: Boolean, default: false },
+  readByShop: { type: Boolean, default: false },
+  createdAt: { type: Date, default: Date.now, index: true }
+});
+orderMessageSchema.index({ orderId: 1, createdAt: 1 });
+const OrderMessage = mongoose.model("OrderMessage", orderMessageSchema);
 
 // Parchi (handwritten shopping list). Status lifecycle:
 //   'pending'   — uploaded by customer, awaiting shop quote
@@ -670,6 +709,49 @@ const requireUser = async (req, res, next) => {
     next();
   } catch (err) { res.status(500).json({ error: err.message }); }
 };
+
+// 🔐 Dual-role guard for Order Chat & Quick Replacement.
+// Verifies bearer token against either User or Shop, ensures the caller is
+// genuinely either the customer who placed the order or the shop that received it.
+const requireOrderParty = async (req, res, next) => {
+  try {
+    const token = extractBearer(req);
+    if (!token) return res.status(401).json({ error: "Missing session token" });
+    const orderId = req.params.id;
+    if (!orderId || !mongoose.Types.ObjectId.isValid(orderId)) {
+      return res.status(400).json({ error: "Invalid order ID" });
+    }
+    const order = await Order.findById(orderId).populate('shopId', 'name phone').populate('userId', 'name phone');
+    if (!order) return res.status(404).json({ error: "Order not found" });
+
+    // 1. Check if caller is the Customer
+    const user = await User.findOne({ "sessionTokens.token": token }).select('+sessionTokens');
+    const orderUserId = (order.userId?._id || order.userId || '').toString();
+    if (user && orderUserId === user._id.toString()) {
+      req.user = user;
+      req.order = order;
+      req.partyRole = 'user';
+      req.partyName = user.name || 'Customer';
+      return next();
+    }
+
+    // 2. Check if caller is the Shopkeeper
+    const shop = await Shop.findOne({ "sessionTokens.token": token }).select('+sessionTokens');
+    const orderShopId = (order.shopId?._id || order.shopId || '').toString();
+    if (shop && orderShopId === shop._id.toString()) {
+      req.shop = shop;
+      req.order = order;
+      req.partyRole = 'shop';
+      req.partyName = shop.name || 'Shopkeeper';
+      return next();
+    }
+
+    return res.status(403).json({ error: "Not authorized for this order" });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+};
+
 
 // ==========================================
 // 🛡️ ADMIN TOKEN GUARD
@@ -2350,6 +2432,388 @@ app.post("/orders/:id/customer-arrived", requireUser, async (req, res) => {
     res.status(500).json({ error: err.message });
   }
 });
+
+// ============================================================================
+// 💬 IN-APP WHATSAPP-STYLE "SHOP CHAT & QUICK REPLACEMENT" ROUTES
+// ============================================================================
+
+// 1. Fetch chat history & active order summary (Dual-auth: user or shop)
+app.get("/orders/:id/messages", requireOrderParty, async (req, res) => {
+  try {
+    const messages = await OrderMessage.find({ orderId: req.order._id })
+      .sort({ createdAt: 1 })
+      .limit(100)
+      .lean();
+
+    // Clear unread badge for the caller
+    let needsSave = false;
+    if (req.partyRole === 'user') {
+      if (req.order.unreadCountUser > 0) {
+        req.order.unreadCountUser = 0;
+        needsSave = true;
+      }
+      await OrderMessage.updateMany(
+        { orderId: req.order._id, readByUser: false },
+        { $set: { readByUser: true } }
+      );
+    } else if (req.partyRole === 'shop') {
+      if (req.order.unreadCountShop > 0) {
+        req.order.unreadCountShop = 0;
+        needsSave = true;
+      }
+      await OrderMessage.updateMany(
+        { orderId: req.order._id, readByShop: false },
+        { $set: { readByShop: true } }
+      );
+    }
+    if (needsSave) {
+      await Order.updateOne(
+        { _id: req.order._id },
+        { $set: { unreadCountUser: req.order.unreadCountUser, unreadCountShop: req.order.unreadCountShop } }
+      );
+    }
+
+    res.json({
+      success: true,
+      messages,
+      order: {
+        _id: req.order._id,
+        status: req.order.status,
+        items: req.order.items || [],
+        totalAmount: req.order.totalAmount,
+        paymentMethod: req.order.paymentMethod,
+        paymentStatus: req.order.paymentStatus,
+        adjustedDelta: req.order.adjustedDelta || 0,
+        unreadCountUser: req.order.unreadCountUser || 0,
+        unreadCountShop: req.order.unreadCountShop || 0,
+        shopId: req.order.shopId,
+        userId: req.order.userId,
+      }
+    });
+  } catch (err) {
+    console.error("GET /orders/:id/messages error:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// 2. Send text message or photo (Dual-auth: user or shop)
+app.post("/orders/:id/messages", requireOrderParty, async (req, res) => {
+  try {
+    const text = (req.body?.text || '').trim();
+    const imageUrl = (req.body?.imageUrl || '').trim();
+
+    if (!text && !imageUrl) {
+      return res.status(400).json({ error: "Message text or image required" });
+    }
+
+    const isClosed = req.order.status?.includes('✅') || req.order.status?.includes('❌');
+    if (isClosed) {
+      return res.status(400).json({ error: "This order is closed. Chat is archived." });
+    }
+
+    const newMsg = await OrderMessage.create({
+      orderId: req.order._id,
+      senderRole: req.partyRole,
+      senderName: req.partyName,
+      text,
+      imageUrl,
+      readByUser: req.partyRole === 'user',
+      readByShop: req.partyRole === 'shop',
+      createdAt: new Date()
+    });
+
+    // Update unread count on order & send SSE notification
+    const recipientUpdate = req.partyRole === 'user'
+      ? { $inc: { unreadCountShop: 1 } }
+      : { $inc: { unreadCountUser: 1 } };
+
+    await Order.updateOne({ _id: req.order._id }, recipientUpdate);
+
+    const targetShopId = (req.order.shopId?._id || req.order.shopId).toString();
+    const targetUserId = (req.order.userId?._id || req.order.userId).toString();
+
+    if (req.partyRole === 'user') {
+      notifyShopSSE(targetShopId, 'order_chat_update');
+    } else {
+      notifyUserSSE(targetUserId, 'order_chat_update');
+    }
+
+    res.json({ success: true, message: newMsg });
+  } catch (err) {
+    console.error("POST /orders/:id/messages error:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// 3. Propose Item Replacement (Shopkeeper only)
+app.post("/orders/:id/propose-replacement", requireOrderParty, async (req, res) => {
+  try {
+    if (req.partyRole !== 'shop') {
+      return res.status(403).json({ error: "Only shopkeeper can propose replacements" });
+    }
+
+    const isClosed = req.order.status?.includes('✅') || req.order.status?.includes('❌');
+    if (isClosed) {
+      return res.status(400).json({ error: "Cannot propose replacement on a closed order." });
+    }
+
+    const { originalItemIndex, replacementItem } = req.body || {};
+    const items = req.order.items || [];
+    const orig = items[originalItemIndex];
+    if (!orig) {
+      return res.status(400).json({ error: "Original item not found in order." });
+    }
+
+    if (!replacementItem || !replacementItem.name || replacementItem.price === undefined) {
+      return res.status(400).json({ error: "Replacement item details required" });
+    }
+
+    const origQty = Number(orig.qty) || 1;
+    const origUnitPrice = Number(orig.sellingPrice || orig.price || orig.mrp || 0);
+    const origTotal = origUnitPrice * origQty;
+
+    const replQty = Number(replacementItem.qty) || origQty;
+    const replUnitPrice = Number(replacementItem.price || replacementItem.sellingPrice || 0);
+    const replTotal = replUnitPrice * replQty;
+    const priceDelta = replTotal - origTotal;
+
+    const proposalId = crypto.randomUUID ? crypto.randomUUID() : `prop_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
+
+    const proposalMessage = await OrderMessage.create({
+      orderId: req.order._id,
+      senderRole: 'shop',
+      senderName: req.partyName,
+      text: `⚠️ "${orig.name}" is out of stock. Suggested substitute: "${replacementItem.name}"`,
+      proposal: {
+        proposalId,
+        type: 'replacement',
+        originalItem: {
+          productId: String(orig.productId || orig._id || ''),
+          name: orig.name,
+          qty: origQty,
+          price: origUnitPrice,
+          image: orig.image || '',
+        },
+        replacementItem: {
+          productId: String(replacementItem.productId || replacementItem._id || ''),
+          name: replacementItem.name,
+          brand: replacementItem.brand || '',
+          qty: replQty,
+          price: replUnitPrice,
+          image: replacementItem.image || '',
+        },
+        priceDelta,
+        status: 'pending',
+      },
+      readByUser: false,
+      readByShop: true,
+      createdAt: new Date()
+    });
+
+    await Order.updateOne({ _id: req.order._id }, { $inc: { unreadCountUser: 1 } });
+
+    const targetUserId = (req.order.userId?._id || req.order.userId).toString();
+    notifyUserSSE(targetUserId, 'order_chat_update');
+
+    res.json({ success: true, message: proposalMessage });
+  } catch (err) {
+    console.error("POST /orders/:id/propose-replacement error:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// 4. Respond to Replacement Proposal (Customer only)
+app.post("/orders/:id/respond-proposal", requireOrderParty, async (req, res) => {
+  try {
+    if (req.partyRole !== 'user') {
+      return res.status(403).json({ error: "Only customer can respond to replacement proposals" });
+    }
+
+    const { messageId, decision, actionIfDeclined } = req.body || {};
+    if (!messageId || !['accept', 'decline'].includes(decision)) {
+      return res.status(400).json({ error: "messageId and decision ('accept' | 'decline') required" });
+    }
+
+    const msg = await OrderMessage.findById(messageId);
+    if (!msg || msg.orderId.toString() !== req.order._id.toString()) {
+      return res.status(404).json({ error: "Proposal message not found" });
+    }
+
+    if (!msg.proposal || msg.proposal.status !== 'pending') {
+      return res.status(400).json({ error: `Proposal is already ${msg.proposal?.status || 'processed'}` });
+    }
+
+    const order = await Order.findById(req.order._id);
+    let items = [...(order.items || [])];
+
+    if (decision === 'accept') {
+      // Find original item index by name or product id
+      let targetIdx = items.findIndex(it =>
+        it.name === msg.proposal.originalItem.name ||
+        (it.productId && String(it.productId) === String(msg.proposal.originalItem.productId))
+      );
+      if (targetIdx === -1) targetIdx = 0;
+
+      // Atomically swap item with substitute
+      const repl = msg.proposal.replacementItem;
+      items[targetIdx] = {
+        ...items[targetIdx],
+        name: repl.name,
+        brand: repl.brand || '',
+        price: repl.price,
+        sellingPrice: repl.price,
+        qty: repl.qty || items[targetIdx].qty || 1,
+        image: repl.image || items[targetIdx].image || '',
+        substitutedFrom: msg.proposal.originalItem.name
+      };
+
+      const delta = Number(msg.proposal.priceDelta) || 0;
+      order.totalAmount = Math.max(0, Math.round(((order.totalAmount || 0) + delta) * 100) / 100);
+      order.adjustedDelta = (order.adjustedDelta || 0) + delta;
+      order.items = items;
+      order.unreadCountShop = (order.unreadCountShop || 0) + 1;
+      await order.save();
+
+      msg.proposal.status = 'accepted';
+      msg.proposal.respondedAt = new Date();
+      await msg.save();
+
+      // Post system announcement into chat
+      await OrderMessage.create({
+        orderId: order._id,
+        senderRole: 'system',
+        senderName: 'System',
+        text: `✅ Customer accepted replacement: "${repl.name}" (${delta >= 0 ? '+' : ''}₹${delta}). Order updated to ₹${order.totalAmount}.`,
+        readByUser: true,
+        readByShop: false,
+        createdAt: new Date()
+      });
+
+    } else {
+      // Customer declined
+      if (actionIfDeclined === 'remove') {
+        const origName = msg.proposal.originalItem.name;
+        const targetIdx = items.findIndex(it =>
+          it.name === origName ||
+          (it.productId && String(it.productId) === String(msg.proposal.originalItem.productId))
+        );
+
+        let deductAmount = (Number(msg.proposal.originalItem.price) || 0) * (Number(msg.proposal.originalItem.qty) || 1);
+        if (targetIdx !== -1) {
+          items.splice(targetIdx, 1);
+        }
+
+        order.totalAmount = Math.max(0, Math.round(((order.totalAmount || 0) - deductAmount) * 100) / 100);
+        order.adjustedDelta = (order.adjustedDelta || 0) - deductAmount;
+        order.items = items;
+        order.unreadCountShop = (order.unreadCountShop || 0) + 1;
+        await order.save();
+
+        msg.proposal.status = 'declined';
+        msg.proposal.respondedAt = new Date();
+        await msg.save();
+
+        await OrderMessage.create({
+          orderId: order._id,
+          senderRole: 'system',
+          senderName: 'System',
+          text: `❌ Customer declined substitute. "${origName}" removed from order (-₹${deductAmount}). New total: ₹${order.totalAmount}.`,
+          readByUser: true,
+          readByShop: false,
+          createdAt: new Date()
+        });
+
+      } else {
+        // Keep original
+        msg.proposal.status = 'declined';
+        msg.proposal.respondedAt = new Date();
+        await msg.save();
+
+        order.unreadCountShop = (order.unreadCountShop || 0) + 1;
+        await order.save();
+
+        await OrderMessage.create({
+          orderId: order._id,
+          senderRole: 'system',
+          senderName: 'System',
+          text: `💬 Customer declined substitute. Please keep original item if possible.`,
+          readByUser: true,
+          readByShop: false,
+          createdAt: new Date()
+        });
+      }
+    }
+
+    const targetShopId = (order.shopId?._id || order.shopId).toString();
+    const targetUserId = (order.userId?._id || order.userId).toString();
+    notifyShopSSE(targetShopId, 'order_chat_update');
+    notifyShopSSE(targetShopId, 'refresh_orders');
+    notifyUserSSE(targetUserId, 'order_chat_update');
+
+    res.json({ success: true, order, message: msg });
+  } catch (err) {
+    console.error("POST /orders/:id/respond-proposal error:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// 5. Add Extra Item to Order via Chat Request (Shopkeeper only)
+app.post("/orders/:id/add-item", requireOrderParty, async (req, res) => {
+  try {
+    if (req.partyRole !== 'shop') {
+      return res.status(403).json({ error: "Only shopkeeper can add items" });
+    }
+
+    const { name, price, qty, image, brand, productId } = req.body || {};
+    if (!name || price === undefined) {
+      return res.status(400).json({ error: "Item name and price required" });
+    }
+
+    const numQty = Math.max(1, Number(qty) || 1);
+    const unitPrice = Math.max(0, Number(price) || 0);
+    const addedCost = unitPrice * numQty;
+
+    const order = await Order.findById(req.order._id);
+    const items = [...(order.items || [])];
+
+    items.push({
+      productId: productId || undefined,
+      name: name.trim(),
+      brand: brand || '',
+      price: unitPrice,
+      sellingPrice: unitPrice,
+      qty: numQty,
+      image: image || '',
+    });
+
+    order.items = items;
+    order.totalAmount = Math.max(0, Math.round(((order.totalAmount || 0) + addedCost) * 100) / 100);
+    order.adjustedDelta = (order.adjustedDelta || 0) + addedCost;
+    order.unreadCountUser = (order.unreadCountUser || 0) + 1;
+    await order.save();
+
+    await OrderMessage.create({
+      orderId: order._id,
+      senderRole: 'system',
+      senderName: 'System',
+      text: `➕ Shopkeeper added ${numQty}x "${name}" (+₹${addedCost}) to your order. New total: ₹${order.totalAmount}.`,
+      readByUser: false,
+      readByShop: true,
+      createdAt: new Date()
+    });
+
+    const targetUserId = (order.userId?._id || order.userId).toString();
+    const targetShopId = (order.shopId?._id || order.shopId).toString();
+    notifyUserSSE(targetUserId, 'order_chat_update');
+    notifyShopSSE(targetShopId, 'refresh_orders');
+
+    res.json({ success: true, order });
+  } catch (err) {
+    console.error("POST /orders/:id/add-item error:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 
 // --- 🌟 REVIEW ROUTES ---
 // requireUser + ownership check. Old behaviour let anyone forge reviews for
