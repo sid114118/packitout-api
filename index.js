@@ -884,16 +884,21 @@ if (!ONESIGNAL_API_KEY) {
 const sendPushNotification = async (targetUserId, title, message) => {
   if (!ONESIGNAL_API_KEY) return;
   try {
+    const payload = {
+      app_id: ONESIGNAL_APP_ID,
+      target_channel: "push",
+      include_aliases: { external_id: [targetUserId.toString()] },
+      include_external_user_ids: [targetUserId.toString()],
+      headings: { en: title },
+      contents: { en: message },
+      priority: 10, // ⚡ High priority wakes up phone even when screen is locked/off
+      android_visibility: 1, // 🔓 Public on lockscreen
+      ttl: 86400, // 24h retention if device is completely turned off
+    };
     const response = await fetch("https://onesignal.com/api/v1/notifications", {
       method: "POST",
       headers: { "Content-Type": "application/json; charset=utf-8", "Authorization": `Basic ${ONESIGNAL_API_KEY}` },
-      body: JSON.stringify({
-        app_id: ONESIGNAL_APP_ID,
-        target_channel: "push",
-        include_aliases: { external_id: [targetUserId.toString()] },
-        headings: { en: title },
-        contents: { en: message },
-      })
+      body: JSON.stringify(payload)
     });
     const data = await response.json();
     console.log("Push Sent Result:", data);
@@ -2523,10 +2528,32 @@ app.post("/orders/:id/messages", requireOrderParty, async (req, res) => {
     const targetShopId = (req.order.shopId?._id || req.order.shopId).toString();
     const targetUserId = (req.order.userId?._id || req.order.userId).toString();
 
+    const shortId = req.order._id.toString().slice(-5).toUpperCase();
     if (req.partyRole === 'user') {
       notifyShopSSE(targetShopId, 'order_chat_update');
+      notifyShopSSE(targetShopId, 'refresh_orders');
+      try {
+        await Notification.create({
+          shopId: targetShopId,
+          orderId: req.order._id,
+          type: 'chat_message',
+          title: `💬 Message from Customer (Order #${shortId})`,
+          message: text || 'New message about order'
+        });
+        await sendPushNotification(targetShopId, `💬 Customer (Order #${shortId})`, text || 'New message');
+      } catch (e) { console.error('Push notification to shop failed:', e.message); }
     } else {
       notifyUserSSE(targetUserId, 'order_chat_update');
+      try {
+        await Notification.create({
+          userId: targetUserId,
+          orderId: req.order._id,
+          type: 'chat_message',
+          title: `💬 Message from ${req.partyName || 'Shopkeeper'}`,
+          message: text || `New message regarding Order #${shortId}`
+        });
+        await sendPushNotification(targetUserId, `💬 ${req.partyName || 'Shopkeeper'} (Order #${shortId})`, text || 'New message regarding your order');
+      } catch (e) { console.error('Push notification to user failed:', e.message); }
     }
 
     res.json({ success: true, message: newMsg });
@@ -2605,6 +2632,22 @@ app.post("/orders/:id/propose-replacement", requireOrderParty, async (req, res) 
 
     const targetUserId = (req.order.userId?._id || req.order.userId).toString();
     notifyUserSSE(targetUserId, 'order_chat_update');
+
+    const shortId = req.order._id.toString().slice(-5).toUpperCase();
+    try {
+      await Notification.create({
+        userId: targetUserId,
+        orderId: req.order._id,
+        type: 'replacement_proposal',
+        title: `🔄 Substitute Suggested (Order #${shortId})`,
+        message: `Shopkeeper suggested "${replacementItem.name}" for "${orig.name}". Tap to review & accept.`
+      });
+      await sendPushNotification(
+        targetUserId,
+        `🔄 Item Replacement (Order #${shortId})`,
+        `Shopkeeper suggested "${replacementItem.name}" for "${orig.name}". Tap to review & accept.`
+      );
+    } catch (e) { console.error('Push notification for proposal failed:', e.message); }
 
     res.json({ success: true, message: proposalMessage });
   } catch (err) {
@@ -2741,6 +2784,22 @@ app.post("/orders/:id/respond-proposal", requireOrderParty, async (req, res) => 
     notifyShopSSE(targetShopId, 'refresh_orders');
     notifyUserSSE(targetUserId, 'order_chat_update');
 
+    const respShortId = order._id.toString().slice(-5).toUpperCase();
+    try {
+      const decisionTitle = decision === 'accept' ? 'Substitute Accepted ✅' : 'Substitute Declined ❌';
+      const decisionText = decision === 'accept'
+        ? `Customer accepted replacement item. Order total: ₹${order.totalAmount}.`
+        : 'Customer declined substitute.';
+      await Notification.create({
+        shopId: targetShopId,
+        orderId: order._id,
+        type: 'proposal_response',
+        title: `Order #${respShortId}: ${decisionTitle}`,
+        message: decisionText
+      });
+      await sendPushNotification(targetShopId, `Order #${respShortId}: ${decisionTitle}`, decisionText);
+    } catch (e) { console.error('Push notification for proposal response failed:', e.message); }
+
     res.json({ success: true, order, message: msg });
   } catch (err) {
     console.error("POST /orders/:id/respond-proposal error:", err);
@@ -2797,6 +2856,22 @@ app.post("/orders/:id/add-item", requireOrderParty, async (req, res) => {
     const targetShopId = (order.shopId?._id || order.shopId).toString();
     notifyUserSSE(targetUserId, 'order_chat_update');
     notifyShopSSE(targetShopId, 'refresh_orders');
+
+    const addShortId = order._id.toString().slice(-5).toUpperCase();
+    try {
+      await Notification.create({
+        userId: targetUserId,
+        orderId: order._id,
+        type: 'item_added',
+        title: `➕ Item Added to Order #${addShortId}`,
+        message: `Shopkeeper added ${numQty}x "${name}" (+₹${addedCost}). New total: ₹${order.totalAmount}.`
+      });
+      await sendPushNotification(
+        targetUserId,
+        `➕ Item Added (Order #${addShortId})`,
+        `Shopkeeper added ${numQty}x "${name}" (+₹${addedCost}) to your order. New total: ₹${order.totalAmount}.`
+      );
+    } catch (e) { console.error('Push notification for add-item failed:', e.message); }
 
     res.json({ success: true, order });
   } catch (err) {
