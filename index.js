@@ -2656,11 +2656,11 @@ app.post("/orders/:id/propose-replacement", requireOrderParty, async (req, res) 
   }
 });
 
-// 4. Respond to Replacement Proposal (Customer only)
+// 4. Respond to Replacement or Add Item Proposal (Customer only)
 app.post("/orders/:id/respond-proposal", requireOrderParty, async (req, res) => {
   try {
     if (req.partyRole !== 'user') {
-      return res.status(403).json({ error: "Only customer can respond to replacement proposals" });
+      return res.status(403).json({ error: "Only customer can respond to proposals" });
     }
 
     const { messageId, decision, actionIfDeclined } = req.body || {};
@@ -2679,53 +2679,108 @@ app.post("/orders/:id/respond-proposal", requireOrderParty, async (req, res) => 
 
     const order = await Order.findById(req.order._id);
     let items = [...(order.items || [])];
+    const isAddItem = msg.proposal.type === 'add_item';
 
     if (decision === 'accept') {
-      // Find original item index by name or product id
-      let targetIdx = items.findIndex(it =>
-        it.name === msg.proposal.originalItem.name ||
-        (it.productId && String(it.productId) === String(msg.proposal.originalItem.productId))
-      );
-      if (targetIdx === -1) targetIdx = 0;
+      if (isAddItem) {
+        // Customer accepted adding the proposed item
+        const item = msg.proposal.newItem || msg.proposal.replacementItem;
+        const delta = Number(msg.proposal.priceDelta) || ((Number(item.price) || 0) * (Number(item.qty) || 1));
+        items.push({
+          productId: item.productId || undefined,
+          name: item.name,
+          brand: item.brand || '',
+          price: Number(item.price) || 0,
+          sellingPrice: Number(item.price) || 0,
+          qty: Number(item.qty) || 1,
+          image: item.image || '',
+        });
 
-      // Atomically swap item with substitute
-      const repl = msg.proposal.replacementItem;
-      items[targetIdx] = {
-        ...items[targetIdx],
-        name: repl.name,
-        brand: repl.brand || '',
-        price: repl.price,
-        sellingPrice: repl.price,
-        qty: repl.qty || items[targetIdx].qty || 1,
-        image: repl.image || items[targetIdx].image || '',
-        substitutedFrom: msg.proposal.originalItem.name
-      };
+        order.totalAmount = Math.max(0, Math.round(((order.totalAmount || 0) + delta) * 100) / 100);
+        order.adjustedDelta = (order.adjustedDelta || 0) + delta;
+        order.items = items;
+        order.unreadCountShop = (order.unreadCountShop || 0) + 1;
+        await order.save();
 
-      const delta = Number(msg.proposal.priceDelta) || 0;
-      order.totalAmount = Math.max(0, Math.round(((order.totalAmount || 0) + delta) * 100) / 100);
-      order.adjustedDelta = (order.adjustedDelta || 0) + delta;
-      order.items = items;
-      order.unreadCountShop = (order.unreadCountShop || 0) + 1;
-      await order.save();
+        msg.proposal.status = 'accepted';
+        msg.proposal.respondedAt = new Date();
+        await msg.save();
 
-      msg.proposal.status = 'accepted';
-      msg.proposal.respondedAt = new Date();
-      await msg.save();
+        await OrderMessage.create({
+          orderId: order._id,
+          senderRole: 'system',
+          senderName: 'System',
+          text: `✅ Customer accepted addition: ${item.qty}x "${item.name}" (+₹${delta}). Order updated to ₹${order.totalAmount}.`,
+          readByUser: true,
+          readByShop: false,
+          createdAt: new Date()
+        });
 
-      // Post system announcement into chat
-      await OrderMessage.create({
-        orderId: order._id,
-        senderRole: 'system',
-        senderName: 'System',
-        text: `✅ Customer accepted replacement: "${repl.name}" (${delta >= 0 ? '+' : ''}₹${delta}). Order updated to ₹${order.totalAmount}.`,
-        readByUser: true,
-        readByShop: false,
-        createdAt: new Date()
-      });
+      } else {
+        // Replacement proposal accepted
+        let targetIdx = items.findIndex(it =>
+          it.name === msg.proposal.originalItem.name ||
+          (it.productId && String(it.productId) === String(msg.proposal.originalItem.productId))
+        );
+        if (targetIdx === -1) targetIdx = 0;
+
+        const repl = msg.proposal.replacementItem;
+        items[targetIdx] = {
+          ...items[targetIdx],
+          name: repl.name,
+          brand: repl.brand || '',
+          price: repl.price,
+          sellingPrice: repl.price,
+          qty: repl.qty || items[targetIdx].qty || 1,
+          image: repl.image || items[targetIdx].image || '',
+          substitutedFrom: msg.proposal.originalItem.name
+        };
+
+        const delta = Number(msg.proposal.priceDelta) || 0;
+        order.totalAmount = Math.max(0, Math.round(((order.totalAmount || 0) + delta) * 100) / 100);
+        order.adjustedDelta = (order.adjustedDelta || 0) + delta;
+        order.items = items;
+        order.unreadCountShop = (order.unreadCountShop || 0) + 1;
+        await order.save();
+
+        msg.proposal.status = 'accepted';
+        msg.proposal.respondedAt = new Date();
+        await msg.save();
+
+        // Post system announcement into chat
+        await OrderMessage.create({
+          orderId: order._id,
+          senderRole: 'system',
+          senderName: 'System',
+          text: `✅ Customer accepted replacement: "${repl.name}" (${delta >= 0 ? '+' : ''}₹${delta}). Order updated to ₹${order.totalAmount}.`,
+          readByUser: true,
+          readByShop: false,
+          createdAt: new Date()
+        });
+      }
 
     } else {
       // Customer declined
-      if (actionIfDeclined === 'remove') {
+      if (isAddItem) {
+        const item = msg.proposal.newItem || msg.proposal.replacementItem;
+        msg.proposal.status = 'declined';
+        msg.proposal.respondedAt = new Date();
+        await msg.save();
+
+        order.unreadCountShop = (order.unreadCountShop || 0) + 1;
+        await order.save();
+
+        await OrderMessage.create({
+          orderId: order._id,
+          senderRole: 'system',
+          senderName: 'System',
+          text: `❌ Customer declined extra item: "${item.name}". Order total remains ₹${order.totalAmount}.`,
+          readByUser: true,
+          readByShop: false,
+          createdAt: new Date()
+        });
+
+      } else if (actionIfDeclined === 'remove') {
         const origName = msg.proposal.originalItem.name;
         const targetIdx = items.findIndex(it =>
           it.name === origName ||
@@ -2758,7 +2813,6 @@ app.post("/orders/:id/respond-proposal", requireOrderParty, async (req, res) => 
         });
 
       } else {
-        // Keep original
         msg.proposal.status = 'declined';
         msg.proposal.respondedAt = new Date();
         await msg.save();
@@ -2786,10 +2840,11 @@ app.post("/orders/:id/respond-proposal", requireOrderParty, async (req, res) => 
 
     const respShortId = order._id.toString().slice(-5).toUpperCase();
     try {
-      const decisionTitle = decision === 'accept' ? 'Substitute Accepted ✅' : 'Substitute Declined ❌';
+      const itemTitle = isAddItem ? 'Extra Item' : 'Substitute';
+      const decisionTitle = decision === 'accept' ? `${itemTitle} Accepted ✅` : `${itemTitle} Declined ❌`;
       const decisionText = decision === 'accept'
-        ? `Customer accepted replacement item. Order total: ₹${order.totalAmount}.`
-        : 'Customer declined substitute.';
+        ? `Customer accepted. Order total updated to ₹${order.totalAmount}.`
+        : `Customer declined ${itemTitle.toLowerCase()}.`;
       await Notification.create({
         shopId: targetShopId,
         orderId: order._id,
@@ -2807,11 +2862,16 @@ app.post("/orders/:id/respond-proposal", requireOrderParty, async (req, res) => 
   }
 });
 
-// 5. Add Extra Item to Order via Chat Request (Shopkeeper only)
+// 5. Propose Adding Extra Item to Order (Shopkeeper only, requires user Accept/Reject)
 app.post("/orders/:id/add-item", requireOrderParty, async (req, res) => {
   try {
     if (req.partyRole !== 'shop') {
-      return res.status(403).json({ error: "Only shopkeeper can add items" });
+      return res.status(403).json({ error: "Only shopkeeper can propose adding items" });
+    }
+
+    const isClosed = req.order.status?.includes('✅') || req.order.status?.includes('❌');
+    if (isClosed) {
+      return res.status(400).json({ error: "Cannot propose adding items to a closed order." });
     }
 
     const { name, price, qty, image, brand, productId } = req.body || {};
@@ -2823,57 +2883,61 @@ app.post("/orders/:id/add-item", requireOrderParty, async (req, res) => {
     const unitPrice = Math.max(0, Number(price) || 0);
     const addedCost = unitPrice * numQty;
 
-    const order = await Order.findById(req.order._id);
-    const items = [...(order.items || [])];
+    const proposalId = crypto.randomUUID ? crypto.randomUUID() : `prop_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
 
-    items.push({
-      productId: productId || undefined,
-      name: name.trim(),
-      brand: brand || '',
-      price: unitPrice,
-      sellingPrice: unitPrice,
-      qty: numQty,
-      image: image || '',
-    });
-
-    order.items = items;
-    order.totalAmount = Math.max(0, Math.round(((order.totalAmount || 0) + addedCost) * 100) / 100);
-    order.adjustedDelta = (order.adjustedDelta || 0) + addedCost;
-    order.unreadCountUser = (order.unreadCountUser || 0) + 1;
-    await order.save();
-
-    await OrderMessage.create({
-      orderId: order._id,
-      senderRole: 'system',
-      senderName: 'System',
-      text: `➕ Shopkeeper added ${numQty}x "${name}" (+₹${addedCost}) to your order. New total: ₹${order.totalAmount}.`,
+    const proposalMessage = await OrderMessage.create({
+      orderId: req.order._id,
+      senderRole: 'shop',
+      senderName: req.partyName,
+      text: `➕ Shopkeeper proposed adding ${numQty}x "${name.trim()}" (+₹${addedCost}) to your order.`,
+      proposal: {
+        proposalId,
+        type: 'add_item',
+        newItem: {
+          productId: String(productId || ''),
+          name: name.trim(),
+          brand: brand || '',
+          qty: numQty,
+          price: unitPrice,
+          image: image || '',
+        },
+        replacementItem: {
+          name: name.trim(),
+          brand: brand || '',
+          qty: numQty,
+          price: unitPrice,
+          image: image || '',
+        },
+        priceDelta: addedCost,
+        status: 'pending',
+      },
       readByUser: false,
       readByShop: true,
       createdAt: new Date()
     });
 
-    const targetUserId = (order.userId?._id || order.userId).toString();
-    const targetShopId = (order.shopId?._id || order.shopId).toString();
-    notifyUserSSE(targetUserId, 'order_chat_update');
-    notifyShopSSE(targetShopId, 'refresh_orders');
+    await Order.updateOne({ _id: req.order._id }, { $inc: { unreadCountUser: 1 } });
 
-    const addShortId = order._id.toString().slice(-5).toUpperCase();
+    const targetUserId = (req.order.userId?._id || req.order.userId).toString();
+    notifyUserSSE(targetUserId, 'order_chat_update');
+
+    const addShortId = req.order._id.toString().slice(-5).toUpperCase();
     try {
       await Notification.create({
         userId: targetUserId,
-        orderId: order._id,
-        type: 'item_added',
-        title: `➕ Item Added to Order #${addShortId}`,
-        message: `Shopkeeper added ${numQty}x "${name}" (+₹${addedCost}). New total: ₹${order.totalAmount}.`
+        orderId: req.order._id,
+        type: 'item_proposal',
+        title: `➕ Extra Item Proposed (Order #${addShortId})`,
+        message: `Shopkeeper wants to add ${numQty}x "${name.trim()}" (+₹${addedCost}). Tap to Accept or Reject.`
       });
       await sendPushNotification(
         targetUserId,
-        `➕ Item Added (Order #${addShortId})`,
-        `Shopkeeper added ${numQty}x "${name}" (+₹${addedCost}) to your order. New total: ₹${order.totalAmount}.`
+        `➕ Extra Item Proposed (Order #${addShortId})`,
+        `Shopkeeper wants to add ${numQty}x "${name.trim()}" (+₹${addedCost}) to your order. Tap to Accept or Reject.`
       );
-    } catch (e) { console.error('Push notification for add-item failed:', e.message); }
+    } catch (e) { console.error('Push notification for add-item proposal failed:', e.message); }
 
-    res.json({ success: true, order });
+    res.json({ success: true, message: proposalMessage, order: req.order });
   } catch (err) {
     console.error("POST /orders/:id/add-item error:", err);
     res.status(500).json({ error: err.message });
