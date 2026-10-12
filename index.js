@@ -427,26 +427,8 @@ const orderMessageSchema = new mongoose.Schema({
   text: { type: String, default: '' },
   imageUrl: { type: String, default: '' },
   proposal: {
-    proposalId: { type: String, default: null },
-    type: { type: String, enum: ['replacement', 'add_item'], default: 'replacement' },
-    originalItem: {
-      productId: { type: String, default: '' },
-      name: { type: String, default: '' },
-      qty: { type: Number, default: 1 },
-      price: { type: Number, default: 0 },
-      image: { type: String, default: '' }
-    },
-    replacementItem: {
-      productId: { type: String, default: '' },
-      name: { type: String, default: '' },
-      brand: { type: String, default: '' },
-      qty: { type: Number, default: 1 },
-      price: { type: Number, default: 0 },
-      image: { type: String, default: '' }
-    },
-    priceDelta: { type: Number, default: 0 },
-    status: { type: String, enum: ['pending', 'accepted', 'declined', 'expired'], default: 'pending' },
-    respondedAt: { type: Date, default: null }
+    type: mongoose.Schema.Types.Mixed,
+    default: null
   },
   readByUser: { type: Boolean, default: false },
   readByShop: { type: Boolean, default: false },
@@ -2473,9 +2455,17 @@ app.get("/orders/:id/messages", requireOrderParty, async (req, res) => {
       );
     }
 
+    // Sanitize any phantom proposal objects from prior bug
+    const sanitizedMessages = messages.map(m => {
+      if (m.proposal && (!m.proposal.proposalId || !m.proposal.replacementItem?.name)) {
+        m.proposal = null;
+      }
+      return m;
+    });
+
     res.json({
       success: true,
-      messages,
+      messages: sanitizedMessages,
       order: {
         _id: req.order._id,
         status: req.order.status,
@@ -2517,6 +2507,7 @@ app.post("/orders/:id/messages", requireOrderParty, async (req, res) => {
       senderName: req.partyName,
       text,
       imageUrl,
+      proposal: null,
       readByUser: req.partyRole === 'user',
       readByShop: req.partyRole === 'shop',
       createdAt: new Date()
