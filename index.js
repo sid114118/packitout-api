@@ -4036,6 +4036,7 @@ app.get("/shops/:id/menu/lean", async (req, res) => {
   try {
     const shop = await Shop.findById(req.params.id)
       .select('name isOpen acceptsPreOrders isAcceptingOrders shopImage operatingHours fullAddress pincode rating totalReviews inventoryMode inventory combos')
+      .populate({ path: 'inventory.product', select: 'name brand category image mrp qnty emoji itemGroupId' })
       .populate('combos.productIds')
       .lean();
     res.json(shop);
@@ -4367,7 +4368,19 @@ app.post("/master-products", async (req, res, next) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-app.get("/master-products", async (req, res) => res.json(await MasterProduct.find()));
+// Slim, cached master catalog for feed & search. Detail fields (description, ingredients, nutrition)
+// are lazy-loaded on-demand via GET /master-products/:id when a user opens the ProductModal.
+app.get("/master-products", async (req, res) => {
+  try {
+    res.set("Cache-Control", "public, max-age=300, stale-while-revalidate=600");
+    const products = await MasterProduct.find({})
+      .select("name brand category mrp qnty emoji image searchTags isVeg itemGroupId")
+      .lean();
+    res.json(products);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
 
 // Lazy-loaded by ProductModal so the customer feed can ship a slim product payload
 // and only fetch description/ingredients/nutrition when a user opens a product.
