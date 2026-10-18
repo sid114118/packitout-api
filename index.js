@@ -1873,6 +1873,55 @@ const computeTrustedTotal = async (shopId, items, coinsUsed) => {
   let itemTotal = 0;
   const trustedItems = [];
   for (const line of (items || [])) {
+    // 🎁 COMBO PACK LINE ITEM
+    if (line.isCombo) {
+      const comboId = (line.comboId || line.productId || "").toString();
+      const combo = (shop.combos || []).find(c => c._id.toString() === comboId);
+      if (!combo) throw new Error("Combo offer not found or no longer available.");
+      if (combo.isActive === false) throw new Error(`Combo "${combo.name}" is currently paused.`);
+
+      const rawPids = Array.isArray(combo.productIds) ? combo.productIds : [];
+      if (rawPids.length === 0) throw new Error(`Combo "${combo.name}" has no products.`);
+
+      let comboRegularTotal = 0;
+      const verifiedComboItems = [];
+
+      for (const p of rawPids) {
+        const pid = (typeof p === 'object' && p?._id) ? p._id.toString() : p.toString();
+        const inv = invByProductId[pid];
+        if (!inv) throw new Error(`Product in combo "${combo.name}" is not in shop inventory.`);
+        if (inv.inStock === false) throw new Error(`Product "${inv.product?.name || 'Item'}" in combo "${combo.name}" is currently out of stock.`);
+        const itemPrice = Number(inv.sellingPrice) || Number(inv.product?.mrp) || 0;
+        comboRegularTotal += itemPrice;
+        verifiedComboItems.push({
+          productId: pid,
+          name: inv.product?.name || line.name || "Item",
+          image: inv.product?.image || "",
+          qnty: inv.product?.qnty || "",
+          brand: inv.product?.brand || "",
+          price: itemPrice
+        });
+      }
+
+      const trustedComboPrice = (Number(combo.comboPrice) > 0) ? Number(combo.comboPrice) : comboRegularTotal;
+      const qty = Math.max(1, Math.floor(Number(line.qty) || 1));
+      itemTotal += trustedComboPrice * qty;
+
+      trustedItems.push({
+        isCombo: true,
+        comboId: combo._id.toString(),
+        name: combo.name || line.name || "Combo Pack",
+        emoji: combo.emoji || '🎁',
+        qty,
+        price: trustedComboPrice,
+        regularPrice: comboRegularTotal,
+        savings: Math.max(0, comboRegularTotal - trustedComboPrice),
+        comboItems: verifiedComboItems
+      });
+      continue;
+    }
+
+    // Standard Individual Product
     const pid = (line.productId || "").toString();
     const qty = Math.max(1, Math.floor(Number(line.qty) || 1));
     const inv = invByProductId[pid];
@@ -4093,6 +4142,10 @@ app.put("/shops/:shopId/combos/:comboId", requireShop, async (req, res) => {
     if (!name || !productIds || !Array.isArray(productIds) || productIds.length === 0) {
       return res.status(400).json({ error: "Combo name and at least one product required." });
     }
+    const comboObjectId = mongoose.Types.ObjectId.isValid(req.params.comboId)
+      ? new mongoose.Types.ObjectId(req.params.comboId)
+      : req.params.comboId;
+
     const updateFields = {
       "combos.$.name": name,
       "combos.$.emoji": emoji || '🎁',
@@ -4103,8 +4156,31 @@ app.put("/shops/:shopId/combos/:comboId", requireShop, async (req, res) => {
       updateFields["combos.$.isActive"] = Boolean(isActive);
     }
     await Shop.updateOne(
-      { _id: req.params.shopId, "combos._id": req.params.comboId },
+      { _id: req.params.shopId, "combos._id": comboObjectId },
       { $set: updateFields }
+    );
+    res.json(await Shop.findById(req.params.shopId).populate('inventory.product').populate('combos.productIds'));
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.patch("/shops/:shopId/combos/:comboId/toggle", requireShop, async (req, res) => {
+  try {
+    if (req.shop._id.toString() !== req.params.shopId) {
+      return res.status(403).json({ error: "Cannot edit another shop's combos" });
+    }
+    const shop = await Shop.findById(req.params.shopId);
+    if (!shop) return res.status(404).json({ error: "Shop not found" });
+    const combo = (shop.combos || []).find(c => c._id.toString() === req.params.comboId);
+    if (!combo) return res.status(404).json({ error: "Combo not found" });
+
+    const newActive = combo.isActive === false ? true : false;
+    const comboObjectId = mongoose.Types.ObjectId.isValid(req.params.comboId)
+      ? new mongoose.Types.ObjectId(req.params.comboId)
+      : req.params.comboId;
+
+    await Shop.updateOne(
+      { _id: req.params.shopId, "combos._id": comboObjectId },
+      { $set: { "combos.$.isActive": newActive } }
     );
     res.json(await Shop.findById(req.params.shopId).populate('inventory.product').populate('combos.productIds'));
   } catch (err) { res.status(500).json({ error: err.message }); }
@@ -4115,9 +4191,13 @@ app.delete("/shops/:shopId/combos/:comboId", requireShop, async (req, res) => {
     if (req.shop._id.toString() !== req.params.shopId) {
       return res.status(403).json({ error: "Cannot edit another shop's combos" });
     }
+    const comboObjectId = mongoose.Types.ObjectId.isValid(req.params.comboId)
+      ? new mongoose.Types.ObjectId(req.params.comboId)
+      : req.params.comboId;
+
     await Shop.updateOne(
       { _id: req.params.shopId },
-      { $pull: { combos: { _id: req.params.comboId } } }
+      { $pull: { combos: { _id: comboObjectId } } }
     );
     res.json(await Shop.findById(req.params.shopId).populate('inventory.product').populate('combos.productIds'));
   } catch (err) { res.status(500).json({ error: err.message }); }
