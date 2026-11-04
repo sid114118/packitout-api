@@ -49,7 +49,7 @@ try {
     //   - already contain real newlines (multi-line panel)
     privateKey = privateKey.trim();
     if ((privateKey.startsWith('"') && privateKey.endsWith('"')) ||
-        (privateKey.startsWith("'") && privateKey.endsWith("'"))) {
+      (privateKey.startsWith("'") && privateKey.endsWith("'"))) {
       privateKey = privateKey.slice(1, -1);
     }
     // Order matters: collapse double-escape first, then single-escape.
@@ -128,7 +128,7 @@ if (!process.env.CLOUDINARY_CLOUD_NAME || !process.env.CLOUDINARY_API_KEY || !pr
 }
 cloudinary.config({
   cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
-  api_key:    process.env.CLOUDINARY_API_KEY,
+  api_key: process.env.CLOUDINARY_API_KEY,
   api_secret: process.env.CLOUDINARY_API_SECRET,
 });
 
@@ -150,7 +150,7 @@ const memoryUpload = multer({
 
 // Safe wrapper so synchronous unlinkSync calls never throw on a missing path
 // (and never block the event loop on cleanup).
-const safeUnlink = (p) => { try { if (p) fs.unlinkSync(p); } catch (e) {} };
+const safeUnlink = (p) => { try { if (p) fs.unlinkSync(p); } catch (e) { } };
 
 const app = express();
 
@@ -195,18 +195,18 @@ mongoose.connect(MONGO_URI)
 // 🏗️ SCHEMAS
 // ==========================================
 
-const shopSchema = new mongoose.Schema({ 
-  name: String, 
-  ownerName: { type: String, default: "" },      
-  fullAddress: { type: String, default: "" },    
-  operatingHours: { type: String, default: "09:00 AM - 10:00 PM" }, 
-  shopImage: { type: String, default: "" },  
+const shopSchema = new mongoose.Schema({
+  name: String,
+  ownerName: { type: String, default: "" },
+  fullAddress: { type: String, default: "" },
+  operatingHours: { type: String, default: "09:00 AM - 10:00 PM" },
+  shopImage: { type: String, default: "" },
   phone: { type: String, unique: true },
   // Password hash — select:false so it never leaks via the public GET /shops
   // endpoint, which used to dump every shop's hash in plain text.
   password: { type: String, required: true, select: false },
-  pincode: String, 
-  serviceablePincodes: { type: [String], default: [] }, 
+  pincode: String,
+  serviceablePincodes: { type: [String], default: [] },
   isOpen: { type: Boolean, default: true },
   acceptsPreOrders: { type: Boolean, default: true },
   isAcceptingOrders: { type: Boolean, default: true },
@@ -218,14 +218,16 @@ const shopSchema = new mongoose.Schema({
     type: { type: String, enum: ['Point'] },
     coordinates: { type: [Number], default: undefined },
   },
-  fssai: { type: String, default: "" },          
-  gst: { type: String, default: "" },            
-  panNumber: { type: String, default: "" },      
-  upiId: { type: String, default: "" },          
-  rating: { type: Number, default: 5.0 },        
-  totalOrdersFulfilled: { type: Number, default: 0 }, 
-  totalReviews: { type: Number, default: 0 }, 
+  fssai: { type: String, default: "" },
+  gst: { type: String, default: "" },
+  panNumber: { type: String, default: "" },
+  upiId: { type: String, default: "" },
+  rating: { type: Number, default: 5.0 },
+  totalOrdersFulfilled: { type: Number, default: 0 },
+  totalReviews: { type: Number, default: 0 },
   canAddMasterProducts: { type: Boolean, default: false },
+  canUseBarcodeScanner: { type: Boolean, default: false },
+  canUseCounterPos: { type: Boolean, default: false },
   inventoryMode: { type: String, enum: ['manual', 'stock_count'], default: 'manual' },
   inventory: [{
     product: { type: mongoose.Schema.Types.ObjectId, ref: 'MasterProduct' },
@@ -261,7 +263,6 @@ shopSchema.index({ "sessionTokens.token": 1 });
 // this once via "Use my current location" in the dashboard; without it they
 // just don't get a distance shown in the customer's Nearby grid.
 shopSchema.index({ location: '2dsphere' });
-shopSchema.index({ location: '2dsphere' });
 const Shop = mongoose.model("Shop", shopSchema);
 
 const campaignSchema = new mongoose.Schema({
@@ -284,16 +285,24 @@ const productRequestSchema = new mongoose.Schema({
 }, { timestamps: true });
 const ProductRequest = mongoose.model('ProductRequest', productRequestSchema);
 
-const masterProductSchema = new mongoose.Schema({ 
-  name: String, brand: String, category: String, mrp: Number, qnty: String, emoji: String, image: String, 
+const masterProductSchema = new mongoose.Schema({
+  name: String, brand: String, category: String, mrp: Number, qnty: String, emoji: String, image: String,
   searchTags: [String], description: { type: String, default: "" }, ingredients: { type: String, default: "" },
-  manufacturer: { type: String, default: "" }, manufactureraddress: { type: String, default: ""},
+  manufacturer: { type: String, default: "" }, manufactureraddress: { type: String, default: "" },
   energy: { type: String, default: "" }, protein: { type: String, default: "" }, carbs: { type: String, default: "" },
-  sugar: { type: String, default: "" }, fat: { type: String, default: "" }, isVeg: { type: Boolean, default: true },   
+  sugar: { type: String, default: "" }, fat: { type: String, default: "" }, isVeg: { type: Boolean, default: true },
   itemGroupId: { type: String, default: "" },
+  barcode: { type: String, default: "" },
+  originalPosName: { type: String, default: "" },
+  section: { type: String, default: "" },
+  subCategory: { type: String, default: "" },
+  isActive: { type: Boolean, default: true },
   relatedProducts: [{ type: mongoose.Schema.Types.ObjectId, ref: 'MasterProduct' }],
   substitutes: [{ type: mongoose.Schema.Types.ObjectId, ref: 'MasterProduct' }]
 });
+masterProductSchema.index({ category: 1, name: 1 });
+masterProductSchema.index({ brand: 1 });
+masterProductSchema.index({ barcode: 1 });
 const MasterProduct = mongoose.model("MasterProduct", masterProductSchema);
 
 // Saved address book entry. Each user can keep multiple — Home, Work, etc.
@@ -361,8 +370,16 @@ const orderSchema = new mongoose.Schema({
   //           'Unpaid' until the shop marks the order Picked Up ✅.
   // Razorpay was removed in favour of direct shop UPI (no gateway = no fees +
   // money lands instantly in the shop's bank).
-  paymentMethod: { type: String, enum: ['UPI', 'POP'], default: 'POP' },
+  paymentMethod: { type: String, enum: ['UPI', 'POP', 'CASH', 'KHATA'], default: 'POP' },
   paymentStatus: { type: String, enum: ['Unpaid', 'PendingVerification', 'Paid'], default: 'Unpaid' },
+  orderSource: { type: String, enum: ['ONLINE', 'POS', 'PARCHI'], default: 'ONLINE' },
+  customerName: { type: String, default: '' },
+  customerPhone: { type: String, default: '' },
+  mrpTotal: { type: Number, default: 0 },
+  discountAmount: { type: Number, default: 0 },
+  savingsAmount: { type: Number, default: 0 },
+  coinsEarned: { type: Number, default: 0 },
+  convertedToOnlineUser: { type: Boolean, default: false },
   isReviewed: { type: Boolean, default: false },
   coinsUsed: { type: Number, default: 0 },
   // Idempotency flag for the loyalty-coin grant at pickup. Set once, never
@@ -488,7 +505,7 @@ notificationSchema.index({ userId: 1, createdAt: -1 });
 notificationSchema.index({ shopId: 1, createdAt: -1 });
 
 // Automatically push SSE events when a notification is created
-notificationSchema.post('save', function(doc) {
+notificationSchema.post('save', function (doc) {
   if (doc.shopId) systemEvents.emit('notify_shop', String(doc.shopId), 'new_notification');
   if (doc.userId) systemEvents.emit('notify_user', String(doc.userId), 'new_notification');
 });
@@ -659,7 +676,10 @@ setInterval(() => {
 // matches the bearer token to a doc and attaches it to req.
 const issueSessionToken = async (Model, docId) => {
   const token = crypto.randomBytes(32).toString('hex');
-  await Model.updateOne({ _id: docId }, { $push: { sessionTokens: { token, createdAt: new Date() } } });
+  await Model.updateOne(
+    { _id: docId },
+    { $push: { sessionTokens: { $each: [{ token, createdAt: new Date() }], $slice: -10 } } }
+  );
   return token;
 };
 
@@ -756,7 +776,7 @@ const requireAdmin = (req, res, next) => {
 // matches ADMIN_PASSWORD env, server hands back ADMIN_TOKEN which the
 // dashboard stores in localStorage and sends as X-Admin-Token on every call.
 // Until both env vars are set on Hostinger, every admin route is locked.
-app.post("/admin/login", express.json(), (req, res) => {
+app.post("/admin/login", rateLimit('admin-login', 10, 15 * 60 * 1000), express.json(), (req, res) => {
   const expectedPw = process.env.ADMIN_PASSWORD;
   const token = process.env.ADMIN_TOKEN;
   if (!expectedPw || !token) {
@@ -1052,10 +1072,27 @@ app.patch("/notifications/read-all", async (req, res) => {
     const userId = (typeof rawUserId === 'string' || typeof rawUserId === 'number') ? String(rawUserId) : null;
     const shopId = (typeof rawShopId === 'string' || typeof rawShopId === 'number') ? String(rawShopId) : null;
     if (!userId && !shopId) return res.status(400).json({ error: "userId or shopId required" });
-    const filter = userId
-      ? (mongoose.Types.ObjectId.isValid(userId) ? { userId } : null)
-      : (mongoose.Types.ObjectId.isValid(shopId) ? { shopId } : null);
-    if (!filter) return res.status(400).json({ error: "Invalid id" });
+
+    const token = extractBearer(req);
+    if (!token) return res.status(401).json({ error: "Missing session token" });
+
+    let filter = null;
+    if (userId) {
+      if (!mongoose.Types.ObjectId.isValid(userId)) return res.status(400).json({ error: "Invalid id" });
+      const user = await User.findOne({ "sessionTokens.token": token }).select('_id');
+      if (!user || user._id.toString() !== userId) {
+        return res.status(403).json({ error: "Not authorized for these notifications" });
+      }
+      filter = { userId };
+    } else if (shopId) {
+      if (!mongoose.Types.ObjectId.isValid(shopId)) return res.status(400).json({ error: "Invalid id" });
+      const shop = await Shop.findOne({ "sessionTokens.token": token }).select('_id');
+      if (!shop || shop._id.toString() !== shopId) {
+        return res.status(403).json({ error: "Not authorized for these notifications" });
+      }
+      filter = { shopId };
+    }
+
     await Notification.updateMany(filter, { $set: { isRead: true } });
     res.json({ success: true });
   } catch (err) { res.status(500).json({ error: "Failed to update notifications" }); }
@@ -1119,7 +1156,7 @@ app.post("/admin/orders/:id/force-cancel", requireAdmin, async (req, res) => {
     await cancelOrderWithRefund(order, {
       statusLabel: 'Cancelled ❌ (by admin)',
       customerTitle: 'Order Cancelled ❌',
-      customerMsg:   `Order #${shortId} was cancelled by support. Refund is being processed.`,
+      customerMsg: `Order #${shortId} was cancelled by support. Refund is being processed.`,
       shopTitle: '⚠️ Order Cancelled by Admin',
       shopMsg: `Order #${shortId} was cancelled by support (${reason}).`,
     });
@@ -1527,15 +1564,15 @@ app.get("/parchis/:shopId", requireShop, async (req, res) => {
     if (req.shop._id.toString() !== req.params.shopId) {
       return res.status(403).json({ error: "Not your shop" });
     }
-    res.json(await Parchi.find({ shopId: req.params.shopId, status: 'pending' }).sort({createdAt: -1}));
-  } catch(err) { res.status(500).json({ error: err.message }); }
+    res.json(await Parchi.find({ shopId: req.params.shopId, status: 'pending' }).sort({ createdAt: -1 }));
+  } catch (err) { res.status(500).json({ error: err.message }); }
 });
 app.get("/parchis/user/:userId", requireUser, async (req, res) => {
   try {
     if (req.user._id.toString() !== req.params.userId) {
       return res.status(403).json({ error: "Not your parchis" });
     }
-    res.json(await Parchi.find({ userId: req.params.userId, status: 'pending' }).sort({createdAt: -1}));
+    res.json(await Parchi.find({ userId: req.params.userId, status: 'pending' }).sort({ createdAt: -1 }));
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 app.get("/admin/all-parchis", requireAdmin, async (req, res) => {
@@ -1921,8 +1958,29 @@ const computeTrustedTotal = async (shopId, items, coinsUsed) => {
       continue;
     }
 
+    // 📝 CUSTOM PARCHI NOTE LINE ITEM (priced at counter by shopkeeper)
+    const rawPid = (line.productId || "").toString();
+    if (line.isCustomNote || rawPid.startsWith("custom_parchi_note_")) {
+      const qty = Math.max(1, Math.floor(Number(line.qty) || 1));
+      const cleanNote = String(line.noteText || line.name || "").trim().slice(0, 300);
+      const displayName = String(line.name || (cleanNote ? `📝 Special Note: "${cleanNote}"` : "📝 Special Note")).trim().slice(0, 300);
+      trustedItems.push({
+        productId: rawPid || `custom_parchi_note_${Date.now()}`,
+        isCustomNote: true,
+        noteText: cleanNote,
+        name: displayName,
+        qty,
+        price: 0,
+        image: "",
+        qnty: "Priced at counter",
+        brand: "Custom Parchi Request",
+        emoji: "📝",
+      });
+      continue;
+    }
+
     // Standard Individual Product
-    const pid = (line.productId || "").toString();
+    const pid = rawPid;
     const qty = Math.max(1, Math.floor(Number(line.qty) || 1));
     const inv = invByProductId[pid];
     if (!inv) throw new Error(`Product ${pid} not in shop inventory`);
@@ -2180,12 +2238,12 @@ app.get("/orders/user/:userId", requireUser, async (req, res) => {
 // EXACTLY what the shop dashboard sends (matters for emojis + spacing — the
 // "Ready to Collect 🛍️" label is verbatim from OrdersTab.jsx).
 const ORDER_STATUS_GRAPH = {
-  'Pending':                  ['Accepted 👨‍🍳'],
-  'Accepted 👨‍🍳':             ['Packing 📦', 'Ready to Collect 🛍️', 'Picked Up ✅'],
-  'Packing 📦':               ['Ready to Collect 🛍️', 'Picked Up ✅'],
-  'Ready to Collect 🛍️':      ['Picked Up ✅'],
-  'Picked Up ✅':             [],
-  'Delivered ✅':             [], // legacy terminal state
+  'Pending': ['Accepted 👨‍🍳'],
+  'Accepted 👨‍🍳': ['Packing 📦', 'Ready to Collect 🛍️', 'Picked Up ✅'],
+  'Packing 📦': ['Ready to Collect 🛍️', 'Picked Up ✅'],
+  'Ready to Collect 🛍️': ['Picked Up ✅'],
+  'Picked Up ✅': [],
+  'Delivered ✅': [], // legacy terminal state
 };
 const isValidOrderTransition = (from, to) => {
   if (!to || typeof to !== 'string') return false;
@@ -2349,11 +2407,11 @@ app.post("/orders/:id/shop-cancel", requireShop, async (req, res) => {
     await cancelOrderWithRefund(order, {
       statusLabel: 'Cancelled ❌ (by shop)',
       customerTitle: 'Order Cancelled ❌',
-      customerMsg:   `Sorry — the shop cancelled your order #${shortId}. Refund is being processed.`,
+      customerMsg: `Sorry — the shop cancelled your order #${shortId}. Refund is being processed.`,
       // Confirmation push to the shop too, so multi-device shops see the
       // cancellation reflected even on the device that didn't trigger it.
       shopTitle: 'Order Cancelled by You ❌',
-      shopMsg:   `Order #${shortId} has been cancelled. The customer was notified and the refund is being processed.`,
+      shopMsg: `Order #${shortId} has been cancelled. The customer was notified and the refund is being processed.`,
     });
     // Stamp the ops trail so admin / future audits see who cancelled and why.
     try {
@@ -2393,7 +2451,7 @@ app.post("/orders/:id/user-cancel", requireUser, async (req, res) => {
       // Confirmation push so the customer has a receipt in their notification
       // history and any other device they're logged in on reflects the cancel.
       customerTitle: 'Order Cancelled ❌',
-      customerMsg:   `Your order #${shortId} has been cancelled. Any coins or payment will be refunded shortly.`,
+      customerMsg: `Your order #${shortId} has been cancelled. Any coins or payment will be refunded shortly.`,
       shopTitle: 'Order Cancelled by Customer ❌',
       shopMsg: `The customer cancelled order #${shortId} before you accepted it.`,
     });
@@ -2989,6 +3047,90 @@ app.post("/orders/:id/add-item", requireOrderParty, async (req, res) => {
     res.json({ success: true, message: proposalMessage, order: req.order });
   } catch (err) {
     console.error("POST /orders/:id/add-item error:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// 6. 1-Tap Custom Parchi Note Pricing (Shopkeeper sets the counter price for a custom note item)
+app.patch("/orders/:id/price-custom-item", requireOrderParty, async (req, res) => {
+  try {
+    if (req.partyRole !== 'shop') {
+      return res.status(403).json({ error: "Only shopkeeper can set custom item prices" });
+    }
+    const isClosed = req.order.status?.includes('✅') || req.order.status?.includes('❌');
+    if (isClosed) {
+      return res.status(400).json({ error: "Cannot modify prices on a closed order." });
+    }
+
+    const idx = Number(req.body?.itemIndex);
+    const unitPrice = Number(req.body?.price);
+    const customName = req.body?.name !== undefined ? String(req.body.name).trim() : null;
+
+    if (!Number.isInteger(idx) || idx < 0 || !Array.isArray(req.order.items) || idx >= req.order.items.length) {
+      return res.status(400).json({ error: "Invalid itemIndex" });
+    }
+    if (!Number.isFinite(unitPrice) || unitPrice < 0 || unitPrice > 100000) {
+      return res.status(400).json({ error: "Invalid price" });
+    }
+
+    const order = await Order.findById(req.order._id);
+    if (!order) return res.status(404).json({ error: "Order not found" });
+
+    const targetItem = order.items[idx];
+    const qty = Math.max(1, Number(targetItem.qty) || 1);
+    const oldLineTotal = (Number(targetItem.price) || 0) * qty;
+    const newLineTotal = Number((unitPrice * qty).toFixed(2));
+    const delta = Number((newLineTotal - oldLineTotal).toFixed(2));
+
+    const updatedItem = {
+      ...targetItem,
+      price: unitPrice,
+      qnty: targetItem.isCustomNote ? "Priced by shopkeeper" : (targetItem.qnty || ""),
+      ...(customName ? { name: customName.slice(0, 300) } : {}),
+    };
+
+    order.items.set(idx, updatedItem);
+    order.markModified('items');
+    order.totalAmount = Math.max(0, Number(((Number(order.totalAmount) || 0) + delta).toFixed(2)));
+    order.adjustedDelta = Number(((Number(order.adjustedDelta) || 0) + delta).toFixed(2));
+    order.unreadCountUser = (Number(order.unreadCountUser) || 0) + 1;
+    await order.save();
+
+    const itemLabel = updatedItem.noteText || updatedItem.name || "Custom Item";
+    const chatMsg = await OrderMessage.create({
+      orderId: order._id,
+      senderRole: 'shop',
+      senderName: req.partyName,
+      text: `📝 Shopkeeper priced "${itemLabel}" (${qty}x) at ₹${unitPrice} each (Line: ₹${newLineTotal} • Updated Order Total: ₹${order.totalAmount}).`,
+      readByUser: false,
+      readByShop: true,
+      createdAt: new Date(),
+    });
+
+    const targetUserId = (req.order.userId?._id || req.order.userId || '').toString();
+    if (targetUserId) {
+      notifyUserSSE(targetUserId, 'order_chat_update');
+      const shortId = order._id.toString().slice(-5).toUpperCase();
+      try {
+        await Notification.create({
+          userId: targetUserId,
+          orderId: order._id,
+          type: 'order_update',
+          title: `📝 Custom Item Priced (Order #${shortId})`,
+          message: `Shopkeeper set "${itemLabel}" to ₹${newLineTotal}. Updated bill: ₹${order.totalAmount}.`,
+        });
+        await sendPushNotification(
+          targetUserId,
+          `📝 Custom Item Priced (Order #${shortId})`,
+          `Shopkeeper set "${itemLabel}" to ₹${newLineTotal}. Updated bill: ₹${order.totalAmount}.`
+        );
+      } catch (e) { console.error("Custom item price notification error:", e.message); }
+    }
+    notifyShopSSE(String(order.shopId?._id || order.shopId), 'refresh_orders');
+
+    res.json({ success: true, order, message: chatMsg });
+  } catch (err) {
+    console.error("PATCH /orders/:id/price-custom-item error:", err);
     res.status(500).json({ error: err.message });
   }
 });
@@ -3700,15 +3842,35 @@ app.post("/users/:id/phone", requireUser, async (req, res) => {
     }
 
     const owner = await User.findOne({ phone });
+    let mergedCoins = 0;
+    let mergedPrimaryShop = null;
     if (owner && String(owner._id) !== String(req.user._id)) {
-      return res.status(409).json({ error: "This phone is already linked to a different account." });
+      // If the phone belongs to a walk-in Counter POS profile that hasn't linked
+      // an email/Google account yet, seamlessly merge their POS orders, loyalty
+      // coins, and primaryShop into this authenticated account!
+      const isPosWalkinStub = !owner.firebaseUid && !owner.email && !owner.password;
+      if (!isPosWalkinStub) {
+        return res.status(409).json({ error: "This phone is already linked to a different account." });
+      }
+      mergedCoins = Number(owner.coins) || 0;
+      mergedPrimaryShop = owner.primaryShop || null;
+      await Order.updateMany({ userId: owner._id }, { $set: { userId: req.user._id } });
+      await User.deleteOne({ _id: owner._id });
     }
 
     const providers = new Set(req.user.authProviders || []);
     providers.add("phone-unverified");
+    const updateDoc = {
+      $set: {
+        phone,
+        authProviders: [...providers],
+        ...((!req.user.primaryShop && mergedPrimaryShop) ? { primaryShop: mergedPrimaryShop } : {}),
+      },
+      ...(mergedCoins > 0 ? { $inc: { coins: mergedCoins } } : {}),
+    };
     const updated = await User.findByIdAndUpdate(
       req.user._id,
-      { $set: { phone, authProviders: [...providers] } },
+      updateDoc,
       { new: true },
     ).populate('primaryShop');
 
@@ -3978,7 +4140,15 @@ const haversineKm = (lng1, lat1, lng2, lat2) => {
 
 app.get("/shops/all/:pincode", async (req, res) => {
   try {
-    const shops = await Shop.find({ pincode: req.params.pincode }).lean();
+    const pin = String(req.params.pincode || '').trim();
+    const shops = await Shop.find(
+      { $or: [{ pincode: pin }, { serviceablePincodes: pin }] },
+      {
+        name: 1, shopImage: 1, operatingHours: 1, fullAddress: 1, pincode: 1,
+        serviceablePincodes: 1, isOpen: 1, acceptsPreOrders: 1, isAcceptingOrders: 1,
+        rating: 1, totalReviews: 1, totalOrdersFulfilled: 1, location: 1,
+      }
+    ).lean();
 
     // Optional ?lat=&lng= from the customer. When present we attach a
     // distanceKm field and sort closest-first; shops without a stored
@@ -4036,11 +4206,107 @@ app.get("/shops/:id/menu/lean", async (req, res) => {
   try {
     const shop = await Shop.findById(req.params.id)
       .select('name isOpen acceptsPreOrders isAcceptingOrders shopImage operatingHours fullAddress pincode rating totalReviews inventoryMode inventory combos')
-      .populate({ path: 'inventory.product', select: 'name brand category image mrp qnty emoji itemGroupId' })
+      .populate({ path: 'inventory.product', select: 'name brand category subCategory section image mrp qnty emoji itemGroupId searchTags barcode' })
       .populate('combos.productIds')
       .lean();
     res.json(shop);
   } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// 🚀 Server-side paginated search & category/brand filter for a shop's inventory (scales to 10,000+ items)
+app.get("/shops/:id/search", async (req, res) => {
+  try {
+    if (!mongoose.Types.ObjectId.isValid(req.params.id)) {
+      return res.status(400).json({ error: "Invalid shop id" });
+    }
+    const qRaw = String(req.query.q || "").trim().toLowerCase();
+    const categoryRaw = String(req.query.category || "").trim().toLowerCase();
+    const subCategoryRaw = String(req.query.subCategory || "").trim().toLowerCase();
+    const brandRaw = String(req.query.brand || "").trim().toLowerCase();
+    const inStockOnly = req.query.inStock === "true";
+    const page = Math.max(1, parseInt(req.query.page, 10) || 1);
+    const limit = Math.min(100, Math.max(1, parseInt(req.query.limit, 10) || 40));
+
+    const shop = await Shop.findById(req.params.id)
+      .select('inventory')
+      .populate({ path: 'inventory.product', select: 'name brand category subCategory section image mrp qnty emoji itemGroupId searchTags barcode isVeg' })
+      .lean();
+    if (!shop) return res.status(404).json({ error: "Shop not found" });
+
+    const tokens = qRaw ? qRaw.split(/\s+/).filter(Boolean) : [];
+    const matched = [];
+
+    for (const inv of (shop.inventory || [])) {
+      const p = inv?.product;
+      if (!p || !p.name) continue;
+      if (inStockOnly && inv.inStock === false) continue;
+
+      if (categoryRaw && !(p.category || "").toLowerCase().includes(categoryRaw)) continue;
+      if (subCategoryRaw && (p.subCategory || "").toLowerCase() !== subCategoryRaw) continue;
+      if (brandRaw && (p.brand || "").toLowerCase() !== brandRaw) continue;
+
+      let score = 0;
+      if (tokens.length > 0) {
+        const nameLower = (p.name || "").toLowerCase();
+        const brandLower = (p.brand || "").toLowerCase();
+        const catLower = (p.category || "").toLowerCase();
+        const subLower = (p.subCategory || "").toLowerCase();
+        const barcodeStr = String(p.barcode || "").toLowerCase();
+        const tagsStr = Array.isArray(p.searchTags) ? p.searchTags.join(" ").toLowerCase() : "";
+        const haystack = `${nameLower} ${brandLower} ${catLower} ${subLower} ${barcodeStr} ${tagsStr}`;
+
+        const allMatched = tokens.every(tok => haystack.includes(tok));
+        if (!allMatched) continue;
+
+        if (barcodeStr && barcodeStr === qRaw) score += 200;
+        if (nameLower === qRaw) score += 120;
+        else if (nameLower.startsWith(qRaw)) score += 70;
+        else if (nameLower.includes(qRaw)) score += 40;
+        if (brandLower === qRaw || brandLower.startsWith(qRaw)) score += 30;
+        if (tagsStr.includes(qRaw)) score += 20;
+      }
+
+      if (inv.inStock !== false) score += 10;
+      if (inv.isFeatured) score += 5;
+
+      const mrpVal = Number(p.mrp) || 0;
+      const sellVal = Number(inv.sellingPrice) || mrpVal;
+      const discountPercent = (mrpVal > 0 && sellVal < mrpVal)
+        ? Math.round(((mrpVal - sellVal) / mrpVal) * 100)
+        : 0;
+
+      matched.push({
+        ...p,
+        sellingPrice: sellVal,
+        inStock: inv.inStock !== false,
+        stockCount: inv.stockCount || 0,
+        isFeatured: Boolean(inv.isFeatured),
+        featuredRank: inv.featuredRank ?? 999,
+        discountPercent,
+        _score: score,
+      });
+    }
+
+    matched.sort((a, b) => {
+      if (b._score !== a._score) return b._score - a._score;
+      return (a.name || "").localeCompare(b.name || "");
+    });
+
+    const total = matched.length;
+    const start = (page - 1) * limit;
+    const items = matched.slice(start, start + limit).map(({ _score, ...rest }) => rest);
+
+    res.json({
+      items,
+      total,
+      page,
+      limit,
+      totalPages: Math.max(1, Math.ceil(total / limit)),
+      hasMore: start + items.length < total,
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
 });
 app.post("/shops/:shopId/inventory", requireShop, async (req, res) => {
   try {
@@ -4117,6 +4383,380 @@ app.delete("/shops/:shopId/inventory/:productId", requireShop, async (req, res) 
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
+// 🔫 Scan-to-Link Barcode: permanently links a scanned barcode to an existing MasterProduct
+// AND adds/updates it in the shop's inventory in one step! Requires Admin-granted canUseBarcodeScanner.
+app.post("/shops/:shopId/barcode-link", requireShop, async (req, res) => {
+  try {
+    if (req.shop._id.toString() !== req.params.shopId) {
+      return res.status(403).json({ error: "Cannot edit another shop's inventory" });
+    }
+    if (!req.shop.canUseBarcodeScanner) {
+      return res.status(403).json({ error: "Barcode scanner feature is not enabled for your shop. Ask Admin to enable it." });
+    }
+    const cleanBarcode = String(req.body?.barcode || "").trim();
+    const productId = String(req.body?.productId || "").trim();
+    const sellingPrice = Number(req.body?.sellingPrice);
+    const inStock = req.body?.inStock !== false;
+
+    if (!cleanBarcode || cleanBarcode.length < 3) {
+      return res.status(400).json({ error: "Valid barcode is required." });
+    }
+    if (!productId || !mongoose.isValidObjectId(productId)) {
+      return res.status(400).json({ error: "Valid productId is required." });
+    }
+    if (!Number.isFinite(sellingPrice) || sellingPrice < 0) {
+      return res.status(400).json({ error: "Valid sellingPrice is required." });
+    }
+
+    // 1. Save barcode onto MasterProduct so future scans across the platform recognize it immediately
+    const masterProd = await MasterProduct.findByIdAndUpdate(
+      productId,
+      { $set: { barcode: cleanBarcode } },
+      { new: true }
+    );
+    if (!masterProd) {
+      return res.status(404).json({ error: "Master product not found." });
+    }
+
+    // 2. Upsert into shop inventory
+    const shop = await Shop.findById(req.params.shopId);
+    const existingIndex = shop.inventory.findIndex(item => item.product && item.product.toString() === productId);
+    if (existingIndex > -1) {
+      await Shop.updateOne(
+        { _id: req.params.shopId },
+        {
+          $set: {
+            [`inventory.${existingIndex}.sellingPrice`]: sellingPrice,
+            [`inventory.${existingIndex}.inStock`]: Boolean(inStock),
+          }
+        }
+      );
+    } else {
+      await Shop.updateOne(
+        { _id: req.params.shopId },
+        {
+          $push: {
+            inventory: {
+              product: productId,
+              sellingPrice,
+              inStock: Boolean(inStock),
+              isFeatured: false,
+              featuredRank: 999,
+            }
+          }
+        }
+      );
+    }
+
+    const updatedShop = await Shop.findById(req.params.shopId).populate('inventory.product').populate('combos.productIds');
+    res.json({ shop: updatedShop, product: masterProd });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ============================================================================
+// ⚡ FAST COUNTER POS BILLING + OFFLINE-TO-ONLINE CUSTOMER CONVERSION ENGINE
+// ============================================================================
+
+const generateUniqueReferralCode = async (rawName) => {
+  const base = String(rawName || "PACK").replace(/[^a-zA-Z]/g, '').substring(0, 4).toUpperCase() || "PACK";
+  for (let attempt = 0; attempt < 6; attempt++) {
+    const candidate = `${base}${Math.floor(10000 + Math.random() * 90000)}`;
+    const exists = await User.exists({ referralCode: candidate });
+    if (!exists) return candidate;
+  }
+  return `PIO${Date.now().toString(36).toUpperCase().slice(-6)}`;
+};
+
+// 1. Instant Walk-in Customer Lookup by Phone (10-digit Indian mobile)
+app.get("/shops/:shopId/pos-customer/:phone", requireShop, async (req, res) => {
+  try {
+    if (req.shop._id.toString() !== req.params.shopId) {
+      return res.status(403).json({ error: "Not your shop" });
+    }
+    const cleanPhone = String(req.params.phone || "").replace(/^\+?91/, "").replace(/\D/g, "");
+    if (!validatePhone(cleanPhone)) {
+      return res.status(400).json({ error: "Valid 10-digit mobile number required" });
+    }
+
+    const user = await User.findOne({ phone: cleanPhone })
+      .select("_id name phone coins primaryShop pincode")
+      .lean();
+
+    const orderFilter = {
+      shopId: req.params.shopId,
+      $or: [
+        { customerPhone: cleanPhone },
+        ...(user ? [{ userId: user._id }] : []),
+      ],
+    };
+
+    const pastOrders = await Order.find(orderFilter)
+      .select("totalAmount createdAt status orderSource")
+      .sort({ createdAt: -1 })
+      .limit(50)
+      .lean();
+
+    const validOrders = pastOrders.filter(o => !/cancel|reject/i.test(o.status || ""));
+    const totalSpentAtShop = validOrders.reduce((sum, o) => sum + (Number(o.totalAmount) || 0), 0);
+    const lastVisitAt = validOrders.length > 0 ? validOrders[0].createdAt : null;
+
+    res.json({
+      found: Boolean(user),
+      user: user ? {
+        _id: user._id,
+        name: user.name || "",
+        phone: user.phone,
+        coins: Number(user.coins) || 0,
+        primaryShop: user.primaryShop || null,
+      } : null,
+      pastOrdersCount: validOrders.length,
+      totalSpentAtShop: Math.round(totalSpentAtShop * 100) / 100,
+      lastVisitAt,
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// 2. Create Walk-in Counter POS Bill + Auto-Convert Offline Customer to Online User
+app.post("/shops/:shopId/pos-bills", requireShop, async (req, res) => {
+  try {
+    if (req.shop._id.toString() !== req.params.shopId) {
+      return res.status(403).json({ error: "Cannot create POS bills for another shop" });
+    }
+    if (!req.shop.canUseCounterPos) {
+      return res.status(403).json({ error: "Counter POS feature is not enabled for your shop. Ask Admin to enable it." });
+    }
+
+    const rawItems = Array.isArray(req.body?.items) ? req.body.items : [];
+    if (rawItems.length === 0) {
+      return res.status(400).json({ error: "Add at least one item to generate a bill." });
+    }
+
+    const rawMethod = String(req.body?.paymentMethod || "CASH").toUpperCase();
+    const paymentMethod = ["CASH", "UPI", "KHATA"].includes(rawMethod) ? rawMethod : "CASH";
+
+    const rawPhone = String(req.body?.customerPhone || "").replace(/^\+?91/, "").replace(/\D/g, "");
+    const hasValidPhone = validatePhone(rawPhone);
+    const cleanPhone = hasValidPhone ? rawPhone : "";
+    const cleanName = String(req.body?.customerName || "").trim().slice(0, 80);
+
+    let mrpTotal = 0;
+    let itemSubtotal = 0;
+    const verifiedItems = [];
+
+    for (const line of rawItems) {
+      if (!line) continue;
+      const qty = Math.max(1, Math.min(999, Math.floor(Number(line.qty) || 1)));
+      const unitPrice = Math.max(0, Math.round((Number(line.price ?? line.sellingPrice ?? line.mrp ?? 0)) * 100) / 100);
+      const unitMrp = Math.max(unitPrice, Math.round((Number(line.mrp ?? unitPrice)) * 100) / 100);
+      const pid = line.productId && mongoose.isValidObjectId(line.productId) ? String(line.productId) : null;
+
+      mrpTotal += unitMrp * qty;
+      itemSubtotal += unitPrice * qty;
+
+      verifiedItems.push({
+        productId: pid || `pos_custom_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+        isCustomItem: Boolean(line.isCustomItem || !pid),
+        name: String(line.name || "Counter Item").trim().slice(0, 160),
+        brand: String(line.brand || (pid ? "" : "Store Item")).trim().slice(0, 80),
+        qnty: String(line.qnty || "1 unit").trim().slice(0, 40),
+        image: String(line.image || ""),
+        emoji: String(line.emoji || "🛍️"),
+        mrp: unitMrp,
+        price: unitPrice,
+        sellingPrice: unitPrice,
+        qty,
+      });
+    }
+
+    if (verifiedItems.length === 0) {
+      return res.status(400).json({ error: "No valid items in bill." });
+    }
+
+    const manualDiscount = Math.max(0, Math.min(itemSubtotal, Number(req.body?.discountAmount) || 0));
+    const afterManualDiscount = Math.max(0, itemSubtotal - manualDiscount);
+
+    // Offline-to-Online Customer Account Resolution & Loyalty Coins
+    let customerUser = null;
+    let convertedToOnlineUser = false;
+    let actualCoinsUsed = 0;
+    let coinDiscount = 0;
+    let earnedCoins = 0;
+
+    if (cleanPhone) {
+      customerUser = await User.findOne({ phone: cleanPhone });
+
+      if (customerUser && req.body?.redeemCoins && Number(customerUser.coins) > 0) {
+        const maxDiscountAllowed = afterManualDiscount * 0.10;
+        const maxCoinsConsumable = Math.floor(maxDiscountAllowed * 10);
+        actualCoinsUsed = Math.min(Number(customerUser.coins) || 0, maxCoinsConsumable);
+        coinDiscount = actualCoinsUsed / 10;
+      }
+    }
+
+    const finalTotal = Math.max(0, Math.round((afterManualDiscount - coinDiscount) * 100) / 100);
+    const totalDiscount = Math.round((manualDiscount + coinDiscount) * 100) / 100;
+    const totalSavings = Math.max(0, Math.round((mrpTotal - finalTotal) * 100) / 100);
+
+    if (cleanPhone) {
+      const baseEarned = finalTotal >= 20 ? Math.max(2, Math.floor(finalTotal / 20)) : 1;
+
+      if (!customerUser) {
+        // 🎉 New Walk-in Customer! Auto-create their Online Store Account + Welcome Bonus Coins
+        const welcomeBonus = 10;
+        earnedCoins = baseEarned + welcomeBonus;
+        const refCode = await generateUniqueReferralCode(cleanName || "WALK");
+        customerUser = await User.create({
+          name: cleanName || "Valued Customer",
+          phone: cleanPhone,
+          pincode: req.shop.pincode || "",
+          primaryShop: req.shop._id,
+          authProviders: ["pos-walkin"],
+          referralCode: refCode,
+          coins: earnedCoins,
+        });
+        convertedToOnlineUser = true;
+      } else {
+        earnedCoins = baseEarned;
+        const netCoinDelta = earnedCoins - actualCoinsUsed;
+        const userUpdates = { primaryShop: req.shop._id };
+        if (cleanName && (!customerUser.name || customerUser.name === "Valued Customer" || customerUser.name === "Customer")) {
+          userUpdates.name = cleanName;
+        }
+        customerUser = await User.findByIdAndUpdate(
+          customerUser._id,
+          {
+            $set: userUpdates,
+            ...(netCoinDelta !== 0 ? { $inc: { coins: netCoinDelta } } : {}),
+          },
+          { new: true }
+        );
+      }
+    }
+
+    // Deduct stockCount for catalog items in shop inventory
+    const shop = await Shop.findById(req.params.shopId);
+    if (shop && Array.isArray(shop.inventory)) {
+      let invModified = false;
+      for (const item of verifiedItems) {
+        if (!item.productId || item.isCustomItem) continue;
+        const idx = shop.inventory.findIndex(inv => inv.product && inv.product.toString() === item.productId);
+        if (idx > -1) {
+          const currentCount = Number(shop.inventory[idx].stockCount) || 0;
+          if (currentCount > 0) {
+            const nextCount = Math.max(0, currentCount - item.qty);
+            shop.inventory[idx].stockCount = nextCount;
+            if (shop.inventoryMode === "stock_count" && nextCount === 0) {
+              shop.inventory[idx].inStock = false;
+            }
+            invModified = true;
+          }
+        }
+      }
+      shop.totalOrdersFulfilled = (Number(shop.totalOrdersFulfilled) || 0) + 1;
+      if (invModified) shop.markModified("inventory");
+      await shop.save();
+    }
+
+    const now = new Date();
+    const posOrder = await Order.create({
+      orderSource: "POS",
+      userId: customerUser ? customerUser._id : null,
+      shopId: req.shop._id,
+      customerName: customerUser?.name || cleanName || "Walk-in Customer",
+      customerPhone: cleanPhone,
+      items: verifiedItems,
+      mrpTotal: Math.round(mrpTotal * 100) / 100,
+      discountAmount: totalDiscount,
+      savingsAmount: totalSavings,
+      totalAmount: finalTotal,
+      coinsUsed: actualCoinsUsed,
+      coinsEarned: earnedCoins,
+      coinsAwarded: true,
+      convertedToOnlineUser,
+      paymentMethod,
+      paymentStatus: paymentMethod === "KHATA" ? "Unpaid" : "Paid",
+      status: "Picked Up ✅",
+      statusHistory: [
+        { status: "Counter POS Bill ⚡", at: now },
+        { status: "Picked Up ✅", at: now },
+      ],
+      createdAt: now,
+    });
+
+    notifyShopSSE(String(req.shop._id), "refresh_orders");
+
+    const populatedOrder = await Order.findById(posOrder._id)
+      .populate("userId", "name phone coins")
+      .populate("shopId", "name phone pincode fullAddress fssai gst upiId");
+
+    const updatedShop = await Shop.findById(req.params.shopId)
+      .populate("inventory.product")
+      .populate("combos.productIds");
+
+    res.json({
+      success: true,
+      order: populatedOrder,
+      customer: customerUser ? {
+        _id: customerUser._id,
+        name: customerUser.name,
+        phone: customerUser.phone,
+        coins: customerUser.coins,
+      } : null,
+      convertedToOnlineUser,
+      coinsEarned: earnedCoins,
+      shop: updatedShop,
+    });
+  } catch (err) {
+    console.error("POST /shops/:shopId/pos-bills error:", err);
+    res.status(500).json({ error: err.message || "Failed to create POS bill" });
+  }
+});
+
+// 3. Public Digital Web Receipt & Offline-to-Online Storefront Bridge (#/bill/:orderId)
+app.get("/public/bill/:orderId", async (req, res) => {
+  try {
+    if (!mongoose.isValidObjectId(req.params.orderId)) {
+      return res.status(400).json({ error: "Invalid bill link." });
+    }
+    const order = await Order.findById(req.params.orderId)
+      .populate("shopId", "name shopImage phone fullAddress operatingHours pincode fssai gst rating totalReviews isOpen acceptsPreOrders upiId")
+      .populate("userId", "name phone coins primaryShop")
+      .lean();
+
+    if (!order) {
+      return res.status(404).json({ error: "Bill not found." });
+    }
+
+    res.json({
+      _id: order._id,
+      shortId: String(order._id).slice(-5).toUpperCase(),
+      orderSource: order.orderSource || "ONLINE",
+      status: order.status,
+      paymentMethod: order.paymentMethod,
+      paymentStatus: order.paymentStatus,
+      customerName: order.userId?.name || order.customerName || "Valued Customer",
+      customerPhone: order.userId?.phone || order.customerPhone || "",
+      customerCoinsBalance: Number(order.userId?.coins || 0),
+      items: order.items || [],
+      mrpTotal: Number(order.mrpTotal || 0),
+      discountAmount: Number(order.discountAmount || 0),
+      savingsAmount: Number(order.savingsAmount || 0),
+      totalAmount: Number(order.totalAmount || 0),
+      coinsUsed: Number(order.coinsUsed || 0),
+      coinsEarned: Number(order.coinsEarned || 0),
+      convertedToOnlineUser: Boolean(order.convertedToOnlineUser),
+      createdAt: order.createdAt,
+      shop: order.shopId || null,
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 app.post("/shops/:shopId/combos", requireShop, async (req, res) => {
   try {
     if (req.shop._id.toString() !== req.params.shopId) {
@@ -4127,7 +4767,7 @@ app.post("/shops/:shopId/combos", requireShop, async (req, res) => {
       return res.status(400).json({ error: "Combo name and at least one product required." });
     }
     await Shop.updateOne(
-      { _id: req.params.shopId }, 
+      { _id: req.params.shopId },
       { $push: { combos: { name, emoji, productIds, comboPrice: Number(comboPrice) || 0, isActive: true } } }
     );
     res.json(await Shop.findById(req.params.shopId).populate('inventory.product').populate('combos.productIds'));
@@ -4211,15 +4851,20 @@ const SHOP_ADMIN_WRITABLE = [
   'name', 'ownerName', 'fullAddress', 'operatingHours', 'shopImage', 'phone',
   'password', 'pincode', 'serviceablePincodes', 'isOpen', 'isAcceptingOrders',
   'fssai', 'gst', 'panNumber', 'upiId', 'inventoryMode', 'canAddMasterProducts',
+  'canUseBarcodeScanner', 'canUseCounterPos',
 ];
 app.patch("/shops/:id/admin-edit", requireAdmin, async (req, res) => {
   try {
     const updateData = pickFields(req.body || {}, SHOP_ADMIN_WRITABLE);
     if (updateData.password !== undefined) {
-      if (!validatePassword(updateData.password)) {
-        return res.status(400).json({ error: "Password must be at least 6 characters." });
+      if (String(updateData.password).trim() === '') {
+        delete updateData.password;
+      } else {
+        if (!validatePassword(updateData.password)) {
+          return res.status(400).json({ error: "Password must be at least 6 characters." });
+        }
+        updateData.password = await bcrypt.hash(String(updateData.password), 10);
       }
-      updateData.password = await bcrypt.hash(String(updateData.password), 10);
     }
     const updatedShop = await Shop.findByIdAndUpdate(req.params.id, updateData, { new: true });
     res.json(updatedShop);
@@ -4343,6 +4988,7 @@ const MASTER_PRODUCT_WRITABLE = [
   'name', 'brand', 'category', 'mrp', 'qnty', 'emoji', 'image', 'searchTags',
   'description', 'ingredients', 'manufacturer', 'manufactureraddress',
   'energy', 'protein', 'carbs', 'sugar', 'fat', 'isVeg', 'itemGroupId',
+  'barcode', 'originalPosName', 'section', 'subCategory', 'isActive',
   'relatedProducts', 'substitutes',
 ];
 // pickFields / normaliseSearchTags are hoisted near the top of the file so
@@ -4373,8 +5019,59 @@ app.post("/master-products", async (req, res, next) => {
 app.get("/master-products", async (req, res) => {
   try {
     res.set("Cache-Control", "public, max-age=300, stale-while-revalidate=600");
-    const products = await MasterProduct.find({})
-      .select("name brand category mrp qnty emoji image searchTags isVeg itemGroupId")
+    const qRaw = String(req.query.q || "").trim();
+    const categoryRaw = String(req.query.category || "").trim();
+    const brandRaw = String(req.query.brand || "").trim();
+    const hasPagination = req.query.page !== undefined || req.query.limit !== undefined;
+
+    const filter = {};
+    if (categoryRaw) {
+      filter.category = { $regex: escapeRegex(categoryRaw), $options: "i" };
+    }
+    if (brandRaw) {
+      filter.brand = { $regex: `^${escapeRegex(brandRaw)}$`, $options: "i" };
+    }
+    if (qRaw) {
+      const tokens = qRaw.split(/\s+/).filter(Boolean).slice(0, 6);
+      if (tokens.length > 0) {
+        filter.$and = tokens.map(tok => {
+          const rx = new RegExp(escapeRegex(tok), "i");
+          return {
+            $or: [
+              { name: rx },
+              { brand: rx },
+              { category: rx },
+              { subCategory: rx },
+              { barcode: rx },
+              { searchTags: rx },
+            ],
+          };
+        });
+      }
+    }
+
+    const selectFields = "name brand category subCategory section mrp qnty emoji image searchTags isVeg itemGroupId barcode";
+
+    if (hasPagination) {
+      const page = Math.max(1, parseInt(req.query.page, 10) || 1);
+      const limit = Math.min(200, Math.max(1, parseInt(req.query.limit, 10) || 50));
+      const skip = (page - 1) * limit;
+      const [items, total] = await Promise.all([
+        MasterProduct.find(filter).select(selectFields).sort({ name: 1 }).skip(skip).limit(limit).lean(),
+        MasterProduct.countDocuments(filter),
+      ]);
+      return res.json({
+        items,
+        total,
+        page,
+        limit,
+        totalPages: Math.max(1, Math.ceil(total / limit)),
+        hasMore: skip + items.length < total,
+      });
+    }
+
+    const products = await MasterProduct.find(filter)
+      .select(selectFields)
       .lean();
     res.json(products);
   } catch (err) {
@@ -4422,13 +5119,13 @@ app.delete("/master-products/:id", requireAdmin, async (req, res) => {
     if (!deletedProduct) {
       return res.status(404).json({ error: "Product not found." });
     }
-    
+
     // Pull this product from all Shop Inventories here so it doesn't leave ghost items
     await Shop.updateMany({}, { $pull: { inventory: { product: req.params.id } } });
 
     res.json({ message: "Product deleted successfully!" });
-  } catch (err) { 
-    res.status(500).json({ error: err.message }); 
+  } catch (err) {
+    res.status(500).json({ error: err.message });
   }
 });
 
@@ -4450,7 +5147,7 @@ app.post("/master-products/bulk-upload", requireAdmin, memoryUpload.single('file
   try {
     if (!req.file) return res.status(400).json({ error: 'No CSV file was uploaded.' });
     const jsonArray = await csv().fromString(req.file.buffer.toString('utf8'));
-    
+
     const formattedProducts = [];
     let skippedCount = 0;
 
@@ -4462,24 +5159,24 @@ app.post("/master-products/bulk-upload", requireAdmin, memoryUpload.single('file
       }
 
       formattedProducts.push({
-        name: row.name, 
-        brand: row.brand || "Generic", 
-        category: row.category || "Uncategorized", 
-        mrp: Number(row.mrp) || 0, 
+        name: row.name,
+        brand: row.brand || "Generic",
+        category: row.category || "Uncategorized",
+        mrp: Number(row.mrp) || 0,
         qnty: row.qnty || "1 unit",
-        emoji: row.emoji || "", 
-        image: row.image || "", 
+        emoji: row.emoji || "",
+        image: row.image || "",
         searchTags: row.searchTags ? row.searchTags.split(',').map(tag => tag.trim()) : [],
-        itemGroupId: row.itemGroupId || "", 
+        itemGroupId: row.itemGroupId || "",
         isVeg: String(row.isVeg).toLowerCase() === 'true',
-        description: row.description || "", 
-        manufacturer: row.manufacturer || "", 
+        description: row.description || "",
+        manufacturer: row.manufacturer || "",
         energy: row.energy || "",
-        protein: row.protein || "", 
-        carbs: row.carbs || "", 
-        sugar: row.sugar || "", 
+        protein: row.protein || "",
+        carbs: row.carbs || "",
+        sugar: row.sugar || "",
         fat: row.fat || "",
-        ingredients: row.ingredients || "", 
+        ingredients: row.ingredients || "",
         manufactureraddress: row.manufactureraddress || ""
       });
     });
@@ -4487,13 +5184,13 @@ app.post("/master-products/bulk-upload", requireAdmin, memoryUpload.single('file
     if (formattedProducts.length > 0) {
       await MasterProduct.insertMany(formattedProducts);
     }
-    
-    res.status(200).json({ 
+
+    res.status(200).json({
       message: `Success! Added ${formattedProducts.length} products to the catalog.`,
       skipped: skippedCount > 0 ? `Skipped ${skippedCount} items due to missing data.` : "All items passed QC."
     });
-  } catch (error) { 
-    res.status(500).json({ error: 'Failed to upload products.' }); 
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to upload products.' });
   }
 });
 
@@ -4617,7 +5314,7 @@ app.post("/missed-searches", rateLimit('missed-searches', 30, 60 * 1000), async 
 
 // List missed searches for admin. ?resolved=false (default) hides done.
 // ?sort=count (default) | lastSearchedAt
-app.get("/missed-searches", async (req, res) => {
+app.get("/missed-searches", requireAdmin, async (req, res) => {
   try {
     const resolvedParam = String(req.query.resolved || "false");
     const filter = {};
@@ -4746,9 +5443,9 @@ app.get("/brands", async (_req, res) => {
 // Tier progress is persisted on the order so restarts don't double-fire and
 // shops that accept mid-escalation stop receiving further escalation events.
 const ESCALATION_TIERS = [
-  { tier: 1, afterMs: 2 * 60 * 1000,  name: 'sms+loud-push' },
-  { tier: 2, afterMs: 5 * 60 * 1000,  name: 'voice-call'    },
-  { tier: 3, afterMs: 15 * 60 * 1000, name: 'auto-cancel'   },
+  { tier: 1, afterMs: 2 * 60 * 1000, name: 'sms+loud-push' },
+  { tier: 2, afterMs: 5 * 60 * 1000, name: 'voice-call' },
+  { tier: 3, afterMs: 15 * 60 * 1000, name: 'auto-cancel' },
 ];
 const ESCALATION_MAX_AGE_MS = 24 * 60 * 60 * 1000; // safety: don't spam old/forgotten orders on first boot
 const ESCALATION_SCAN_INTERVAL_MS = 30 * 1000;
@@ -4880,9 +5577,9 @@ async function autoCancelOrder(order) {
   return cancelOrderWithRefund(order, {
     statusLabel: 'Cancelled ❌ (shop unresponsive)',
     customerTitle: 'Order Cancelled ❌',
-    customerMsg:   `Order #${shortId} was auto-cancelled — the shop didn't respond. Refund is being processed.`,
-    shopTitle:     '⚠️ Order Auto-Cancelled',
-    shopMsg:       `Order #${shortId} was auto-cancelled — you didn't respond within 15 minutes.`,
+    customerMsg: `Order #${shortId} was auto-cancelled — the shop didn't respond. Refund is being processed.`,
+    shopTitle: '⚠️ Order Auto-Cancelled',
+    shopMsg: `Order #${shortId} was auto-cancelled — you didn't respond within 15 minutes.`,
   });
 }
 
@@ -4890,7 +5587,7 @@ async function runEscalationScan() {
   try {
     const now = Date.now();
     const firstTierCutoff = new Date(now - ESCALATION_TIERS[0].afterMs);
-    const maxAgeCutoff   = new Date(now - ESCALATION_MAX_AGE_MS);
+    const maxAgeCutoff = new Date(now - ESCALATION_MAX_AGE_MS);
 
     const candidates = await Order.find({
       status: 'Pending',
