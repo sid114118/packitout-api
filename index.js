@@ -14,6 +14,7 @@ const bcrypt = require("bcryptjs");
 const { GoogleGenerativeAI } = require("@google/generative-ai");
 const EventEmitter = require('events');
 const systemEvents = new EventEmitter();
+const { notifySoundbox, notifyParchiSoundbox, getSoundboxClientStatus } = require("./soundboxService");
 
 const genAI = process.env.GEMINI_API_KEY
   ? new GoogleGenerativeAI(process.env.GEMINI_API_KEY)
@@ -1248,6 +1249,14 @@ app.post("/upload-parchi", rateLimit('upload-parchi', 10, 60 * 1000), requireUse
     });
     await newParchi.save();
     notifyShopSSE(shopId, "refresh_parchis");
+
+    // 🔊 Real-Time Soundbox Announcement: "New shopping list received"
+    notifyParchiSoundbox({
+      shopId,
+      customerName: newParchi.customerName,
+      parchiId: newParchi._id.toString(),
+    }).catch((e) => console.error("[Soundbox MQTT] Parchi notify error:", e.message));
+
     res.status(200).json({ success: true, parchi: newParchi });
   } catch (error) {
     res.status(500).json({ error: "Upload failed." });
@@ -1737,6 +1746,16 @@ app.post("/parchis/:id/accept-bill", requireUser, async (req, res) => {
       await sendPushNotification(parchi.shopId, shopTitle, shopMessage);
     } catch (e) { console.log('parchi accept shop notify skipped:', e.message); }
 
+    // 🔊 Real-Time Soundbox Announcement for Accepted Parchi Order
+    notifySoundbox({
+      shopId: parchi.shopId,
+      amount: order.totalAmount,
+      itemCount: order.items ? order.items.length : 1,
+      totalQuantity: order.items ? order.items.reduce((sum, it) => sum + (Number(it.qty) || 1), 0) : 1,
+      orderId: `ORD-${shortId}`,
+      paymentMethod: order.paymentMethod || 'POP',
+    }).catch((e) => console.error("[Soundbox MQTT] Accept bill order notify error:", e.message));
+
     res.json({ success: true, order });
   } catch (err) {
     console.error('accept-bill error:', err);
@@ -2158,6 +2177,17 @@ app.post("/orders", requireUser, async (req, res) => {
     }
 
     notifyShopSSE(String(o.shopId), 'refresh_orders');
+
+    // 🔊 Real-Time Soundbox Announcement: Order Amount & Item Count
+    notifySoundbox({
+      shopId: o.shopId,
+      amount: o.totalAmount,
+      itemCount: o.items ? o.items.length : 1,
+      totalQuantity: o.items ? o.items.reduce((sum, it) => sum + (Number(it.qty) || 1), 0) : 1,
+      orderId: `ORD-${shortId}`,
+      paymentMethod: o.paymentMethod || 'POP',
+    }).catch((e) => console.error("[Soundbox MQTT] Order placement notify error:", e.message));
+
     res.json(o);
   } catch (err) {
     if (coinRefund) {
@@ -2167,6 +2197,47 @@ app.post("/orders", requireUser, async (req, res) => {
     res.status(500).json({ error: err.message });
   }
 });
+
+// 🔊 Direct Test Endpoint for Hardware Soundbox (ESP32)
+// Call with POST /shops/:shopId/test-soundbox
+// Body (optional): { "type": "order" | "parchi", "amount": 350, "itemCount": 2 }
+app.post("/shops/:shopId/test-soundbox", async (req, res) => {
+  try {
+    const { shopId } = req.params;
+    const { type = 'order', amount = 350, itemCount = 2, totalQuantity = 3, paymentMethod = 'POP', customerName = 'Customer' } = req.body || {};
+
+    if (!shopId) return res.status(400).json({ error: "shopId required" });
+
+    let success = false;
+    if (type === 'parchi') {
+      success = await notifyParchiSoundbox({
+        shopId,
+        customerName,
+        parchiId: `PARCHI-${Date.now().toString().slice(-4)}`
+      });
+    } else {
+      success = await notifySoundbox({
+        shopId,
+        amount,
+        itemCount,
+        totalQuantity,
+        orderId: `ORD-${Date.now().toString().slice(-5)}`,
+        paymentMethod
+      });
+    }
+
+    res.json({
+      success,
+      type,
+      shopId,
+      status: getSoundboxClientStatus(),
+      message: `Soundbox test ${type} notification sent to shop ${shopId}`
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // Admin-only firehose, capped at 500 rows. Used by the AdminDashboard global
 // orders tab. The user/shop populates exclude their password fields via the
 // `select:false` set on the schema. Old behaviour returned every order ever,
