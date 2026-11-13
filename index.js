@@ -4620,13 +4620,14 @@ app.post("/shops/:shopId/pos-bills", requireShop, async (req, res) => {
 
     for (const line of rawItems) {
       if (!line) continue;
-      const qty = Math.max(1, Math.min(999, Math.floor(Number(line.qty) || 1)));
+      const rawQty = Number(line.qty);
+      const qty = Number.isFinite(rawQty) && rawQty > 0 ? Math.max(0.01, Math.min(9999, Math.round(rawQty * 1000) / 1000)) : 1;
       const unitPrice = Math.max(0, Math.round((Number(line.price ?? line.sellingPrice ?? line.mrp ?? 0)) * 100) / 100);
       const unitMrp = Math.max(unitPrice, Math.round((Number(line.mrp ?? unitPrice)) * 100) / 100);
       const pid = line.productId && mongoose.isValidObjectId(line.productId) ? String(line.productId) : null;
 
-      mrpTotal += unitMrp * qty;
-      itemSubtotal += unitPrice * qty;
+      mrpTotal += Math.round(unitMrp * qty * 100) / 100;
+      itemSubtotal += Math.round(unitPrice * qty * 100) / 100;
 
       verifiedItems.push({
         productId: pid || `pos_custom_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
