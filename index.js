@@ -4323,7 +4323,7 @@ app.get("/shops/:id/search", async (req, res) => {
         const catLower = (p.category || "").toLowerCase();
         const subLower = (p.subCategory || "").toLowerCase();
         const barcodeStr = String(p.barcode || "").toLowerCase();
-        const tagsStr = Array.isArray(p.searchTags) ? p.searchTags.join(" ").toLowerCase() : "";
+        const tagsStr = Array.isArray(p.searchTags) ? p.searchTags.join(" ").toLowerCase() : String(p.searchTags || "").toLowerCase();
         const haystack = `${nameLower} ${brandLower} ${catLower} ${subLower} ${barcodeStr} ${tagsStr}`;
 
         const allMatched = tokens.every(tok => haystack.includes(tok));
