@@ -372,7 +372,20 @@ const orderSchema = new mongoose.Schema({
   // Razorpay was removed in favour of direct shop UPI (no gateway = no fees +
   // money lands instantly in the shop's bank).
   paymentMethod: { type: String, enum: ['UPI', 'POP', 'CASH', 'KHATA'], default: 'POP' },
-  paymentStatus: { type: String, enum: ['Unpaid', 'PendingVerification', 'Paid'], default: 'Unpaid' },
+  paymentStatus: { type: String, enum: ['Unpaid', 'PartiallyPaid', 'PendingVerification', 'Paid'], default: 'Unpaid' },
+  paidAmount: { type: Number, default: 0 },
+  paidVia: { type: String, enum: ['NONE', 'CASH', 'UPI'], default: 'NONE' },
+  khataAmount: { type: Number, default: 0 },
+  khataSettledAmount: { type: Number, default: 0 },
+  khataSnapshot: {
+    synced: { type: Boolean, default: false },
+    isFirstKhata: { type: Boolean, default: false },
+    previousDue: { type: Number, default: 0 },
+    paidNow: { type: Number, default: 0 },
+    paidVia: { type: String, default: 'NONE' },
+    addedDue: { type: Number, default: 0 },
+    newTotalDue: { type: Number, default: 0 },
+  },
   orderSource: { type: String, enum: ['ONLINE', 'POS', 'PARCHI'], default: 'ONLINE' },
   customerName: { type: String, default: '' },
   customerPhone: { type: String, default: '' },
@@ -435,7 +448,49 @@ const orderSchema = new mongoose.Schema({
 });
 orderSchema.index({ userId: 1, createdAt: -1 });
 orderSchema.index({ shopId: 1, createdAt: -1 });
+orderSchema.index({ shopId: 1, paymentMethod: 1, createdAt: 1 });
 const Order = mongoose.model("Order", orderSchema);
+
+// 📒 STORE KHATA (UDHAAR / CREDIT LEDGER) SCHEMAS
+// One KhataAccount per (shopId, customerPhone) pair. Only the shopkeeper can
+// add credit via Counter POS or Manual Credit in the Khata Book tab.
+const khataAccountSchema = new mongoose.Schema({
+  shopId: { type: mongoose.Schema.Types.ObjectId, ref: 'Shop', required: true },
+  userId: { type: mongoose.Schema.Types.ObjectId, ref: 'User', default: null, index: true },
+  customerPhone: { type: String, required: true },
+  customerName: { type: String, default: 'Customer' },
+  currentBalance: { type: Number, default: 0 },
+  totalCreditGiven: { type: Number, default: 0 },
+  totalSettled: { type: Number, default: 0 },
+  creditLimit: { type: Number, default: 0 }, // 0 = no custom cap
+  notes: { type: String, default: '' },
+  lastTransactionAt: { type: Date, default: Date.now },
+  lastReminderAt: { type: Date, default: null },
+}, { timestamps: true });
+khataAccountSchema.index({ shopId: 1, customerPhone: 1 }, { unique: true });
+khataAccountSchema.index({ shopId: 1, currentBalance: -1, lastTransactionAt: -1 });
+const KhataAccount = mongoose.model("KhataAccount", khataAccountSchema);
+
+const khataTransactionSchema = new mongoose.Schema({
+  khataAccountId: { type: mongoose.Schema.Types.ObjectId, ref: 'KhataAccount', required: true, index: true },
+  shopId: { type: mongoose.Schema.Types.ObjectId, ref: 'Shop', required: true, index: true },
+  userId: { type: mongoose.Schema.Types.ObjectId, ref: 'User', default: null, index: true },
+  customerPhone: { type: String, required: true },
+  type: { type: String, enum: ['CREDIT_BILL', 'MANUAL_CREDIT', 'PAYMENT_CASH', 'PAYMENT_UPI'], required: true },
+  amount: { type: Number, required: true },
+  balanceBefore: { type: Number, default: 0 },
+  balanceAfter: { type: Number, default: 0 },
+  orderId: { type: mongoose.Schema.Types.ObjectId, ref: 'Order', default: null },
+  paymentMode: { type: String, enum: ['CASH', 'UPI', 'KHATA', 'NONE'], default: 'NONE' },
+  verificationStatus: { type: String, enum: ['Confirmed', 'PendingVerification', 'Rejected'], default: 'Confirmed' },
+  utrOrRef: { type: String, default: '' },
+  note: { type: String, default: '' },
+  createdBy: { type: String, enum: ['shop', 'user'], default: 'shop' },
+  createdAt: { type: Date, default: Date.now },
+});
+khataTransactionSchema.index({ khataAccountId: 1, createdAt: -1 });
+khataTransactionSchema.index({ shopId: 1, verificationStatus: 1, createdAt: -1 });
+const KhataTransaction = mongoose.model("KhataTransaction", khataTransactionSchema);
 
 // 💬 In-App WhatsApp-Style "Shop Chat & Quick Replacement" Message Schema
 const orderMessageSchema = new mongoose.Schema({
@@ -2267,7 +2322,7 @@ app.get("/orders/shop/:shopId", requireShop, async (req, res) => {
     const orders = await Order.find({ shopId: req.params.shopId })
       .populate('userId', 'name phone')
       // re-populate shopId so frontend code that reads order.shopId.name still works
-      .populate('shopId', 'name phone pincode')
+      .populate('shopId', 'name phone pincode fullAddress upiId gst')
       .sort({ createdAt: -1 })
       .limit(limit);
     res.json(orders);
@@ -2287,7 +2342,7 @@ app.get("/orders/user/:userId", requireUser, async (req, res) => {
     // Populate just the shop fields the OrdersPage card needs — keeps the
     // payload small while still letting the customer see who they ordered from.
     const orders = await Order.find({ userId: req.params.userId })
-      .populate('shopId', 'name phone')
+      .populate('shopId', 'name phone pincode fullAddress upiId shopImage gst')
       .sort({ createdAt: -1 })
       .limit(50)
       .lean();
@@ -3926,8 +3981,13 @@ app.post("/users/:id/phone", requireUser, async (req, res) => {
       mergedCoins = Number(owner.coins) || 0;
       mergedPrimaryShop = owner.primaryShop || null;
       await Order.updateMany({ userId: owner._id }, { $set: { userId: req.user._id } });
+      await KhataAccount.updateMany({ userId: owner._id }, { $set: { userId: req.user._id } });
+      await KhataTransaction.updateMany({ userId: owner._id }, { $set: { userId: req.user._id } });
       await User.deleteOne({ _id: owner._id });
     }
+    // Also attach any Khata ledger rows recorded against this phone before signup
+    await KhataAccount.updateMany({ customerPhone: phone, userId: null }, { $set: { userId: req.user._id } });
+    await KhataTransaction.updateMany({ customerPhone: phone, userId: null }, { $set: { userId: req.user._id } });
 
     const providers = new Set(req.user.authProviders || []);
     providers.add("phone-unverified");
@@ -4527,8 +4587,11 @@ app.post("/shops/:shopId/barcode-link", requireShop, async (req, res) => {
 });
 
 // ============================================================================
-// ⚡ FAST COUNTER POS BILLING + OFFLINE-TO-ONLINE CUSTOMER CONVERSION ENGINE
+// ⚡ FAST COUNTER POS BILLING + STORE KHATA LEDGER ENGINE
 // ============================================================================
+
+const round2 = (n) => Math.round((Number(n) || 0) * 100) / 100;
+const cleanIndianPhone = (raw) => String(raw || "").replace(/^\+?91/, "").replace(/\D/g, "");
 
 const generateUniqueReferralCode = async (rawName) => {
   const base = String(rawName || "PACK").replace(/[^a-zA-Z]/g, '').substring(0, 4).toUpperCase() || "PACK";
@@ -4540,16 +4603,169 @@ const generateUniqueReferralCode = async (rawName) => {
   return `PIO${Date.now().toString(36).toUpperCase().slice(-6)}`;
 };
 
-// 1. Instant Walk-in Customer Lookup by Phone (10-digit Indian mobile)
+// FIFO settlement of oldest Unpaid / PartiallyPaid KHATA orders when a customer pays towards their Khata
+const settleKhataOrdersFIFO = async (shopId, cleanPhone, userId, paymentAmount) => {
+  let remainingPool = round2(paymentAmount);
+  if (remainingPool <= 0) return;
+
+  const orClauses = [];
+  if (cleanPhone) orClauses.push({ customerPhone: cleanPhone });
+  if (userId && mongoose.isValidObjectId(userId)) orClauses.push({ userId });
+  if (orClauses.length === 0) return;
+
+  const openOrders = await Order.find({
+    shopId,
+    paymentMethod: "KHATA",
+    paymentStatus: { $in: ["Unpaid", "PartiallyPaid"] },
+    $or: orClauses,
+  }).sort({ createdAt: 1 });
+
+  for (const order of openOrders) {
+    if (remainingPool <= 0.009) break;
+    if (/cancel|reject/i.test(order.status || "")) continue;
+
+    const principal = Number(order.khataAmount) > 0
+      ? round2(order.khataAmount)
+      : round2(Math.max(0, Number(order.totalAmount || 0) - Number(order.paidAmount || 0)));
+    const settledSoFar = round2(order.khataSettledAmount || 0);
+    const stillOwed = Math.max(0, round2(principal - settledSoFar));
+
+    if (stillOwed <= 0.009) {
+      order.paymentStatus = "Paid";
+      await order.save();
+      continue;
+    }
+
+    const alloc = Math.min(remainingPool, stillOwed);
+    order.khataAmount = principal;
+    order.khataSettledAmount = round2(settledSoFar + alloc);
+    remainingPool = Math.max(0, round2(remainingPool - alloc));
+
+    if (order.khataSettledAmount >= principal - 0.01) {
+      order.khataSettledAmount = principal;
+      order.paymentStatus = "Paid";
+    } else if (Number(order.paidAmount || 0) > 0 || order.khataSettledAmount > 0) {
+      order.paymentStatus = "PartiallyPaid";
+    }
+    await order.save();
+  }
+};
+
+// Idempotently backfill pre-existing KHATA POS orders created before KhataAccount existed
+const syncLegacyKhataOrdersForShop = async (shopId) => {
+  try {
+    const unsynced = await Order.find({
+      shopId,
+      paymentMethod: "KHATA",
+      "khataSnapshot.synced": { $ne: true },
+    })
+      .sort({ createdAt: 1 })
+      .populate("userId", "name phone");
+
+    if (!unsynced.length) return;
+
+    for (const order of unsynced) {
+      const shortId = String(order._id).slice(-5).toUpperCase();
+      if (/cancel|reject/i.test(order.status || "")) {
+        await Order.updateOne({ _id: order._id }, { $set: { "khataSnapshot.synced": true } });
+        continue;
+      }
+
+      const phone = cleanIndianPhone(order.customerPhone || order.userId?.phone);
+      if (!validatePhone(phone)) {
+        await Order.updateOne({ _id: order._id }, { $set: { "khataSnapshot.synced": true } });
+        continue;
+      }
+
+      const alreadyTx = await KhataTransaction.exists({ orderId: order._id });
+      const principal = round2(Number(order.khataAmount) > 0 ? order.khataAmount : order.totalAmount);
+      const isAlreadyPaid = order.paymentStatus === "Paid";
+      const custName = (order.customerName && order.customerName !== "Walk-in Customer")
+        ? order.customerName
+        : (order.userId?.name || "Customer");
+
+      let acc = await KhataAccount.findOne({ shopId, customerPhone: phone });
+      if (!acc) {
+        acc = await KhataAccount.create({
+          shopId,
+          userId: order.userId?._id || order.userId || null,
+          customerPhone: phone,
+          customerName: custName,
+          currentBalance: 0,
+          totalCreditGiven: 0,
+          totalSettled: 0,
+          lastTransactionAt: order.createdAt || new Date(),
+        });
+      }
+
+      const prevDue = round2(acc.currentBalance);
+      const isFirst = Number(acc.totalCreditGiven || 0) === 0;
+      const addedDue = isAlreadyPaid ? 0 : principal;
+      const newDue = round2(prevDue + addedDue);
+
+      if (!alreadyTx && principal > 0) {
+        if (!isAlreadyPaid) {
+          await KhataTransaction.create({
+            khataAccountId: acc._id,
+            shopId,
+            userId: acc.userId || order.userId?._id || null,
+            customerPhone: phone,
+            type: "CREDIT_BILL",
+            amount: principal,
+            balanceBefore: prevDue,
+            balanceAfter: newDue,
+            orderId: order._id,
+            paymentMode: "KHATA",
+            verificationStatus: "Confirmed",
+            note: `Counter Bill #${shortId}`,
+            createdBy: "shop",
+            createdAt: order.createdAt || new Date(),
+          });
+          acc.currentBalance = newDue;
+          acc.totalCreditGiven = round2(acc.totalCreditGiven + principal);
+        } else {
+          // Was already marked paid historically — keep settled history accurate
+          acc.totalCreditGiven = round2(acc.totalCreditGiven + principal);
+          acc.totalSettled = round2(acc.totalSettled + principal);
+        }
+        if (!acc.userId && order.userId?._id) acc.userId = order.userId._id;
+        if (custName && (!acc.customerName || acc.customerName === "Customer" || acc.customerName === "Valued Customer")) {
+          acc.customerName = custName;
+        }
+        acc.lastTransactionAt = order.createdAt || new Date();
+        await acc.save();
+      }
+
+      order.khataAmount = principal;
+      order.khataSettledAmount = isAlreadyPaid ? principal : 0;
+      order.khataSnapshot = {
+        synced: true,
+        isFirstKhata: isFirst,
+        previousDue: prevDue,
+        paidNow: Number(order.paidAmount || 0),
+        paidVia: order.paidVia || "NONE",
+        addedDue: principal,
+        newTotalDue: round2(prevDue + principal),
+      };
+      await order.save();
+    }
+  } catch (err) {
+    console.error("syncLegacyKhataOrdersForShop error:", err.message);
+  }
+};
+
+// 1. Instant Walk-in Customer Lookup by Phone (10-digit Indian mobile) + Live Khata Status
 app.get("/shops/:shopId/pos-customer/:phone", requireShop, async (req, res) => {
   try {
     if (req.shop._id.toString() !== req.params.shopId) {
       return res.status(403).json({ error: "Not your shop" });
     }
-    const cleanPhone = String(req.params.phone || "").replace(/^\+?91/, "").replace(/\D/g, "");
+    const cleanPhone = cleanIndianPhone(req.params.phone);
     if (!validatePhone(cleanPhone)) {
       return res.status(400).json({ error: "Valid 10-digit mobile number required" });
     }
+
+    await syncLegacyKhataOrdersForShop(req.params.shopId);
 
     const user = await User.findOne({ phone: cleanPhone })
       .select("_id name phone coins primaryShop pincode")
@@ -4563,11 +4779,22 @@ app.get("/shops/:shopId/pos-customer/:phone", requireShop, async (req, res) => {
       ],
     };
 
-    const pastOrders = await Order.find(orderFilter)
-      .select("totalAmount createdAt status orderSource")
-      .sort({ createdAt: -1 })
-      .limit(50)
-      .lean();
+    const [pastOrders, khataAcc] = await Promise.all([
+      Order.find(orderFilter)
+        .select("totalAmount createdAt status orderSource")
+        .sort({ createdAt: -1 })
+        .limit(50)
+        .lean(),
+      KhataAccount.findOne({ shopId: req.params.shopId, customerPhone: cleanPhone }).lean(),
+    ]);
+
+    let pendingVerificationCount = 0;
+    if (khataAcc) {
+      pendingVerificationCount = await KhataTransaction.countDocuments({
+        khataAccountId: khataAcc._id,
+        verificationStatus: "PendingVerification",
+      });
+    }
 
     const validOrders = pastOrders.filter(o => !/cancel|reject/i.test(o.status || ""));
     const totalSpentAtShop = validOrders.reduce((sum, o) => sum + (Number(o.totalAmount) || 0), 0);
@@ -4583,15 +4810,38 @@ app.get("/shops/:shopId/pos-customer/:phone", requireShop, async (req, res) => {
         primaryShop: user.primaryShop || null,
       } : null,
       pastOrdersCount: validOrders.length,
-      totalSpentAtShop: Math.round(totalSpentAtShop * 100) / 100,
+      totalSpentAtShop: round2(totalSpentAtShop),
       lastVisitAt,
+      khata: khataAcc ? {
+        hasAccount: true,
+        accountId: khataAcc._id,
+        customerName: khataAcc.customerName || user?.name || "",
+        currentBalance: round2(khataAcc.currentBalance),
+        totalCreditGiven: round2(khataAcc.totalCreditGiven),
+        totalSettled: round2(khataAcc.totalSettled),
+        creditLimit: round2(khataAcc.creditLimit),
+        isFirstTimeKhata: round2(khataAcc.totalCreditGiven) === 0,
+        pendingVerificationCount,
+        lastTransactionAt: khataAcc.lastTransactionAt,
+      } : {
+        hasAccount: false,
+        accountId: null,
+        customerName: user?.name || "",
+        currentBalance: 0,
+        totalCreditGiven: 0,
+        totalSettled: 0,
+        creditLimit: 0,
+        isFirstTimeKhata: true,
+        pendingVerificationCount: 0,
+        lastTransactionAt: null,
+      },
     });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
-// 2. Create Walk-in Counter POS Bill + Auto-Convert Offline Customer to Online User
+// 2. Create Walk-in Counter POS Bill (Cash / UPI / Full or Split Khata) + Customer Converter
 app.post("/shops/:shopId/pos-bills", requireShop, async (req, res) => {
   try {
     if (req.shop._id.toString() !== req.params.shopId) {
@@ -4607,9 +4857,9 @@ app.post("/shops/:shopId/pos-bills", requireShop, async (req, res) => {
     }
 
     const rawMethod = String(req.body?.paymentMethod || "CASH").toUpperCase();
-    const paymentMethod = ["CASH", "UPI", "KHATA"].includes(rawMethod) ? rawMethod : "CASH";
+    const requestedMethod = ["CASH", "UPI", "KHATA"].includes(rawMethod) ? rawMethod : "CASH";
 
-    const rawPhone = String(req.body?.customerPhone || "").replace(/^\+?91/, "").replace(/\D/g, "");
+    const rawPhone = cleanIndianPhone(req.body?.customerPhone);
     const hasValidPhone = validatePhone(rawPhone);
     const cleanPhone = hasValidPhone ? rawPhone : "";
     const cleanName = String(req.body?.customerName || "").trim().slice(0, 80);
@@ -4622,12 +4872,12 @@ app.post("/shops/:shopId/pos-bills", requireShop, async (req, res) => {
       if (!line) continue;
       const rawQty = Number(line.qty);
       const qty = Number.isFinite(rawQty) && rawQty > 0 ? Math.max(0.01, Math.min(9999, Math.round(rawQty * 1000) / 1000)) : 1;
-      const unitPrice = Math.max(0, Math.round((Number(line.price ?? line.sellingPrice ?? line.mrp ?? 0)) * 100) / 100);
-      const unitMrp = Math.max(unitPrice, Math.round((Number(line.mrp ?? unitPrice)) * 100) / 100);
+      const unitPrice = Math.max(0, round2(Number(line.price ?? line.sellingPrice ?? line.mrp ?? 0)));
+      const unitMrp = Math.max(unitPrice, round2(Number(line.mrp ?? unitPrice)));
       const pid = line.productId && mongoose.isValidObjectId(line.productId) ? String(line.productId) : null;
 
-      mrpTotal += Math.round(unitMrp * qty * 100) / 100;
-      itemSubtotal += Math.round(unitPrice * qty * 100) / 100;
+      mrpTotal += round2(unitMrp * qty);
+      itemSubtotal += round2(unitPrice * qty);
 
       verifiedItems.push({
         productId: pid || `pos_custom_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
@@ -4651,7 +4901,7 @@ app.post("/shops/:shopId/pos-bills", requireShop, async (req, res) => {
     const manualDiscount = Math.max(0, Math.min(itemSubtotal, Number(req.body?.discountAmount) || 0));
     const afterManualDiscount = Math.max(0, itemSubtotal - manualDiscount);
 
-    // Offline-to-Online Customer Account Resolution & Loyalty Coins
+    // Offline-to-Online Customer Lookup & Loyalty Coins Preview
     let customerUser = null;
     let convertedToOnlineUser = false;
     let actualCoinsUsed = 0;
@@ -4669,9 +4919,60 @@ app.post("/shops/:shopId/pos-bills", requireShop, async (req, res) => {
       }
     }
 
-    const finalTotal = Math.max(0, Math.round((afterManualDiscount - coinDiscount) * 100) / 100);
-    const totalDiscount = Math.round((manualDiscount + coinDiscount) * 100) / 100;
-    const totalSavings = Math.max(0, Math.round((mrpTotal - finalTotal) * 100) / 100);
+    const finalTotal = Math.max(0, round2(afterManualDiscount - coinDiscount));
+    const totalDiscount = round2(manualDiscount + coinDiscount);
+    const totalSavings = Math.max(0, round2(mrpTotal - finalTotal));
+
+    // Sync any legacy Khata bills first so previousDue & isFirstKhata are 100% accurate
+    if (cleanPhone) {
+      await syncLegacyKhataOrdersForShop(req.params.shopId);
+    }
+
+    // Resolve Split vs Full Khata payment amounts BEFORE mutating anything
+    const rawPaidNow = Math.max(0, round2(Number(req.body?.paidNowAmount) || 0));
+    const rawPaidVia = String(req.body?.paidNowVia || "CASH").toUpperCase();
+    const paidNowViaClean = ["CASH", "UPI"].includes(rawPaidVia) ? rawPaidVia : "CASH";
+
+    let paymentMethod = requestedMethod;
+    let paidAmount = finalTotal;
+    let paidVia = paymentMethod === "UPI" ? "UPI" : "CASH";
+    let khataAmount = 0;
+
+    if (requestedMethod === "KHATA") {
+      if (finalTotal <= 0) {
+        paymentMethod = "CASH";
+        paidAmount = 0;
+        paidVia = "CASH";
+        khataAmount = 0;
+      } else if (rawPaidNow >= finalTotal) {
+        // Paid 100% or more upfront -> record as full paid bill under Cash/UPI
+        paymentMethod = paidNowViaClean;
+        paidAmount = finalTotal;
+        paidVia = paidNowViaClean;
+        khataAmount = 0;
+      } else {
+        khataAmount = round2(finalTotal - rawPaidNow);
+        paidAmount = rawPaidNow;
+        paidVia = rawPaidNow > 0 ? paidNowViaClean : "NONE";
+
+        if (!cleanPhone) {
+          return res.status(400).json({ error: "Customer's 10-digit mobile number is required to record Khata Due." });
+        }
+        const knownName = cleanName || (customerUser?.name && !["Valued Customer", "Customer", "Walk-in Customer"].includes(customerUser.name) ? customerUser.name : "");
+        if (!knownName) {
+          return res.status(400).json({ error: "Customer name is required to open/update Store Khata." });
+        }
+      }
+    }
+
+    // Look up existing KhataAccount (even for CASH/UPI bills so receipt reminds of pending Khata!)
+    const existingKhataAcc = cleanPhone
+      ? await KhataAccount.findOne({ shopId: req.shop._id, customerPhone: cleanPhone })
+      : null;
+
+    const previousDue = existingKhataAcc ? round2(existingKhataAcc.currentBalance) : 0;
+    const isFirstKhata = khataAmount > 0 && (!existingKhataAcc || round2(existingKhataAcc.totalCreditGiven) === 0);
+    const newTotalDue = round2(previousDue + khataAmount);
 
     if (cleanPhone) {
       const baseEarned = finalTotal >= 20 ? Math.max(2, Math.floor(finalTotal / 20)) : 1;
@@ -4734,6 +5035,10 @@ app.post("/shops/:shopId/pos-bills", requireShop, async (req, res) => {
     }
 
     const now = new Date();
+    const orderPaymentStatus = khataAmount === 0
+      ? "Paid"
+      : (paidAmount > 0 ? "PartiallyPaid" : "Unpaid");
+
     const posOrder = await Order.create({
       orderSource: "POS",
       userId: customerUser ? customerUser._id : null,
@@ -4741,7 +5046,7 @@ app.post("/shops/:shopId/pos-bills", requireShop, async (req, res) => {
       customerName: customerUser?.name || cleanName || "Walk-in Customer",
       customerPhone: cleanPhone,
       items: verifiedItems,
-      mrpTotal: Math.round(mrpTotal * 100) / 100,
+      mrpTotal: round2(mrpTotal),
       discountAmount: totalDiscount,
       savingsAmount: totalSavings,
       totalAmount: finalTotal,
@@ -4750,7 +5055,20 @@ app.post("/shops/:shopId/pos-bills", requireShop, async (req, res) => {
       coinsAwarded: true,
       convertedToOnlineUser,
       paymentMethod,
-      paymentStatus: paymentMethod === "KHATA" ? "Unpaid" : "Paid",
+      paymentStatus: orderPaymentStatus,
+      paidAmount,
+      paidVia,
+      khataAmount,
+      khataSettledAmount: 0,
+      khataSnapshot: {
+        synced: true,
+        isFirstKhata,
+        previousDue,
+        paidNow: paidAmount,
+        paidVia,
+        addedDue: khataAmount,
+        newTotalDue,
+      },
       status: "Picked Up ✅",
       statusHistory: [
         { status: "Counter POS Bill ⚡", at: now },
@@ -4758,6 +5076,79 @@ app.post("/shops/:shopId/pos-bills", requireShop, async (req, res) => {
       ],
       createdAt: now,
     });
+
+    // Update Store Khata Ledger if khataAmount > 0
+    let khataAccountDoc = existingKhataAcc;
+    if (khataAmount > 0 && cleanPhone) {
+      const displayCustName = cleanName || customerUser?.name || existingKhataAcc?.customerName || "Customer";
+      if (!khataAccountDoc) {
+        khataAccountDoc = await KhataAccount.create({
+          shopId: req.shop._id,
+          userId: customerUser?._id || null,
+          customerPhone: cleanPhone,
+          customerName: displayCustName,
+          currentBalance: newTotalDue,
+          totalCreditGiven: khataAmount,
+          totalSettled: 0,
+          lastTransactionAt: now,
+        });
+      } else {
+        khataAccountDoc.userId = khataAccountDoc.userId || customerUser?._id || null;
+        if (displayCustName && displayCustName !== "Valued Customer") {
+          khataAccountDoc.customerName = displayCustName;
+        }
+        khataAccountDoc.currentBalance = newTotalDue;
+        khataAccountDoc.totalCreditGiven = round2(khataAccountDoc.totalCreditGiven + khataAmount);
+        khataAccountDoc.lastTransactionAt = now;
+        await khataAccountDoc.save();
+      }
+
+      const shortId = String(posOrder._id).slice(-5).toUpperCase();
+      const txNote = paidAmount > 0
+        ? `Counter Bill #${shortId} (Bill ₹${finalTotal} • Paid ₹${paidAmount} ${paidVia})`
+        : `Counter Bill #${shortId}`;
+
+      await KhataTransaction.create({
+        khataAccountId: khataAccountDoc._id,
+        shopId: req.shop._id,
+        userId: customerUser?._id || khataAccountDoc.userId || null,
+        customerPhone: cleanPhone,
+        type: "CREDIT_BILL",
+        amount: khataAmount,
+        balanceBefore: previousDue,
+        balanceAfter: newTotalDue,
+        orderId: posOrder._id,
+        paymentMode: "KHATA",
+        verificationStatus: "Confirmed",
+        note: txNote,
+        createdBy: "shop",
+        createdAt: now,
+      });
+
+      notifyShopSSE(String(req.shop._id), "refresh_khata");
+      if (customerUser?._id) {
+        const title = isFirstKhata
+          ? `📒 Khata Opened at ${req.shop.name}`
+          : `📒 +₹${khataAmount} Added to Khata`;
+        const msg = isFirstKhata
+          ? `Welcome! Bill #${shortId} (₹${khataAmount} due) recorded as your first Khata entry at ${req.shop.name}. Total Due: ₹${newTotalDue}.`
+          : `Bill #${shortId} added ₹${khataAmount} to your ${req.shop.name} Khata. Total Pending Due: ₹${newTotalDue}.`;
+        try {
+          await Notification.create({
+            userId: customerUser._id,
+            orderId: posOrder._id,
+            type: "khata",
+            title,
+            message: msg,
+          });
+          await sendPushNotification(customerUser._id, title, msg);
+        } catch (nErr) {
+          console.log("Khata user push skipped:", nErr.message);
+        }
+        notifyUserSSE(String(customerUser._id), "refresh_khata");
+        notifyUserSSE(String(customerUser._id), "refresh_orders");
+      }
+    }
 
     notifyShopSSE(String(req.shop._id), "refresh_orders");
 
@@ -4780,6 +5171,7 @@ app.post("/shops/:shopId/pos-bills", requireShop, async (req, res) => {
       } : null,
       convertedToOnlineUser,
       coinsEarned: earnedCoins,
+      khataAccount: khataAccountDoc || null,
       shop: updatedShop,
     });
   } catch (err) {
@@ -4803,6 +5195,16 @@ app.get("/public/bill/:orderId", async (req, res) => {
       return res.status(404).json({ error: "Bill not found." });
     }
 
+    const custPhone = cleanIndianPhone(order.userId?.phone || order.customerPhone);
+    let currentLiveKhataDue = null;
+    if (validatePhone(custPhone) && order.shopId?._id) {
+      const liveAcc = await KhataAccount.findOne({
+        shopId: order.shopId._id,
+        customerPhone: custPhone,
+      }).select("currentBalance").lean();
+      if (liveAcc) currentLiveKhataDue = round2(liveAcc.currentBalance);
+    }
+
     res.json({
       _id: order._id,
       shortId: String(order._id).slice(-5).toUpperCase(),
@@ -4810,20 +5212,699 @@ app.get("/public/bill/:orderId", async (req, res) => {
       status: order.status,
       paymentMethod: order.paymentMethod,
       paymentStatus: order.paymentStatus,
+      paidAmount: round2(order.paidAmount),
+      paidVia: order.paidVia || "NONE",
+      khataAmount: round2(order.khataAmount),
+      khataSettledAmount: round2(order.khataSettledAmount),
+      khataSnapshot: order.khataSnapshot || null,
+      currentLiveKhataDue,
       customerName: order.userId?.name || order.customerName || "Valued Customer",
       customerPhone: order.userId?.phone || order.customerPhone || "",
       customerCoinsBalance: Number(order.userId?.coins || 0),
       items: order.items || [],
-      mrpTotal: Number(order.mrpTotal || 0),
-      discountAmount: Number(order.discountAmount || 0),
-      savingsAmount: Number(order.savingsAmount || 0),
-      totalAmount: Number(order.totalAmount || 0),
+      mrpTotal: round2(order.mrpTotal),
+      discountAmount: round2(order.discountAmount),
+      savingsAmount: round2(order.savingsAmount),
+      totalAmount: round2(order.totalAmount),
       coinsUsed: Number(order.coinsUsed || 0),
       coinsEarned: Number(order.coinsEarned || 0),
       convertedToOnlineUser: Boolean(order.convertedToOnlineUser),
       createdAt: order.createdAt,
       shop: order.shopId || null,
     });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ============================================================================
+// 📒 STORE KHATA BOOK (UDHAAR / CREDIT LEDGER) ROUTES — SHOPKEEPER + CUSTOMER
+// ============================================================================
+
+// Shopkeeper: List all Khata accounts, summary KPIs & pending UPI verifications
+app.get("/shops/:shopId/khata", requireShop, async (req, res) => {
+  try {
+    if (req.shop._id.toString() !== req.params.shopId) {
+      return res.status(403).json({ error: "Not your shop" });
+    }
+
+    await syncLegacyKhataOrdersForShop(req.params.shopId);
+
+    const startOfToday = new Date();
+    startOfToday.setHours(0, 0, 0, 0);
+
+    const [accounts, pendingApprovals, todayTxns] = await Promise.all([
+      KhataAccount.find({ shopId: req.params.shopId })
+        .populate("userId", "name phone coins")
+        .sort({ currentBalance: -1, lastTransactionAt: -1 })
+        .lean(),
+      KhataTransaction.find({
+        shopId: req.params.shopId,
+        verificationStatus: "PendingVerification",
+      })
+        .populate("khataAccountId", "customerName customerPhone currentBalance")
+        .sort({ createdAt: -1 })
+        .lean(),
+      KhataTransaction.find({
+        shopId: req.params.shopId,
+        verificationStatus: "Confirmed",
+        createdAt: { $gte: startOfToday },
+      }).lean(),
+    ]);
+
+    const pendingCountMap = new Map();
+    for (const tx of pendingApprovals) {
+      const aid = String(tx.khataAccountId?._id || tx.khataAccountId || "");
+      if (aid) pendingCountMap.set(aid, (pendingCountMap.get(aid) || 0) + 1);
+    }
+
+    let totalReceivable = 0;
+    let activeCustomersCount = 0;
+    let settledCustomersCount = 0;
+    let overLimitCount = 0;
+
+    const enrichedAccounts = accounts.map(acc => {
+      const bal = round2(acc.currentBalance);
+      const limit = round2(acc.creditLimit);
+      if (bal > 0) {
+        totalReceivable += bal;
+        activeCustomersCount += 1;
+      } else {
+        settledCustomersCount += 1;
+      }
+      if (limit > 0 && bal > limit) overLimitCount += 1;
+      return {
+        ...acc,
+        currentBalance: bal,
+        totalCreditGiven: round2(acc.totalCreditGiven),
+        totalSettled: round2(acc.totalSettled),
+        creditLimit: limit,
+        pendingVerificationCount: pendingCountMap.get(String(acc._id)) || 0,
+      };
+    });
+
+    // Sort: pending UPI approvals first, then highest balance, then latest activity
+    enrichedAccounts.sort((a, b) => {
+      if ((b.pendingVerificationCount || 0) !== (a.pendingVerificationCount || 0)) {
+        return (b.pendingVerificationCount || 0) - (a.pendingVerificationCount || 0);
+      }
+      if ((a.currentBalance > 0) !== (b.currentBalance > 0)) {
+        return b.currentBalance > 0 ? 1 : -1;
+      }
+      return new Date(b.lastTransactionAt || b.updatedAt) - new Date(a.lastTransactionAt || a.updatedAt);
+    });
+
+    let todayCreditGiven = 0;
+    let todayCashCollected = 0;
+    let todayUpiCollected = 0;
+    for (const tx of todayTxns) {
+      const amt = round2(tx.amount);
+      if (tx.type === "CREDIT_BILL" || tx.type === "MANUAL_CREDIT") todayCreditGiven += amt;
+      else if (tx.type === "PAYMENT_CASH") todayCashCollected += amt;
+      else if (tx.type === "PAYMENT_UPI") todayUpiCollected += amt;
+    }
+
+    const formattedPending = pendingApprovals.map(tx => ({
+      _id: tx._id,
+      accountId: tx.khataAccountId?._id || tx.khataAccountId,
+      customerName: tx.khataAccountId?.customerName || "Customer",
+      customerPhone: tx.khataAccountId?.customerPhone || tx.customerPhone,
+      currentBalance: round2(tx.khataAccountId?.currentBalance || 0),
+      amount: round2(tx.amount),
+      utrOrRef: tx.utrOrRef || "",
+      note: tx.note || "",
+      createdAt: tx.createdAt,
+    }));
+
+    res.json({
+      summary: {
+        totalReceivable: round2(totalReceivable),
+        activeCustomersCount,
+        settledCustomersCount,
+        totalCustomersCount: enrichedAccounts.length,
+        overLimitCount,
+        pendingVerificationCount: formattedPending.length,
+        todayCreditGiven: round2(todayCreditGiven),
+        todayCollected: round2(todayCashCollected + todayUpiCollected),
+        todayCashCollected: round2(todayCashCollected),
+        todayUpiCollected: round2(todayUpiCollected),
+      },
+      pendingApprovals: formattedPending,
+      accounts: enrichedAccounts,
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Shopkeeper: Full Khata passbook for one customer
+app.get("/shops/:shopId/khata/:accountId", requireShop, async (req, res) => {
+  try {
+    if (req.shop._id.toString() !== req.params.shopId) {
+      return res.status(403).json({ error: "Not your shop" });
+    }
+    if (!mongoose.isValidObjectId(req.params.accountId)) {
+      return res.status(400).json({ error: "Invalid Khata account ID" });
+    }
+    const account = await KhataAccount.findOne({
+      _id: req.params.accountId,
+      shopId: req.params.shopId,
+    }).populate("userId", "name phone coins").lean();
+
+    if (!account) return res.status(404).json({ error: "Khata account not found" });
+
+    const transactions = await KhataTransaction.find({
+      khataAccountId: account._id,
+      shopId: req.params.shopId,
+    })
+      .populate("orderId", "_id items totalAmount paidAmount paidVia khataAmount khataSettledAmount paymentStatus khataSnapshot orderSource createdAt customerName customerPhone")
+      .sort({ createdAt: -1 })
+      .limit(120)
+      .lean();
+
+    res.json({ account, transactions });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Shopkeeper: Collect / record a Cash or UPI Khata payment ("Jama")
+app.post("/shops/:shopId/khata/record-payment", requireShop, async (req, res) => {
+  try {
+    if (req.shop._id.toString() !== req.params.shopId) {
+      return res.status(403).json({ error: "Not your shop" });
+    }
+
+    const { accountId, phone, amount, mode = "CASH", note = "" } = req.body || {};
+    const payAmt = round2(Number(amount));
+    if (!Number.isFinite(payAmt) || payAmt <= 0) {
+      return res.status(400).json({ error: "Enter a valid payment amount greater than ₹0." });
+    }
+    const payMode = String(mode).toUpperCase() === "UPI" ? "UPI" : "CASH";
+
+    let account = null;
+    if (accountId && mongoose.isValidObjectId(accountId)) {
+      account = await KhataAccount.findOne({ _id: accountId, shopId: req.shop._id });
+    } else if (phone) {
+      const cp = cleanIndianPhone(phone);
+      if (validatePhone(cp)) {
+        account = await KhataAccount.findOne({ shopId: req.shop._id, customerPhone: cp });
+      }
+    }
+
+    if (!account) return res.status(404).json({ error: "Khata account not found." });
+
+    const prevBal = round2(account.currentBalance);
+    if (prevBal <= 0) {
+      return res.status(400).json({ error: "This customer's Khata balance is already ₹0 (All Clear)." });
+    }
+    if (payAmt > prevBal + 0.01) {
+      return res.status(400).json({ error: `Payment (₹${payAmt}) exceeds pending Khata balance (₹${prevBal}).` });
+    }
+
+    const effectivePay = Math.min(prevBal, payAmt);
+    const newBal = Math.max(0, round2(prevBal - effectivePay));
+    const now = new Date();
+
+    account.currentBalance = newBal;
+    account.totalSettled = round2(account.totalSettled + effectivePay);
+    account.lastTransactionAt = now;
+    await account.save();
+
+    const tx = await KhataTransaction.create({
+      khataAccountId: account._id,
+      shopId: req.shop._id,
+      userId: account.userId || null,
+      customerPhone: account.customerPhone,
+      type: payMode === "UPI" ? "PAYMENT_UPI" : "PAYMENT_CASH",
+      amount: effectivePay,
+      balanceBefore: prevBal,
+      balanceAfter: newBal,
+      paymentMode: payMode,
+      verificationStatus: "Confirmed",
+      note: String(note || "").trim().slice(0, 160) || `Khata Payment Received (${payMode})`,
+      createdBy: "shop",
+      createdAt: now,
+    });
+
+    await settleKhataOrdersFIFO(req.shop._id, account.customerPhone, account.userId, effectivePay);
+
+    notifyShopSSE(String(req.shop._id), "refresh_khata");
+    notifyShopSSE(String(req.shop._id), "refresh_orders");
+
+    if (account.userId) {
+      const title = newBal === 0
+        ? `🎉 All Khata Dues Cleared at ${req.shop.name}!`
+        : `✅ Khata Payment of ₹${effectivePay} Received`;
+      const msg = newBal === 0
+        ? `${req.shop.name} recorded your ₹${effectivePay} ${payMode} payment. Your Khata balance is now ₹0.`
+        : `${req.shop.name} recorded your ₹${effectivePay} ${payMode} payment. Remaining Khata Due: ₹${newBal}.`;
+      try {
+        await Notification.create({
+          userId: account.userId,
+          type: "khata",
+          title,
+          message: msg,
+        });
+        await sendPushNotification(account.userId, title, msg);
+      } catch (e) { console.log("Khata payment push skipped:", e.message); }
+      notifyUserSSE(String(account.userId), "refresh_khata");
+      notifyUserSSE(String(account.userId), "refresh_orders");
+    }
+
+    res.json({ success: true, account, transaction: tx });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Shopkeeper: Add manual credit / opening balance directly from Khata Book
+app.post("/shops/:shopId/khata/manual-credit", requireShop, async (req, res) => {
+  try {
+    if (req.shop._id.toString() !== req.params.shopId) {
+      return res.status(403).json({ error: "Not your shop" });
+    }
+
+    const cleanPhone = cleanIndianPhone(req.body?.phone);
+    const cleanName = String(req.body?.customerName || "").trim().slice(0, 80);
+    const amt = round2(Number(req.body?.amount));
+    const creditLimit = req.body?.creditLimit !== undefined ? Math.max(0, round2(Number(req.body.creditLimit))) : undefined;
+    const note = String(req.body?.note || "").trim().slice(0, 200);
+
+    if (!validatePhone(cleanPhone)) {
+      return res.status(400).json({ error: "Valid 10-digit Indian mobile number required." });
+    }
+    if (!Number.isFinite(amt) || amt <= 0) {
+      return res.status(400).json({ error: "Enter a valid credit amount greater than ₹0." });
+    }
+
+    await syncLegacyKhataOrdersForShop(req.shop._id);
+
+    let customerUser = await User.findOne({ phone: cleanPhone });
+    let account = await KhataAccount.findOne({ shopId: req.shop._id, customerPhone: cleanPhone });
+
+    if (!account && !cleanName && !customerUser?.name) {
+      return res.status(400).json({ error: "Customer name is required to open a new Khata account." });
+    }
+
+    if (!customerUser) {
+      const refCode = await generateUniqueReferralCode(cleanName || "KHAT");
+      customerUser = await User.create({
+        name: cleanName || "Customer",
+        phone: cleanPhone,
+        pincode: req.shop.pincode || "",
+        primaryShop: req.shop._id,
+        authProviders: ["pos-walkin"],
+        referralCode: refCode,
+        coins: 10,
+      });
+    }
+
+    const now = new Date();
+    const prevBal = account ? round2(account.currentBalance) : 0;
+    const isFirstKhata = !account || round2(account.totalCreditGiven) === 0;
+    const newBal = round2(prevBal + amt);
+    const finalName = cleanName || account?.customerName || customerUser?.name || "Customer";
+
+    if (!account) {
+      account = await KhataAccount.create({
+        shopId: req.shop._id,
+        userId: customerUser._id,
+        customerPhone: cleanPhone,
+        customerName: finalName,
+        currentBalance: newBal,
+        totalCreditGiven: amt,
+        totalSettled: 0,
+        creditLimit: creditLimit || 0,
+        lastTransactionAt: now,
+      });
+    } else {
+      account.userId = account.userId || customerUser._id;
+      if (cleanName) account.customerName = cleanName;
+      if (creditLimit !== undefined) account.creditLimit = creditLimit;
+      account.currentBalance = newBal;
+      account.totalCreditGiven = round2(account.totalCreditGiven + amt);
+      account.lastTransactionAt = now;
+      await account.save();
+    }
+
+    const tx = await KhataTransaction.create({
+      khataAccountId: account._id,
+      shopId: req.shop._id,
+      userId: customerUser._id,
+      customerPhone: cleanPhone,
+      type: "MANUAL_CREDIT",
+      amount: amt,
+      balanceBefore: prevBal,
+      balanceAfter: newBal,
+      paymentMode: "KHATA",
+      verificationStatus: "Confirmed",
+      note: note || (isFirstKhata ? "Opening Khata Entry" : "Manual Khata Credit"),
+      createdBy: "shop",
+      createdAt: now,
+    });
+
+    notifyShopSSE(String(req.shop._id), "refresh_khata");
+    const title = isFirstKhata
+      ? `📒 Store Khata Opened at ${req.shop.name}`
+      : `📒 +₹${amt} Added to Store Khata`;
+    const msg = `${req.shop.name} added ₹${amt} (${tx.note}) to your Khata. Total Pending Due: ₹${newBal}.`;
+    try {
+      await Notification.create({ userId: customerUser._id, type: "khata", title, message: msg });
+      await sendPushNotification(customerUser._id, title, msg);
+    } catch (e) { console.log("Manual khata push skipped:", e.message); }
+    notifyUserSSE(String(customerUser._id), "refresh_khata");
+
+    res.json({ success: true, account, transaction: tx });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Shopkeeper: Approve or reject a customer's claimed UPI Khata payment
+app.post("/shops/:shopId/khata/transactions/:txId/verify", requireShop, async (req, res) => {
+  try {
+    if (req.shop._id.toString() !== req.params.shopId) {
+      return res.status(403).json({ error: "Not your shop" });
+    }
+    if (!mongoose.isValidObjectId(req.params.txId)) {
+      return res.status(400).json({ error: "Invalid transaction ID" });
+    }
+
+    const action = String(req.body?.action || "approve").toLowerCase();
+    const tx = await KhataTransaction.findOne({
+      _id: req.params.txId,
+      shopId: req.shop._id,
+    });
+    if (!tx) return res.status(404).json({ error: "Transaction not found" });
+    if (tx.verificationStatus !== "PendingVerification") {
+      return res.status(400).json({ error: `Transaction already ${tx.verificationStatus}` });
+    }
+
+    const account = await KhataAccount.findOne({ _id: tx.khataAccountId, shopId: req.shop._id });
+    if (!account) return res.status(404).json({ error: "Khata account not found" });
+
+    if (action === "approve") {
+      const prevBal = round2(account.currentBalance);
+      const deductAmt = Math.min(prevBal, round2(tx.amount));
+      const newBal = Math.max(0, round2(prevBal - deductAmt));
+
+      account.currentBalance = newBal;
+      account.totalSettled = round2(account.totalSettled + deductAmt);
+      account.lastTransactionAt = new Date();
+      await account.save();
+
+      tx.verificationStatus = "Confirmed";
+      tx.balanceBefore = prevBal;
+      tx.balanceAfter = newBal;
+      await tx.save();
+
+      await settleKhataOrdersFIFO(req.shop._id, account.customerPhone, account.userId, deductAmt);
+
+      notifyShopSSE(String(req.shop._id), "refresh_khata");
+      notifyShopSSE(String(req.shop._id), "refresh_orders");
+
+      if (account.userId) {
+        const title = newBal === 0
+          ? `🎉 Khata Cleared! Payment Confirmed`
+          : `✅ UPI Khata Payment Confirmed`;
+        const msg = `${req.shop.name} confirmed your ₹${deductAmt} UPI payment. Remaining Khata Due: ₹${newBal}.`;
+        try {
+          await Notification.create({ userId: account.userId, type: "khata", title, message: msg });
+          await sendPushNotification(account.userId, title, msg);
+        } catch (e) { console.log("Verify approve push skipped:", e.message); }
+        notifyUserSSE(String(account.userId), "refresh_khata");
+        notifyUserSSE(String(account.userId), "refresh_orders");
+      }
+
+      return res.json({ success: true, account, transaction: tx });
+    }
+
+    // Reject path
+    const reason = String(req.body?.rejectReason || "").trim().slice(0, 120);
+    tx.verificationStatus = "Rejected";
+    if (reason) tx.note = `${tx.note ? `${tx.note} • ` : ""}Rejected: ${reason}`;
+    await tx.save();
+
+    notifyShopSSE(String(req.shop._id), "refresh_khata");
+    if (account.userId) {
+      const title = `⚠️ Khata UPI Payment Not Verified`;
+      const msg = `${req.shop.name} could not verify your ₹${tx.amount} UPI claim${reason ? ` (${reason})` : ""}. Please contact the store.`;
+      try {
+        await Notification.create({ userId: account.userId, type: "khata", title, message: msg });
+        await sendPushNotification(account.userId, title, msg);
+      } catch (e) { console.log("Verify reject push skipped:", e.message); }
+      notifyUserSSE(String(account.userId), "refresh_khata");
+    }
+
+    res.json({ success: true, account, transaction: tx });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Shopkeeper: Update Khata credit limit, customer name, notes, or reminder timestamp
+app.patch("/shops/:shopId/khata/:accountId", requireShop, async (req, res) => {
+  try {
+    if (req.shop._id.toString() !== req.params.shopId) {
+      return res.status(403).json({ error: "Not your shop" });
+    }
+    if (!mongoose.isValidObjectId(req.params.accountId)) {
+      return res.status(400).json({ error: "Invalid Khata account ID" });
+    }
+
+    const updates = {};
+    if (req.body?.creditLimit !== undefined) {
+      updates.creditLimit = Math.max(0, round2(Number(req.body.creditLimit)));
+    }
+    if (req.body?.notes !== undefined) {
+      updates.notes = String(req.body.notes).trim().slice(0, 300);
+    }
+    if (req.body?.customerName !== undefined && String(req.body.customerName).trim()) {
+      updates.customerName = String(req.body.customerName).trim().slice(0, 80);
+    }
+    if (req.body?.markReminderSent) {
+      updates.lastReminderAt = new Date();
+    }
+
+    const account = await KhataAccount.findOneAndUpdate(
+      { _id: req.params.accountId, shopId: req.shop._id },
+      { $set: updates },
+      { new: true }
+    );
+    if (!account) return res.status(404).json({ error: "Khata account not found" });
+
+    notifyShopSSE(String(req.shop._id), "refresh_khata");
+    res.json({ success: true, account });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Customer: Check all Store Khata accounts (only shown in app if hasAnyKhata === true)
+app.get("/users/:userId/khata", requireUser, async (req, res) => {
+  try {
+    if (req.user._id.toString() !== req.params.userId) {
+      return res.status(403).json({ error: "Not your Khata accounts" });
+    }
+
+    const cleanPhone = cleanIndianPhone(req.user.phone);
+    const orFilter = [{ userId: req.user._id }];
+    if (validatePhone(cleanPhone)) orFilter.push({ customerPhone: cleanPhone });
+
+    let accounts = await KhataAccount.find({ $or: orFilter })
+      .populate("shopId", "name phone shopImage fullAddress pincode upiId gst isOpen operatingHours")
+      .sort({ currentBalance: -1, lastTransactionAt: -1 })
+      .lean();
+
+    // If none found yet, backfill any legacy KHATA orders for this user
+    if (accounts.length === 0) {
+      const legacyShopIds = await Order.distinct("shopId", {
+        paymentMethod: "KHATA",
+        "khataSnapshot.synced": { $ne: true },
+        $or: [
+          { userId: req.user._id },
+          ...(validatePhone(cleanPhone) ? [{ customerPhone: cleanPhone }] : []),
+        ],
+      });
+      for (const sid of legacyShopIds) {
+        if (sid) await syncLegacyKhataOrdersForShop(sid);
+      }
+      if (legacyShopIds.length > 0) {
+        accounts = await KhataAccount.find({ $or: orFilter })
+          .populate("shopId", "name phone shopImage fullAddress pincode upiId gst isOpen operatingHours")
+          .sort({ currentBalance: -1, lastTransactionAt: -1 })
+          .lean();
+      }
+    }
+
+    // Bind any phone-matched KhataAccount/Transaction missing userId
+    const unlinkedIds = accounts.filter(a => !a.userId).map(a => a._id);
+    if (unlinkedIds.length > 0) {
+      await KhataAccount.updateMany({ _id: { $in: unlinkedIds } }, { $set: { userId: req.user._id } });
+      await KhataTransaction.updateMany({ khataAccountId: { $in: unlinkedIds }, userId: null }, { $set: { userId: req.user._id } });
+    }
+
+    const accountIds = accounts.map(a => a._id);
+    const pendingTxns = accountIds.length > 0
+      ? await KhataTransaction.find({
+          khataAccountId: { $in: accountIds },
+          verificationStatus: "PendingVerification",
+        }).select("khataAccountId amount").lean()
+      : [];
+
+    const pendingByAccount = new Map();
+    for (const tx of pendingTxns) {
+      const aid = String(tx.khataAccountId);
+      pendingByAccount.set(aid, (pendingByAccount.get(aid) || 0) + 1);
+    }
+
+    let totalPendingAcrossShops = 0;
+    let activeShopsCount = 0;
+    const enriched = accounts.map(a => {
+      const bal = round2(a.currentBalance);
+      if (bal > 0) {
+        totalPendingAcrossShops += bal;
+        activeShopsCount += 1;
+      }
+      return {
+        ...a,
+        currentBalance: bal,
+        totalCreditGiven: round2(a.totalCreditGiven),
+        totalSettled: round2(a.totalSettled),
+        creditLimit: round2(a.creditLimit),
+        pendingVerificationCount: pendingByAccount.get(String(a._id)) || 0,
+      };
+    });
+
+    res.json({
+      hasAnyKhata: enriched.length > 0,
+      totalPendingAcrossShops: round2(totalPendingAcrossShops),
+      activeShopsCount,
+      pendingVerificationCount: pendingTxns.length,
+      accounts: enriched,
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Customer: Full Passbook for one Store Khata account
+app.get("/users/:userId/khata/:accountId", requireUser, async (req, res) => {
+  try {
+    if (req.user._id.toString() !== req.params.userId) {
+      return res.status(403).json({ error: "Not your Khata account" });
+    }
+    if (!mongoose.isValidObjectId(req.params.accountId)) {
+      return res.status(400).json({ error: "Invalid Khata account ID" });
+    }
+
+    const cleanPhone = cleanIndianPhone(req.user.phone);
+    const account = await KhataAccount.findById(req.params.accountId)
+      .populate("shopId", "name phone shopImage fullAddress pincode upiId gst isOpen operatingHours")
+      .lean();
+
+    if (!account) return res.status(404).json({ error: "Khata account not found" });
+
+    const ownsById = account.userId && String(account.userId) === String(req.user._id);
+    const ownsByPhone = validatePhone(cleanPhone) && account.customerPhone === cleanPhone;
+    if (!ownsById && !ownsByPhone) {
+      return res.status(403).json({ error: "Not your Khata account" });
+    }
+
+    const transactions = await KhataTransaction.find({ khataAccountId: account._id })
+      .populate("orderId", "_id items totalAmount paidAmount paidVia khataAmount khataSettledAmount paymentStatus khataSnapshot orderSource createdAt customerName customerPhone")
+      .sort({ createdAt: -1 })
+      .limit(120)
+      .lean();
+
+    res.json({ account, transactions });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Customer: Notify Shopkeeper after paying Khata due via UPI App
+app.post("/users/:userId/khata/:accountId/claim-upi-payment", requireUser, async (req, res) => {
+  try {
+    if (req.user._id.toString() !== req.params.userId) {
+      return res.status(403).json({ error: "Not your Khata account" });
+    }
+    if (!mongoose.isValidObjectId(req.params.accountId)) {
+      return res.status(400).json({ error: "Invalid Khata account ID" });
+    }
+
+    const account = await KhataAccount.findById(req.params.accountId).populate("shopId", "name");
+    if (!account) return res.status(404).json({ error: "Khata account not found" });
+
+    const cleanPhone = cleanIndianPhone(req.user.phone);
+    const ownsById = account.userId && String(account.userId) === String(req.user._id);
+    const ownsByPhone = validatePhone(cleanPhone) && account.customerPhone === cleanPhone;
+    if (!ownsById && !ownsByPhone) {
+      return res.status(403).json({ error: "Not your Khata account" });
+    }
+
+    const currentBal = round2(account.currentBalance);
+    if (currentBal <= 0) {
+      return res.status(400).json({ error: "Your Khata balance is already settled (₹0)." });
+    }
+
+    const payAmt = round2(Number(req.body?.amount));
+    if (!Number.isFinite(payAmt) || payAmt <= 0) {
+      return res.status(400).json({ error: "Enter a valid UPI payment amount." });
+    }
+    if (payAmt > currentBal + 0.01) {
+      return res.status(400).json({ error: `Amount (₹${payAmt}) cannot exceed pending Khata balance (₹${currentBal}).` });
+    }
+
+    const twoMinsAgo = new Date(Date.now() - 2 * 60 * 1000);
+    const dupClaim = await KhataTransaction.findOne({
+      khataAccountId: account._id,
+      verificationStatus: "PendingVerification",
+      amount: payAmt,
+      createdAt: { $gte: twoMinsAgo },
+    });
+    if (dupClaim) {
+      return res.status(409).json({ error: "Your UPI payment alert was already sent and is awaiting shopkeeper confirmation." });
+    }
+
+    const utrOrRef = String(req.body?.utrOrRef || "").trim().slice(0, 60);
+    const note = String(req.body?.note || "Paid via UPI App").trim().slice(0, 160);
+    const shopObjId = account.shopId?._id || account.shopId;
+
+    const tx = await KhataTransaction.create({
+      khataAccountId: account._id,
+      shopId: shopObjId,
+      userId: req.user._id,
+      customerPhone: account.customerPhone,
+      type: "PAYMENT_UPI",
+      amount: payAmt,
+      balanceBefore: currentBal,
+      balanceAfter: currentBal, // balance updates once shopkeeper confirms receipt
+      paymentMode: "UPI",
+      verificationStatus: "PendingVerification",
+      utrOrRef,
+      note: utrOrRef ? `${note} (UTR: ${utrOrRef})` : note,
+      createdBy: "user",
+      createdAt: new Date(),
+    });
+
+    const shopTitle = `💸 Khata UPI Payment Claim: ₹${payAmt}`;
+    const shopMsg = `${req.user.name || account.customerName} (${account.customerPhone}) notified ₹${payAmt} UPI payment towards ₹${currentBal} Khata Due. Tap Khata Book to verify!`;
+    try {
+      await Notification.create({
+        shopId: shopObjId,
+        type: "khata",
+        title: shopTitle,
+        message: shopMsg,
+      });
+      await sendPushNotification(shopObjId, shopTitle, shopMsg);
+    } catch (e) { console.log("Shop khata claim push skipped:", e.message); }
+
+    notifyShopSSE(String(shopObjId), "refresh_khata");
+    notifyUserSSE(String(req.user._id), "refresh_khata");
+
+    res.json({ success: true, transaction: tx });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
