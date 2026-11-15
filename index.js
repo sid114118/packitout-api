@@ -4591,7 +4591,13 @@ app.post("/shops/:shopId/barcode-link", requireShop, async (req, res) => {
 // ============================================================================
 
 const round2 = (n) => Math.round((Number(n) || 0) * 100) / 100;
-const cleanIndianPhone = (raw) => String(raw || "").replace(/^\+?91/, "").replace(/\D/g, "");
+const cleanIndianPhone = (raw) => {
+  if (!raw) return "";
+  let digits = String(raw).replace(/\D/g, "");
+  if (digits.length === 12 && digits.startsWith("91")) digits = digits.slice(2);
+  else if (digits.length === 11 && digits.startsWith("0")) digits = digits.slice(1);
+  return digits.slice(-10);
+};
 
 const generateUniqueReferralCode = async (rawName) => {
   const base = String(rawName || "PACK").replace(/[^a-zA-Z]/g, '').substring(0, 4).toUpperCase() || "PACK";
@@ -4767,7 +4773,12 @@ app.get("/shops/:shopId/pos-customer/:phone", requireShop, async (req, res) => {
 
     await syncLegacyKhataOrdersForShop(req.params.shopId);
 
-    const user = await User.findOne({ phone: cleanPhone })
+    const user = await User.findOne({
+      $or: [
+        { phone: cleanPhone },
+        { "addresses.phone": cleanPhone },
+      ],
+    })
       .select("_id name phone coins primaryShop pincode")
       .lean();
 
@@ -4909,7 +4920,19 @@ app.post("/shops/:shopId/pos-bills", requireShop, async (req, res) => {
     let earnedCoins = 0;
 
     if (cleanPhone) {
-      customerUser = await User.findOne({ phone: cleanPhone });
+      customerUser = await User.findOne({
+        $or: [
+          { phone: cleanPhone },
+          { "addresses.phone": cleanPhone },
+        ],
+      });
+
+      if (customerUser && !customerUser.phone) {
+        try {
+          customerUser.phone = cleanPhone;
+          await User.updateOne({ _id: customerUser._id }, { $set: { phone: cleanPhone } });
+        } catch {}
+      }
 
       if (customerUser && req.body?.redeemCoins && Number(customerUser.coins) > 0) {
         const maxDiscountAllowed = afterManualDiscount * 0.10;
@@ -5701,6 +5724,39 @@ app.patch("/shops/:shopId/khata/:accountId", requireShop, async (req, res) => {
   }
 });
 
+// Helper to collect all verified candidate phone numbers for a user account
+// (from direct user.phone, saved addresses, and past order history)
+const resolveUserCandidatePhones = async (user) => {
+  const candidatePhones = new Set();
+  const directPhone = cleanIndianPhone(user?.phone);
+  if (validatePhone(directPhone)) candidatePhones.add(directPhone);
+
+  if (Array.isArray(user?.addresses)) {
+    for (const a of user.addresses) {
+      const ap = cleanIndianPhone(a?.phone);
+      if (validatePhone(ap)) candidatePhones.add(ap);
+    }
+  }
+
+  if (user?._id) {
+    try {
+      const [orderPhones, deliveryPhones] = await Promise.all([
+        Order.distinct("customerPhone", { userId: user._id }),
+        Order.distinct("deliveryAddress.phone", { userId: user._id }),
+      ]);
+      for (const op of orderPhones) {
+        const cop = cleanIndianPhone(op);
+        if (validatePhone(cop)) candidatePhones.add(cop);
+      }
+      for (const dp of deliveryPhones) {
+        const cdp = cleanIndianPhone(dp);
+        if (validatePhone(cdp)) candidatePhones.add(cdp);
+      }
+    } catch {}
+  }
+  return Array.from(candidatePhones);
+};
+
 // Customer: Check all Store Khata accounts (only shown in app if hasAnyKhata === true)
 app.get("/users/:userId/khata", requireUser, async (req, res) => {
   try {
@@ -5708,23 +5764,67 @@ app.get("/users/:userId/khata", requireUser, async (req, res) => {
       return res.status(403).json({ error: "Not your Khata accounts" });
     }
 
-    const cleanPhone = cleanIndianPhone(req.user.phone);
+    const phoneList = await resolveUserCandidatePhones(req.user);
+
+    // If user document has no phone set yet, auto-attach the best verified candidate phone
+    if (!req.user.phone && phoneList.length > 0) {
+      const bestPhone = phoneList[0];
+      const conflict = await User.findOne({ phone: bestPhone, _id: { $ne: req.user._id } });
+      if (!conflict) {
+        await User.updateOne({ _id: req.user._id }, { $set: { phone: bestPhone } });
+        req.user.phone = bestPhone;
+      }
+    }
+
+    // Auto-merge any walk-in POS stubs created for these phones into this authenticated account
+    if (phoneList.length > 0) {
+      const stubUsers = await User.find({
+        phone: { $in: phoneList },
+        _id: { $ne: req.user._id },
+        authProviders: { $in: ["pos-walkin"] },
+        firebaseUid: null,
+      }).select("_id");
+
+      if (stubUsers.length > 0) {
+        const stubIds = stubUsers.map(s => s._id);
+        await Order.updateMany({ userId: { $in: stubIds } }, { $set: { userId: req.user._id } });
+        await KhataAccount.updateMany({ userId: { $in: stubIds } }, { $set: { userId: req.user._id } });
+        await KhataTransaction.updateMany({ userId: { $in: stubIds } }, { $set: { userId: req.user._id } });
+        await User.deleteMany({ _id: { $in: stubIds } });
+      }
+
+      // Link any KhataAccount or KhataTransaction matching phoneList to req.user._id
+      await KhataAccount.updateMany(
+        { customerPhone: { $in: phoneList }, $or: [{ userId: null }, { userId: { $ne: req.user._id } }] },
+        { $set: { userId: req.user._id } }
+      );
+      await KhataTransaction.updateMany(
+        { customerPhone: { $in: phoneList }, $or: [{ userId: null }, { userId: { $ne: req.user._id } }] },
+        { $set: { userId: req.user._id } }
+      );
+    }
+
     const orFilter = [{ userId: req.user._id }];
-    if (validatePhone(cleanPhone)) orFilter.push({ customerPhone: cleanPhone });
+    if (phoneList.length > 0) {
+      orFilter.push({ customerPhone: { $in: phoneList } });
+    }
 
     let accounts = await KhataAccount.find({ $or: orFilter })
       .populate("shopId", "name phone shopImage fullAddress pincode upiId gst isOpen operatingHours")
       .sort({ currentBalance: -1, lastTransactionAt: -1 })
       .lean();
 
-    // If none found yet, backfill any legacy KHATA orders for this user
+    // If none found yet, backfill any legacy or split KHATA orders for this user
     if (accounts.length === 0) {
       const legacyShopIds = await Order.distinct("shopId", {
-        paymentMethod: "KHATA",
+        $or: [
+          { paymentMethod: "KHATA" },
+          { khataAmount: { $gt: 0 } },
+        ],
         "khataSnapshot.synced": { $ne: true },
         $or: [
           { userId: req.user._id },
-          ...(validatePhone(cleanPhone) ? [{ customerPhone: cleanPhone }] : []),
+          ...(phoneList.length > 0 ? [{ customerPhone: { $in: phoneList } }] : []),
         ],
       });
       for (const sid of legacyShopIds) {
@@ -5739,10 +5839,10 @@ app.get("/users/:userId/khata", requireUser, async (req, res) => {
     }
 
     // Bind any phone-matched KhataAccount/Transaction missing userId
-    const unlinkedIds = accounts.filter(a => !a.userId).map(a => a._id);
+    const unlinkedIds = accounts.filter(a => !a.userId || String(a.userId) !== String(req.user._id)).map(a => a._id);
     if (unlinkedIds.length > 0) {
       await KhataAccount.updateMany({ _id: { $in: unlinkedIds } }, { $set: { userId: req.user._id } });
-      await KhataTransaction.updateMany({ khataAccountId: { $in: unlinkedIds }, userId: null }, { $set: { userId: req.user._id } });
+      await KhataTransaction.updateMany({ khataAccountId: { $in: unlinkedIds }, userId: { $ne: req.user._id } }, { $set: { userId: req.user._id } });
     }
 
     const accountIds = accounts.map(a => a._id);
@@ -5777,8 +5877,23 @@ app.get("/users/:userId/khata", requireUser, async (req, res) => {
       };
     });
 
+    let hasAnyKhata = enriched.length > 0;
+    if (!hasAnyKhata) {
+      const hasKhataOrder = await Order.exists({
+        $or: [
+          { paymentMethod: "KHATA" },
+          { khataAmount: { $gt: 0 } },
+        ],
+        $or: [
+          { userId: req.user._id },
+          ...(phoneList.length > 0 ? [{ customerPhone: { $in: phoneList } }] : []),
+        ],
+      });
+      if (hasKhataOrder) hasAnyKhata = true;
+    }
+
     res.json({
-      hasAnyKhata: enriched.length > 0,
+      hasAnyKhata,
       totalPendingAcrossShops: round2(totalPendingAcrossShops),
       activeShopsCount,
       pendingVerificationCount: pendingTxns.length,
@@ -5799,7 +5914,7 @@ app.get("/users/:userId/khata/:accountId", requireUser, async (req, res) => {
       return res.status(400).json({ error: "Invalid Khata account ID" });
     }
 
-    const cleanPhone = cleanIndianPhone(req.user.phone);
+    const phoneList = await resolveUserCandidatePhones(req.user);
     const account = await KhataAccount.findById(req.params.accountId)
       .populate("shopId", "name phone shopImage fullAddress pincode upiId gst isOpen operatingHours")
       .lean();
@@ -5807,9 +5922,14 @@ app.get("/users/:userId/khata/:accountId", requireUser, async (req, res) => {
     if (!account) return res.status(404).json({ error: "Khata account not found" });
 
     const ownsById = account.userId && String(account.userId) === String(req.user._id);
-    const ownsByPhone = validatePhone(cleanPhone) && account.customerPhone === cleanPhone;
+    const ownsByPhone = phoneList.includes(cleanIndianPhone(account.customerPhone));
     if (!ownsById && !ownsByPhone) {
       return res.status(403).json({ error: "Not your Khata account" });
+    }
+
+    if (!ownsById && ownsByPhone) {
+      await KhataAccount.updateOne({ _id: account._id }, { $set: { userId: req.user._id } });
+      await KhataTransaction.updateMany({ khataAccountId: account._id, userId: { $ne: req.user._id } }, { $set: { userId: req.user._id } });
     }
 
     const transactions = await KhataTransaction.find({ khataAccountId: account._id })
@@ -5837,11 +5957,16 @@ app.post("/users/:userId/khata/:accountId/claim-upi-payment", requireUser, async
     const account = await KhataAccount.findById(req.params.accountId).populate("shopId", "name");
     if (!account) return res.status(404).json({ error: "Khata account not found" });
 
-    const cleanPhone = cleanIndianPhone(req.user.phone);
+    const phoneList = await resolveUserCandidatePhones(req.user);
     const ownsById = account.userId && String(account.userId) === String(req.user._id);
-    const ownsByPhone = validatePhone(cleanPhone) && account.customerPhone === cleanPhone;
+    const ownsByPhone = phoneList.includes(cleanIndianPhone(account.customerPhone));
     if (!ownsById && !ownsByPhone) {
       return res.status(403).json({ error: "Not your Khata account" });
+    }
+
+    if (!ownsById && ownsByPhone) {
+      account.userId = req.user._id;
+      await account.save();
     }
 
     const currentBal = round2(account.currentBalance);
