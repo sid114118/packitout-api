@@ -15,6 +15,7 @@ const { GoogleGenerativeAI } = require("@google/generative-ai");
 const EventEmitter = require('events');
 const systemEvents = new EventEmitter();
 const { notifySoundbox, notifyParchiSoundbox, getSoundboxClientStatus } = require("./soundboxService");
+const catalogSearchService = require("./services/catalogSearchService");
 
 const genAI = process.env.GEMINI_API_KEY
   ? new GoogleGenerativeAI(process.env.GEMINI_API_KEY)
@@ -298,12 +299,19 @@ const masterProductSchema = new mongoose.Schema({
   section: { type: String, default: "" },
   subCategory: { type: String, default: "" },
   isActive: { type: Boolean, default: true },
+  attributes: { type: mongoose.Schema.Types.Mixed, default: {} },
+  unitPrice: { type: Number, default: 0 },
+  unitMeasure: { type: String, default: "" },
+  unitPriceDisplay: { type: String, default: "" },
   relatedProducts: [{ type: mongoose.Schema.Types.ObjectId, ref: 'MasterProduct' }],
   substitutes: [{ type: mongoose.Schema.Types.ObjectId, ref: 'MasterProduct' }]
 });
 masterProductSchema.index({ category: 1, name: 1 });
 masterProductSchema.index({ brand: 1 });
 masterProductSchema.index({ barcode: 1 });
+masterProductSchema.index({ itemGroupId: 1 });
+masterProductSchema.index({ "attributes.gender": 1 });
+masterProductSchema.index({ "attributes.grainType": 1 });
 const MasterProduct = mongoose.model("MasterProduct", masterProductSchema);
 
 // Saved address book entry. Each user can keep multiple — Home, Work, etc.
@@ -4344,97 +4352,74 @@ app.get("/shops/:id/menu/lean", async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// 🚀 Server-side paginated search & category/brand filter for a shop's inventory (scales to 10,000+ items)
+// 🔍 Visual Autocomplete suggestions with category thumbnails
+app.get("/catalog/autocomplete", async (req, res) => {
+  try {
+    const q = req.query.q;
+    const shopId = req.query.shopId;
+    const limit = req.query.limit ? parseInt(req.query.limit, 10) : 8;
+
+    const result = await catalogSearchService.getAutocompleteSuggestions({
+      query: q,
+      shopId,
+      limit,
+      Shop,
+      MasterProduct
+    });
+    res.json(result);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// 🏷️ Dynamic context-aware filter pills (gender, brand, price per unit) and sort options
+app.get("/catalog/filters", async (req, res) => {
+  try {
+    const { q, category, subCategory, shopId } = req.query;
+    const result = await catalogSearchService.getCategoryFilters({
+      query: q,
+      category,
+      subCategory,
+      shopId,
+      Shop,
+      MasterProduct
+    });
+    res.json(result);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// 🚀 Server-side paginated search & dynamic attribute filter for a shop's inventory (scales to 10,000+ items)
 app.get("/shops/:id/search", async (req, res) => {
   try {
     if (!mongoose.Types.ObjectId.isValid(req.params.id)) {
       return res.status(400).json({ error: "Invalid shop id" });
     }
-    const qRaw = String(req.query.q || "").trim().toLowerCase();
-    const categoryRaw = String(req.query.category || "").trim().toLowerCase();
-    const subCategoryRaw = String(req.query.subCategory || "").trim().toLowerCase();
-    const brandRaw = String(req.query.brand || "").trim().toLowerCase();
-    const inStockOnly = req.query.inStock === "true";
-    const page = Math.max(1, parseInt(req.query.page, 10) || 1);
-    const limit = Math.min(100, Math.max(1, parseInt(req.query.limit, 10) || 40));
-
-    const shop = await Shop.findById(req.params.id)
-      .select('inventory')
-      .populate({ path: 'inventory.product', select: 'name brand category subCategory section image mrp qnty emoji itemGroupId searchTags barcode isVeg' })
-      .lean();
+    const shop = await Shop.findById(req.params.id).select('_id');
     if (!shop) return res.status(404).json({ error: "Shop not found" });
 
-    const tokens = qRaw ? qRaw.split(/\s+/).filter(Boolean) : [];
-    const matched = [];
-
-    for (const inv of (shop.inventory || [])) {
-      const p = inv?.product;
-      if (!p || !p.name) continue;
-      if (inStockOnly && inv.inStock === false) continue;
-
-      if (categoryRaw && !(p.category || "").toLowerCase().includes(categoryRaw)) continue;
-      if (subCategoryRaw && (p.subCategory || "").toLowerCase() !== subCategoryRaw) continue;
-      if (brandRaw && (p.brand || "").toLowerCase() !== brandRaw) continue;
-
-      let score = 0;
-      if (tokens.length > 0) {
-        const nameLower = (p.name || "").toLowerCase();
-        const brandLower = (p.brand || "").toLowerCase();
-        const catLower = (p.category || "").toLowerCase();
-        const subLower = (p.subCategory || "").toLowerCase();
-        const barcodeStr = String(p.barcode || "").toLowerCase();
-        const tagsStr = Array.isArray(p.searchTags) ? p.searchTags.join(" ").toLowerCase() : String(p.searchTags || "").toLowerCase();
-        const haystack = `${nameLower} ${brandLower} ${catLower} ${subLower} ${barcodeStr} ${tagsStr}`;
-
-        const allMatched = tokens.every(tok => haystack.includes(tok));
-        if (!allMatched) continue;
-
-        if (barcodeStr && barcodeStr === qRaw) score += 200;
-        if (nameLower === qRaw) score += 120;
-        else if (nameLower.startsWith(qRaw)) score += 70;
-        else if (nameLower.includes(qRaw)) score += 40;
-        if (brandLower === qRaw || brandLower.startsWith(qRaw)) score += 30;
-        if (tagsStr.includes(qRaw)) score += 20;
-      }
-
-      if (inv.inStock !== false) score += 10;
-      if (inv.isFeatured) score += 5;
-
-      const mrpVal = Number(p.mrp) || 0;
-      const sellVal = Number(inv.sellingPrice) || mrpVal;
-      const discountPercent = (mrpVal > 0 && sellVal < mrpVal)
-        ? Math.round(((mrpVal - sellVal) / mrpVal) * 100)
-        : 0;
-
-      matched.push({
-        ...p,
-        sellingPrice: sellVal,
-        inStock: inv.inStock !== false,
-        stockCount: inv.stockCount || 0,
-        isFeatured: Boolean(inv.isFeatured),
-        featuredRank: inv.featuredRank ?? 999,
-        discountPercent,
-        _score: score,
-      });
-    }
-
-    matched.sort((a, b) => {
-      if (b._score !== a._score) return b._score - a._score;
-      return (a.name || "").localeCompare(b.name || "");
+    const result = await catalogSearchService.searchProducts({
+      shopId: req.params.id,
+      query: req.query.q,
+      category: req.query.category,
+      subCategory: req.query.subCategory,
+      brand: req.query.brand,
+      gender: req.query.gender,
+      grainType: req.query.grainType,
+      minPrice: req.query.minPrice,
+      maxPrice: req.query.maxPrice,
+      minUnitPrice: req.query.minUnitPrice,
+      maxUnitPrice: req.query.maxUnitPrice,
+      sort: req.query.sort,
+      inStock: req.query.inStock,
+      page: req.query.page,
+      limit: req.query.limit,
+      Shop,
+      MasterProduct
     });
 
-    const total = matched.length;
-    const start = (page - 1) * limit;
-    const items = matched.slice(start, start + limit).map(({ _score, ...rest }) => rest);
-
-    res.json({
-      items,
-      total,
-      page,
-      limit,
-      totalPages: Math.max(1, Math.ceil(total / limit)),
-      hasMore: start + items.length < total,
-    });
+    res.json(result);
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -4931,7 +4916,7 @@ app.post("/shops/:shopId/pos-bills", requireShop, async (req, res) => {
         try {
           customerUser.phone = cleanPhone;
           await User.updateOne({ _id: customerUser._id }, { $set: { phone: cleanPhone } });
-        } catch {}
+        } catch { }
       }
 
       if (customerUser && req.body?.redeemCoins && Number(customerUser.coins) > 0) {
@@ -5752,7 +5737,7 @@ const resolveUserCandidatePhones = async (user) => {
         const cdp = cleanIndianPhone(dp);
         if (validatePhone(cdp)) candidatePhones.add(cdp);
       }
-    } catch {}
+    } catch { }
   }
 
   // Also check if any order was placed with this user's name
@@ -5763,7 +5748,7 @@ const resolveUserCandidatePhones = async (user) => {
         const cnp = cleanIndianPhone(np);
         if (validatePhone(cnp)) candidatePhones.add(cnp);
       }
-    } catch {}
+    } catch { }
   }
 
   return Array.from(candidatePhones);
@@ -5964,9 +5949,9 @@ app.get("/users/:userId/khata", requireUser, async (req, res) => {
     const accountIds = accounts.map(a => a._id);
     const pendingTxns = accountIds.length > 0
       ? await KhataTransaction.find({
-          khataAccountId: { $in: accountIds },
-          verificationStatus: "PendingVerification",
-        }).select("khataAccountId amount").lean()
+        khataAccountId: { $in: accountIds },
+        verificationStatus: "PendingVerification",
+      }).select("khataAccountId amount").lean()
       : [];
 
     const pendingByAccount = new Map();
@@ -7085,6 +7070,12 @@ app.delete("/campaigns/:id", requireAdmin, async (req, res) => {
 // 🚀 START SERVER
 // ==========================================
 const PORT = process.env.PORT || 5000;
-app.listen(PORT, () => {
-  console.log(`🚀 Server running on port ${PORT}`);
-});
+if (require.main === module) {
+  app.listen(PORT, () => {
+    console.log(`🚀 Server running on port ${PORT}`);
+  });
+}
+
+app.Shop = Shop;
+app.MasterProduct = MasterProduct;
+module.exports = app;
