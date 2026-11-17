@@ -16,6 +16,7 @@ const EventEmitter = require('events');
 const systemEvents = new EventEmitter();
 const { notifySoundbox, notifyParchiSoundbox, getSoundboxClientStatus } = require("./soundboxService");
 const catalogSearchService = require("./services/catalogSearchService");
+const { expandQueryTokens, calculateGroceryRelevance, classifyProduct, escapeRegex } = require("./utils/grocerySearchEngine");
 
 const genAI = process.env.GEMINI_API_KEY
   ? new GoogleGenerativeAI(process.env.GEMINI_API_KEY)
@@ -6439,22 +6440,28 @@ app.get("/master-products", async (req, res) => {
     if (brandRaw) {
       filter.brand = { $regex: `^${escapeRegex(brandRaw)}$`, $options: "i" };
     }
+
+    let qContext = null;
     if (qRaw) {
-      const tokens = qRaw.split(/\s+/).filter(Boolean).slice(0, 6);
-      if (tokens.length > 0) {
-        filter.$and = tokens.map(tok => {
-          const rx = new RegExp(escapeRegex(tok), "i");
-          return {
-            $or: [
-              { name: rx },
-              { brand: rx },
-              { category: rx },
-              { subCategory: rx },
-              { barcode: rx },
-              { searchTags: rx },
-            ],
-          };
-        });
+      qContext = expandQueryTokens(qRaw);
+      const tokenClauses = qContext.rawTokens.map(tok => {
+        const synList = Array.from(expandQueryTokens(tok).expandedTokens);
+        const orConditions = [];
+        for (const s of synList) {
+          const rx = new RegExp(escapeRegex(s), "i");
+          orConditions.push(
+            { name: rx },
+            { brand: rx },
+            { category: rx },
+            { subCategory: rx },
+            { barcode: rx },
+            { searchTags: rx }
+          );
+        }
+        return { $or: orConditions };
+      });
+      if (tokenClauses.length > 0) {
+        filter.$and = tokenClauses;
       }
     }
 
@@ -6464,23 +6471,64 @@ app.get("/master-products", async (req, res) => {
       const page = Math.max(1, parseInt(req.query.page, 10) || 1);
       const limit = Math.min(200, Math.max(1, parseInt(req.query.limit, 10) || 50));
       const skip = (page - 1) * limit;
+
+      if (qContext && qContext.rawTokens.length > 0) {
+        let rawItems = await MasterProduct.find(filter).select(selectFields).lean();
+        rawItems = rawItems.map(item => {
+          const reclass = classifyProduct(item);
+          return reclass ? { ...item, ...reclass } : item;
+        });
+        rawItems.sort((a, b) => {
+          const scoreB = calculateGroceryRelevance(b, qContext);
+          const scoreA = calculateGroceryRelevance(a, qContext);
+          if (scoreB !== scoreA) return scoreB - scoreA;
+          return String(a.name || '').localeCompare(String(b.name || ''));
+        });
+        const total = rawItems.length;
+        const pagedItems = rawItems.slice(skip, skip + limit);
+        return res.json({
+          items: pagedItems,
+          total,
+          page,
+          limit,
+          totalPages: Math.max(1, Math.ceil(total / limit)),
+          hasMore: skip + pagedItems.length < total,
+        });
+      }
+
       const [items, total] = await Promise.all([
         MasterProduct.find(filter).select(selectFields).sort({ name: 1 }).skip(skip).limit(limit).lean(),
         MasterProduct.countDocuments(filter),
       ]);
+      const healedItems = items.map(item => {
+        const reclass = classifyProduct(item);
+        return reclass ? { ...item, ...reclass } : item;
+      });
       return res.json({
-        items,
+        items: healedItems,
         total,
         page,
         limit,
         totalPages: Math.max(1, Math.ceil(total / limit)),
-        hasMore: skip + items.length < total,
+        hasMore: skip + healedItems.length < total,
       });
     }
 
-    const products = await MasterProduct.find(filter)
+    let products = await MasterProduct.find(filter)
       .select(selectFields)
       .lean();
+    products = products.map(item => {
+      const reclass = classifyProduct(item);
+      return reclass ? { ...item, ...reclass } : item;
+    });
+    if (qContext && qContext.rawTokens.length > 0) {
+      products.sort((a, b) => {
+        const scoreB = calculateGroceryRelevance(b, qContext);
+        const scoreA = calculateGroceryRelevance(a, qContext);
+        if (scoreB !== scoreA) return scoreB - scoreA;
+        return String(a.name || '').localeCompare(String(b.name || ''));
+      });
+    }
     res.json(products);
   } catch (err) {
     res.status(500).json({ error: err.message });

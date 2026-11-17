@@ -6,6 +6,13 @@
 
 const { computeUnitPrice, parseQuantity } = require('../utils/unitPriceCalculator');
 const { inferProductAttributes, extractCategoryFilterPills, DEFAULT_SORT_OPTIONS } = require('../utils/attributeExtractor');
+const {
+  expandQueryTokens,
+  calculateGroceryRelevance,
+  classifyProduct,
+  SYNONYM_MAP,
+  CORE_INTENTS
+} = require('../utils/grocerySearchEngine');
 
 // Curated high-resolution Cloudinary fallback thumbnails for standard categories/terms
 const CURATED_CATEGORY_THUMBNAILS = {
@@ -14,10 +21,25 @@ const CURATED_CATEGORY_THUMBNAILS = {
   'talcum powder': 'https://res.cloudinary.com/dj48tkcsw/image/upload/v1775368062/Products/Amul/kp5mli0uneidjzg4ytmm.webp',
   'detergent powder': 'https://res.cloudinary.com/dj48tkcsw/image/upload/v1775368144/Products/Amul/jaeiv0fjtlq2utwnk0cq.webp',
   'himalaya baby powder': 'https://res.cloudinary.com/dj48tkcsw/image/upload/v1775368302/Products/Amul/pke0syf0hs9bfqbqakja.webp',
-  rice: 'https://res.cloudinary.com/dj48tkcsw/image/upload/v1775368127/Products/Amul/mjjjgita6hjipemw7gf2.webp',
-  'basmati rice': 'https://res.cloudinary.com/dj48tkcsw/image/upload/v1775368127/Products/Amul/mjjjgita6hjipemw7gf2.webp',
-  milk: 'https://res.cloudinary.com/dj48tkcsw/image/upload/v1775374531/Products/Amul/tdxtg1ocwgcqiqzterj9.avif',
-  atta: 'https://res.cloudinary.com/dj48tkcsw/image/upload/v1775368127/Products/Amul/mjjjgita6hjipemw7gf2.webp',
+  rice: 'https://res.cloudinary.com/dj48tkcsw/image/upload/v1782202730/packitout/categories/Atta___Rice.png',
+  chawal: 'https://res.cloudinary.com/dj48tkcsw/image/upload/v1782202730/packitout/categories/Atta___Rice.png',
+  'basmati rice': 'https://res.cloudinary.com/dj48tkcsw/image/upload/v1782202730/packitout/categories/Atta___Rice.png',
+  milk: 'https://res.cloudinary.com/dj48tkcsw/image/upload/v1782202789/packitout/categories/Dairy__Bread___Eggs.png',
+  doodh: 'https://res.cloudinary.com/dj48tkcsw/image/upload/v1782202789/packitout/categories/Dairy__Bread___Eggs.png',
+  atta: 'https://res.cloudinary.com/dj48tkcsw/image/upload/v1782202730/packitout/categories/Atta___Rice.png',
+  kaju: 'https://res.cloudinary.com/dj48tkcsw/image/upload/v1782202758/packitout/categories/Dry_Fruits___Cereals.png',
+  cashew: 'https://res.cloudinary.com/dj48tkcsw/image/upload/v1782202758/packitout/categories/Dry_Fruits___Cereals.png',
+  'dry fruits': 'https://res.cloudinary.com/dj48tkcsw/image/upload/v1782202758/packitout/categories/Dry_Fruits___Cereals.png',
+  egg: 'https://res.cloudinary.com/dj48tkcsw/image/upload/v1782202789/packitout/categories/Dairy__Bread___Eggs.png',
+  anda: 'https://res.cloudinary.com/dj48tkcsw/image/upload/v1782202789/packitout/categories/Dairy__Bread___Eggs.png',
+  soap: 'https://res.cloudinary.com/dj48tkcsw/image/upload/v1782202739/packitout/categories/Bath___Body.png',
+  sabun: 'https://res.cloudinary.com/dj48tkcsw/image/upload/v1782202739/packitout/categories/Bath___Body.png',
+  oil: 'https://res.cloudinary.com/dj48tkcsw/image/upload/v1782202857/packitout/categories/Oil__Ghee___Salt.png',
+  tel: 'https://res.cloudinary.com/dj48tkcsw/image/upload/v1782202857/packitout/categories/Oil__Ghee___Salt.png',
+  sugar: 'https://res.cloudinary.com/dj48tkcsw/image/upload/v1782202857/packitout/categories/Oil__Ghee___Salt.png',
+  chini: 'https://res.cloudinary.com/dj48tkcsw/image/upload/v1782202857/packitout/categories/Oil__Ghee___Salt.png',
+  haldi: 'https://res.cloudinary.com/dj48tkcsw/image/upload/v1782202816/packitout/categories/Spices___condiments.png',
+  turmeric: 'https://res.cloudinary.com/dj48tkcsw/image/upload/v1782202816/packitout/categories/Spices___condiments.png',
   default: 'https://res.cloudinary.com/dj48tkcsw/image/upload/v1775368062/Products/Amul/kp5mli0uneidjzg4ytmm.webp'
 };
 
@@ -36,14 +58,15 @@ function resolveThumbnail(text, matchedImage = null) {
 }
 
 /**
- * Helper to fetch raw product items either from inMemory array, Shop inventory, or MasterProduct model.
+ * Helper to fetch raw product items either from inMemory array, Shop inventory, or MasterProduct model,
+ * with real-time category audit and misclassification auto-correction applied.
  */
 async function getRawCatalogItems({ shopId, Shop, MasterProduct, inMemoryProducts }) {
-  if (Array.isArray(inMemoryProducts) && inMemoryProducts.length > 0) {
-    return inMemoryProducts;
-  }
+  let rawList = [];
 
-  if (shopId && Shop) {
+  if (Array.isArray(inMemoryProducts) && inMemoryProducts.length > 0) {
+    rawList = inMemoryProducts;
+  } else if (shopId && Shop) {
     const shop = await Shop.findById(shopId)
       .select('inventory')
       .populate({
@@ -54,7 +77,7 @@ async function getRawCatalogItems({ shopId, Shop, MasterProduct, inMemoryProduct
 
     if (!shop || !shop.inventory) return [];
 
-    return shop.inventory
+    rawList = shop.inventory
       .filter(inv => inv && inv.product && inv.product.name)
       .map(inv => {
         const p = inv.product;
@@ -71,56 +94,36 @@ async function getRawCatalogItems({ shopId, Shop, MasterProduct, inMemoryProduct
           featuredRank: inv.featuredRank ?? 999
         };
       });
-  }
-
-  if (MasterProduct) {
+  } else if (MasterProduct) {
     const products = await MasterProduct.find({ isActive: { $ne: false } }).lean();
-    return products.map(p => ({
+    rawList = products.map(p => ({
       ...p,
       sellingPrice: Number(p.mrp) || 0,
       inStock: true
     }));
   }
 
-  return [];
+  // Apply catalog self-healing classification fix to every loaded item
+  return rawList.map(item => {
+    const fix = classifyProduct(item);
+    if (!fix) return item;
+    return {
+      ...item,
+      category: fix.category,
+      subCategory: fix.subCategory || item.subCategory,
+      section: fix.section || item.section,
+      emoji: fix.emoji || item.emoji
+    };
+  });
 }
 
 /**
- * Computes search score for relevance sorting
+ * Computes search score for relevance sorting using intelligent grocery search engine
  */
 function calculateRelevanceScore(product, queryTokens, fullQueryLower) {
-  if (!queryTokens || queryTokens.length === 0) return 0;
-
-  const nameLower = String(product.name || '').toLowerCase();
-  const brandLower = String(product.brand || '').toLowerCase();
-  const catLower = String(product.category || '').toLowerCase();
-  const subLower = String(product.subCategory || '').toLowerCase();
-  const barcodeStr = String(product.barcode || '').toLowerCase();
-  const tagsStr = Array.isArray(product.searchTags)
-    ? product.searchTags.join(' ').toLowerCase()
-    : String(product.searchTags || '').toLowerCase();
-
-  const haystack = `${nameLower} ${brandLower} ${catLower} ${subLower} ${barcodeStr} ${tagsStr}`;
-
-  // Check if every token matches the haystack
-  const allMatched = queryTokens.every(tok => haystack.includes(tok));
-  if (!allMatched) return -1; // No match
-
-  let score = 0;
-  if (barcodeStr && barcodeStr === fullQueryLower) score += 300;
-  if (nameLower === fullQueryLower) score += 200;
-  else if (nameLower.startsWith(fullQueryLower)) score += 120;
-  else if (nameLower.includes(fullQueryLower)) score += 60;
-
-  if (brandLower === fullQueryLower || brandLower.startsWith(fullQueryLower)) score += 40;
-  if (subLower.includes(fullQueryLower)) score += 30;
-  if (catLower.includes(fullQueryLower)) score += 20;
-  if (tagsStr.includes(fullQueryLower)) score += 25;
-
-  if (product.inStock !== false) score += 10;
-  if (product.isFeatured) score += 5;
-
-  return score;
+  const queryStr = fullQueryLower || (queryTokens || []).join(' ');
+  const queryContext = expandQueryTokens(queryStr);
+  return calculateGroceryRelevance(product, queryContext);
 }
 
 /**
@@ -253,26 +256,28 @@ async function getAutocompleteSuggestions({ query, shopId, limit = 8, Shop, Mast
   // If user searched a generic word like "powder", ensure broad Category "Powder" is at top
   const suggestions = [];
   const seenTexts = new Set();
+  const queryContext = expandQueryTokens(q);
 
-  // If query is an archetype (e.g. "powder", "rice"), make sure a primary category suggestion is present
+  // If query is an archetype (e.g. "powder", "rice", "kaju"), make sure a primary category suggestion is present
   const capitalizedQuery = q.replace(/\b\w/g, c => c.toUpperCase());
   if (!seenTexts.has(capitalizedQuery.toLowerCase())) {
     // Find representative category for this query
-    let repCategory = 'Beauty & Grooming';
-    let repSub = '';
+    let repCategory = queryContext.intent ? queryContext.intent.intentCategories[0] : 'General';
+    let repSub = (queryContext.intent && queryContext.intent.intentCategories[1]) || '';
     let repThumb = resolveThumbnail(q);
 
     for (const item of items) {
-      if ((item.name || '').toLowerCase().includes(q)) {
+      if (calculateGroceryRelevance(item, queryContext) > 0) {
         repCategory = item.category || repCategory;
         repSub = item.subCategory || repSub;
-        if (item.image) {
+        if (item.image && typeof item.image === 'string' && item.image.startsWith('http')) {
           repThumb = item.image;
           break;
         }
       }
     }
 
+    const matchingCount = items.filter(x => calculateGroceryRelevance(x, queryContext) > 0).length;
     seenTexts.add(capitalizedQuery.toLowerCase());
     suggestions.push({
       id: `cat_${q}`,
@@ -281,7 +286,7 @@ async function getAutocompleteSuggestions({ query, shopId, limit = 8, Shop, Mast
       category: repCategory,
       subCategory: repSub,
       thumbnail: repThumb,
-      itemCount: items.filter(x => (x.name || '').toLowerCase().includes(q)).length
+      itemCount: matchingCount
     });
   }
 
@@ -603,5 +608,9 @@ module.exports = {
   searchProducts,
   resolveThumbnail,
   CURATED_CATEGORY_THUMBNAILS,
-  DEFAULT_SORT_OPTIONS
+  DEFAULT_SORT_OPTIONS,
+  calculateRelevanceScore,
+  expandQueryTokens,
+  calculateGroceryRelevance,
+  classifyProduct
 };
