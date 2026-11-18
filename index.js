@@ -4230,7 +4230,7 @@ app.post("/shop-login", async (req, res) => {
     const phone = String(req.body?.phone || '').trim();
     const password = String(req.body?.password || '');
     // password is select:false, so must opt in explicitly to compare.
-    const shop = await Shop.findOne({ phone }).select('+password').populate('inventory.product');
+    const shop = await Shop.findOne({ phone }).select('+password');
     if (!shop) return res.status(401).json({ error: "Invalid" });
 
     let ok = false;
@@ -4335,6 +4335,7 @@ app.get("/shops/:id/menu", async (req, res) => {
 // ProductModal lazily refetches the full doc via GET /master-products/:id when opened.
 app.get("/shops/:id/menu/lean", async (req, res) => {
   try {
+    res.set("Cache-Control", "public, max-age=60, stale-while-revalidate=120");
     const shop = await Shop.findById(req.params.id)
       .select('name isOpen acceptsPreOrders isAcceptingOrders shopImage operatingHours fullAddress pincode rating totalReviews inventoryMode inventory combos')
       .populate({ path: 'inventory.product', select: 'name brand category subCategory section image mrp qnty emoji itemGroupId searchTags barcode' })
