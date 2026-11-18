@@ -6,6 +6,8 @@
 
 const { computeUnitPrice } = require('./unitPriceCalculator');
 
+const attributeCache = new WeakMap();
+
 /**
  * Dynamically infers attributes for a product based on its name, category,
  * subCategory, brand, searchTags, description, and quantity.
@@ -14,7 +16,10 @@ const { computeUnitPrice } = require('./unitPriceCalculator');
  * @returns {object} Extracted key-value attributes (e.g. { gender, grainType, dietary, brand, unitMeasure, pricePerUnitRange })
  */
 function inferProductAttributes(product) {
-  if (!product) return {};
+  if (!product || typeof product !== 'object') return {};
+  if (product.attributes) return product.attributes;
+  const cached = attributeCache.get(product);
+  if (cached) return cached;
 
   const attrs = {};
   const tagsStr = Array.isArray(product.searchTags)
@@ -101,6 +106,7 @@ function inferProductAttributes(product) {
     }
   }
 
+  attributeCache.set(product, attrs);
   return attrs;
 }
 

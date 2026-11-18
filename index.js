@@ -2210,55 +2210,60 @@ app.post("/orders", requireUser, async (req, res) => {
 
     const shortId = o._id.toString().slice(-5).toUpperCase();
 
-    // Notify the shop that a new order arrived. The title/body call out URGENT
-    // orders and scheduled pickup times so the shopkeeper sees it at a glance.
-    const { title: shopTitle, message: shopMessage } = buildNewOrderShopNotif(shortId, o.totalAmount, o.isUrgent, o.pickupTime);
-    await Notification.create({
-      shopId: o.shopId,
-      orderId: o._id,
-      type: 'new_order',
-      title: shopTitle,
-      message: shopMessage,
-    });
-    await sendPushNotification(o.shopId, shopTitle, shopMessage);
-
-    // Also confirm the order to the customer so they get instant feedback in the
-    // bell + push, even before the shop accepts.
-    if (o.userId && mongoose.Types.ObjectId.isValid(o.userId)) {
-      const { type, title, message } = orderNotificationFor(initialStatus, shortId);
-      try {
-        await Notification.create({
-          userId: o.userId,
-          orderId: o._id,
-          type,
-          title,
-          message,
-        });
-        await sendPushNotification(o.userId, title, message);
-      } catch (notifErr) {
-        console.log("Customer placement notification skipped:", notifErr.message);
-      }
-    }
-
-    notifyShopSSE(String(o.shopId), 'refresh_orders');
-
-    // 🔊 Real-Time Soundbox Announcement: Order Amount & Item Count
-    notifySoundbox({
-      shopId: o.shopId,
-      amount: o.totalAmount,
-      itemCount: o.items ? o.items.length : 1,
-      totalQuantity: o.items ? o.items.reduce((sum, it) => sum + (Number(it.qty) || 1), 0) : 1,
-      orderId: `ORD-${shortId}`,
-      paymentMethod: o.paymentMethod || 'POP',
-    }).catch((e) => console.error("[Soundbox MQTT] Order placement notify error:", e.message));
-
+    // ⚡ Return order creation response immediately to the customer (< 200ms)
     res.json(o);
+
+    // 🚀 Fire notifications, SSE events, and soundbox announcements asynchronously in the background
+    setImmediate(async () => {
+      try {
+        const { title: shopTitle, message: shopMessage } = buildNewOrderShopNotif(shortId, o.totalAmount, o.isUrgent, o.pickupTime);
+        await Notification.create({
+          shopId: o.shopId,
+          orderId: o._id,
+          type: 'new_order',
+          title: shopTitle,
+          message: shopMessage,
+        }).catch((e) => console.error("Shop order notification error:", e.message));
+        sendPushNotification(o.shopId, shopTitle, shopMessage).catch((e) => console.error("Shop push notification error:", e.message));
+
+        if (o.userId && mongoose.Types.ObjectId.isValid(o.userId)) {
+          const { type, title, message } = orderNotificationFor(initialStatus, shortId);
+          try {
+            await Notification.create({
+              userId: o.userId,
+              orderId: o._id,
+              type,
+              title,
+              message,
+            }).catch((e) => console.error("User order notification error:", e.message));
+            sendPushNotification(o.userId, title, message).catch((e) => console.error("User push notification error:", e.message));
+          } catch (notifErr) {
+            console.log("Customer placement notification skipped:", notifErr.message);
+          }
+        }
+
+        notifyShopSSE(String(o.shopId), 'refresh_orders');
+
+        notifySoundbox({
+          shopId: o.shopId,
+          amount: o.totalAmount,
+          itemCount: o.items ? o.items.length : 1,
+          totalQuantity: o.items ? o.items.reduce((sum, it) => sum + (Number(it.qty) || 1), 0) : 1,
+          orderId: `ORD-${shortId}`,
+          paymentMethod: o.paymentMethod || 'POP',
+        }).catch((e) => console.error("[Soundbox MQTT] Order placement notify error:", e.message));
+      } catch (bgErr) {
+        console.error("Background order notification processing error:", bgErr);
+      }
+    });
   } catch (err) {
     if (coinRefund) {
       try { await User.findByIdAndUpdate(coinRefund.userId, { $inc: { coins: coinRefund.amount } }); }
       catch (refundErr) { console.error("Coin refund after failed order failed:", refundErr.message); }
     }
-    res.status(500).json({ error: err.message });
+    if (!res.headersSent) {
+      res.status(500).json({ error: err.message });
+    }
   }
 });
 
@@ -4239,7 +4244,8 @@ app.post("/shop-login", async (req, res) => {
     const phone = String(req.body?.phone || '').trim();
     const password = String(req.body?.password || '');
     // password is select:false, so must opt in explicitly to compare.
-    const shop = await Shop.findOne({ phone }).select('+password').populate('inventory.product');
+    // Exclude inventory to keep login response lean (< 100ms) without loading thousands of items.
+    const shop = await Shop.findOne({ phone }).select('+password -inventory');
     if (!shop) return res.status(401).json({ error: "Invalid" });
 
     let ok = false;
@@ -4264,6 +4270,7 @@ app.post("/shop-login", async (req, res) => {
     const safe = shop.toObject();
     delete safe.password;
     delete safe.sessionTokens;
+    safe.inventory = []; // Lean placeholder; ShopDashboard fetches populated inventory via /shops/:id/menu
     res.json({ ...safe, sessionToken });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
