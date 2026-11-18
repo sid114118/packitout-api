@@ -115,6 +115,7 @@ const normaliseSearchTags = (val) => {
   if (typeof val === 'string') return val.split(',').map(t => t.trim()).filter(Boolean);
   return undefined;
 };
+const escapeRegex = (str) => String(str || '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 
 // ==========================================
 // 🧾 PARCHI UPLOAD PACKAGES
@@ -4559,6 +4560,7 @@ app.post("/shops/:shopId/barcode-link", requireShop, async (req, res) => {
     if (!masterProd) {
       return res.status(404).json({ error: "Master product not found." });
     }
+    invalidateMasterCatalogCache();
 
     // 2. Upsert into shop inventory
     const shop = await Shop.findById(req.params.shopId);
@@ -6436,6 +6438,13 @@ const MASTER_PRODUCT_WRITABLE = [
   'barcode', 'originalPosName', 'section', 'subCategory', 'isActive',
   'relatedProducts', 'substitutes',
 ];
+// In-memory cache for the full unfiltered master catalog (invalidated on any create/edit/delete/barcode-link)
+let masterCatalogCache = { data: null, expiresAt: 0, inFlight: null };
+const invalidateMasterCatalogCache = () => {
+  masterCatalogCache.data = null;
+  masterCatalogCache.expiresAt = 0;
+};
+
 // pickFields / normaliseSearchTags are hoisted near the top of the file so
 // they're available for POST /orders, which runs before this section.
 app.post("/master-products", async (req, res, next) => {
@@ -6455,7 +6464,9 @@ app.post("/master-products", async (req, res, next) => {
     const tags = normaliseSearchTags(req.body?.searchTags);
     if (tags !== undefined) body.searchTags = tags;
     const p = new MasterProduct(body);
-    await p.save(); res.json(p);
+    await p.save();
+    invalidateMasterCatalogCache();
+    res.json(p);
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
@@ -6468,6 +6479,32 @@ app.get("/master-products", async (req, res) => {
     const categoryRaw = String(req.query.category || "").trim();
     const brandRaw = String(req.query.brand || "").trim();
     const hasPagination = req.query.page !== undefined || req.query.limit !== undefined;
+    const isUnfilteredFull = !qRaw && !categoryRaw && !brandRaw && !hasPagination;
+
+    const selectFields = "name brand category subCategory section mrp qnty emoji image searchTags isVeg itemGroupId barcode";
+
+    if (isUnfilteredFull) {
+      if (masterCatalogCache.data && Date.now() < masterCatalogCache.expiresAt) {
+        return res.json(masterCatalogCache.data);
+      }
+      if (!masterCatalogCache.inFlight) {
+        masterCatalogCache.inFlight = MasterProduct.find({})
+          .select(selectFields)
+          .lean()
+          .then(docs => {
+            masterCatalogCache.data = docs;
+            masterCatalogCache.expiresAt = Date.now() + 2 * 60 * 1000; // 2 min TTL
+            masterCatalogCache.inFlight = null;
+            return docs;
+          })
+          .catch(err => {
+            masterCatalogCache.inFlight = null;
+            throw err;
+          });
+      }
+      const products = await masterCatalogCache.inFlight;
+      return res.json(products);
+    }
 
     const filter = {};
     if (categoryRaw) {
@@ -6494,8 +6531,6 @@ app.get("/master-products", async (req, res) => {
         });
       }
     }
-
-    const selectFields = "name brand category subCategory section mrp qnty emoji image searchTags isVeg itemGroupId barcode";
 
     if (hasPagination) {
       const page = Math.max(1, parseInt(req.query.page, 10) || 1);
@@ -6544,6 +6579,7 @@ app.delete("/master-products/purge-all", requireAdmin, async (req, res) => {
       return res.status(400).json({ error: 'Missing confirmation. Pass {"confirm":"PURGE-ALL-PRODUCTS"}' });
     }
     const masterResult = await MasterProduct.deleteMany({});
+    invalidateMasterCatalogCache();
 
     // Wipe them from all shop inventories too so your React app doesn't crash trying to load deleted products
     await Shop.updateMany({}, { $set: { inventory: [] } });
@@ -6564,6 +6600,7 @@ app.delete("/master-products/:id", requireAdmin, async (req, res) => {
     if (!deletedProduct) {
       return res.status(404).json({ error: "Product not found." });
     }
+    invalidateMasterCatalogCache();
 
     // Pull this product from all Shop Inventories here so it doesn't leave ghost items
     await Shop.updateMany({}, { $pull: { inventory: { product: req.params.id } } });
@@ -6581,6 +6618,7 @@ app.patch("/master-products/:id", requireAdmin, async (req, res) => {
     const tags = normaliseSearchTags(req.body?.searchTags);
     if (tags !== undefined) updateData.searchTags = tags;
     const updatedProduct = await MasterProduct.findByIdAndUpdate(req.params.id, updateData, { new: true });
+    invalidateMasterCatalogCache();
     res.json(updatedProduct);
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -6628,6 +6666,7 @@ app.post("/master-products/bulk-upload", requireAdmin, memoryUpload.single('file
 
     if (formattedProducts.length > 0) {
       await MasterProduct.insertMany(formattedProducts);
+      invalidateMasterCatalogCache();
     }
 
     res.status(200).json({
