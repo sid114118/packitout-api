@@ -190,6 +190,26 @@ mongoose.connect(MONGO_URI)
     } catch (e) {
       console.error("⚠️ User.syncIndexes failed:", e.message);
     }
+    // 🔧 Self-heal THE FAMILY MART (6aaf78a07234b919c3bd5665) if its inventory still references purged MasterProduct IDs
+    try {
+      const fmId = '6aaf78a07234b919c3bd5665';
+      const fmShop = await mongoose.model("Shop").findById(fmId).select('inventory').populate({ path: 'inventory.product', select: '_id' }).lean();
+      if (fmShop && Array.isArray(fmShop.inventory) && fmShop.inventory.length > 0) {
+        const validCount = fmShop.inventory.filter(i => i && i.product && i.product._id).length;
+        if (validCount === 0) {
+          const relinkPath = require('path').join(__dirname, 'family_mart_relinked_inventory.json');
+          if (fs.existsSync(relinkPath)) {
+            const relinkedInv = JSON.parse(fs.readFileSync(relinkPath, 'utf8'));
+            if (Array.isArray(relinkedInv) && relinkedInv.length > 0) {
+              await mongoose.model("Shop").updateOne({ _id: fmId }, { $set: { inventory: relinkedInv } });
+              console.log(`✅ Re-linked THE FAMILY MART inventory (${relinkedInv.length} products restored)`);
+            }
+          }
+        }
+      }
+    } catch (e) {
+      console.error("⚠️ Family Mart inventory relink check failed:", e.message);
+    }
   })
   .catch(err => console.log(err));
 
@@ -4368,6 +4388,7 @@ app.patch("/shops/:id/location", requireShop, async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 const SHOP_PRODUCT_POPULATE_SELECT = 'name brand category subCategory section image mrp qnty emoji itemGroupId searchTags barcode isVeg';
+const SHOP_FEED_LEAN_PRODUCT_SELECT = 'name brand category subCategory image mrp qnty emoji itemGroupId isVeg';
 
 const shopLeanMenuCache = new Map(); // shopId -> { data, expiresAt, inFlight }
 const invalidateShopLeanMenuCache = (shopId) => {
@@ -4409,7 +4430,7 @@ app.get("/shops/:id/checkout-info", async (req, res) => {
 });
 
 // Slim variant for the customer feed/list views — strips description, ingredients,
-// manufacturer fields, nutrition, and related/substitute refs that the feed never renders.
+// manufacturer fields, nutrition, searchTags, barcode, and bulkOffer that the customer feed never renders.
 // ProductModal lazily refetches the full doc via GET /master-products/:id when opened.
 app.get("/shops/:id/menu/lean", async (req, res) => {
   try {
@@ -4425,13 +4446,13 @@ app.get("/shops/:id/menu/lean", async (req, res) => {
     }
 
     const promise = Shop.findById(sid)
-      .select('name isOpen acceptsPreOrders isAcceptingOrders shopImage operatingHours fullAddress pincode upiId rating totalReviews inventoryMode inventory combos')
-      .populate({ path: 'inventory.product', select: SHOP_PRODUCT_POPULATE_SELECT })
-      .populate({ path: 'combos.productIds', select: SHOP_PRODUCT_POPULATE_SELECT })
+      .select('name isOpen acceptsPreOrders isAcceptingOrders shopImage operatingHours fullAddress pincode upiId rating totalReviews inventoryMode inventory.product inventory.sellingPrice inventory.inStock inventory.isFeatured inventory.featuredRank combos')
+      .populate({ path: 'inventory.product', select: SHOP_FEED_LEAN_PRODUCT_SELECT })
+      .populate({ path: 'combos.productIds', select: SHOP_FEED_LEAN_PRODUCT_SELECT })
       .lean()
       .then(doc => {
         if (doc) {
-          shopLeanMenuCache.set(sid, { data: doc, expiresAt: Date.now() + 45 * 1000, inFlight: null });
+          shopLeanMenuCache.set(sid, { data: doc, expiresAt: Date.now() + 5 * 60 * 1000, inFlight: null });
         } else {
           shopLeanMenuCache.delete(sid);
         }
@@ -6405,6 +6426,7 @@ app.patch("/shops/:id/admin-edit", requireAdmin, async (req, res) => {
       }
     }
     const updatedShop = await Shop.findByIdAndUpdate(req.params.id, updateData, { new: true });
+    invalidateShopLeanMenuCache(req.params.id);
     res.json(updatedShop);
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
@@ -6835,6 +6857,7 @@ app.post("/shops/:shopId/bulk-import", requireShopOrAdmin, async (req, res) => {
       { new: true }
     );
     if (!updated) return res.status(404).json({ error: "Shop not found" });
+    invalidateShopLeanMenuCache(shopId);
 
     res.status(200).json({
       success: true,
