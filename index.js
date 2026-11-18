@@ -1971,15 +1971,50 @@ app.get("/admin/users/:id/profile", requireAdmin, async (req, res) => {
 // Recompute the trusted cart total from the shop's current inventory.
 // Frontend prices/totals are NEVER trusted — we always recompute server-side.
 const computeTrustedTotal = async (shopId, items, coinsUsed) => {
-  const shop = await Shop.findById(shopId).populate('inventory.product');
+  const shop = await Shop.findById(shopId).select('inventory combos').lean();
   if (!shop) throw new Error("Shop not found");
+
+  // Collect only the productIds needed for this order (plus any combo items)
+  const neededPids = new Set();
+  for (const line of (items || [])) {
+    if (line.isCombo) {
+      const comboId = (line.comboId || line.productId || "").toString();
+      const combo = (shop.combos || []).find(c => c._id.toString() === comboId);
+      if (combo && Array.isArray(combo.productIds)) {
+        for (const p of combo.productIds) {
+          const pid = (typeof p === 'object' && p?._id) ? p._id.toString() : p.toString();
+          if (mongoose.Types.ObjectId.isValid(pid)) neededPids.add(pid);
+        }
+      }
+    } else {
+      const rawPid = (line.productId || "").toString();
+      if (!line.isCustomNote && !rawPid.startsWith("custom_parchi_note_") && mongoose.Types.ObjectId.isValid(rawPid)) {
+        neededPids.add(rawPid);
+      }
+    }
+  }
+
+  // Fetch only the 1-20 MasterProducts actually in the cart instead of populating all 5,863 shop items!
+  const productMap = new Map();
+  if (neededPids.size > 0) {
+    const masterDocs = await MasterProduct.find({ _id: { $in: Array.from(neededPids) } })
+      .select('name image qnty brand emoji mrp')
+      .lean();
+    for (const doc of masterDocs) {
+      productMap.set(doc._id.toString(), doc);
+    }
+  }
 
   // Index inventory by productId so we can resolve both price (trusted) and
   // display fields (image/qnty/brand/emoji) without hitting the catalog twice.
   const invByProductId = {};
   for (const inv of (shop.inventory || [])) {
     if (!inv.product) continue;
-    invByProductId[inv.product._id.toString()] = inv;
+    const pidStr = inv.product.toString();
+    const prodDoc = productMap.get(pidStr);
+    if (prodDoc) {
+      invByProductId[pidStr] = { ...inv, product: prodDoc };
+    }
   }
 
   let itemTotal = 0;
@@ -2202,49 +2237,53 @@ app.post("/orders", requireUser, async (req, res) => {
 
     const shortId = o._id.toString().slice(-5).toUpperCase();
 
-    // Notify the shop that a new order arrived. The title/body call out URGENT
-    // orders and scheduled pickup times so the shopkeeper sees it at a glance.
-    const { title: shopTitle, message: shopMessage } = buildNewOrderShopNotif(shortId, o.totalAmount, o.isUrgent, o.pickupTime);
-    await Notification.create({
-      shopId: o.shopId,
-      orderId: o._id,
-      type: 'new_order',
-      title: shopTitle,
-      message: shopMessage,
-    });
-    await sendPushNotification(o.shopId, shopTitle, shopMessage);
-
-    // Also confirm the order to the customer so they get instant feedback in the
-    // bell + push, even before the shop accepts.
-    if (o.userId && mongoose.Types.ObjectId.isValid(o.userId)) {
-      const { type, title, message } = orderNotificationFor(initialStatus, shortId);
-      try {
-        await Notification.create({
-          userId: o.userId,
-          orderId: o._id,
-          type,
-          title,
-          message,
-        });
-        await sendPushNotification(o.userId, title, message);
-      } catch (notifErr) {
-        console.log("Customer placement notification skipped:", notifErr.message);
-      }
-    }
-
-    notifyShopSSE(String(o.shopId), 'refresh_orders');
-
-    // 🔊 Real-Time Soundbox Announcement: Order Amount & Item Count
-    notifySoundbox({
-      shopId: o.shopId,
-      amount: o.totalAmount,
-      itemCount: o.items ? o.items.length : 1,
-      totalQuantity: o.items ? o.items.reduce((sum, it) => sum + (Number(it.qty) || 1), 0) : 1,
-      orderId: `ORD-${shortId}`,
-      paymentMethod: o.paymentMethod || 'POP',
-    }).catch((e) => console.error("[Soundbox MQTT] Order placement notify error:", e.message));
-
+    // ⚡ Respond to the customer immediately so checkout finishes in <300ms!
     res.json(o);
+
+    // Fire shop & customer notifications, SSE, and soundbox in the background
+    setImmediate(async () => {
+      try {
+        const { title: shopTitle, message: shopMessage } = buildNewOrderShopNotif(shortId, o.totalAmount, o.isUrgent, o.pickupTime);
+        await Notification.create({
+          shopId: o.shopId,
+          orderId: o._id,
+          type: 'new_order',
+          title: shopTitle,
+          message: shopMessage,
+        });
+        await sendPushNotification(o.shopId, shopTitle, shopMessage);
+      } catch (e) {
+        console.log("Shop placement notification skipped:", e.message);
+      }
+
+      if (o.userId && mongoose.Types.ObjectId.isValid(o.userId)) {
+        const { type, title, message } = orderNotificationFor(initialStatus, shortId);
+        try {
+          await Notification.create({
+            userId: o.userId,
+            orderId: o._id,
+            type,
+            title,
+            message,
+          });
+          await sendPushNotification(o.userId, title, message);
+        } catch (notifErr) {
+          console.log("Customer placement notification skipped:", notifErr.message);
+        }
+      }
+
+      notifyShopSSE(String(o.shopId), 'refresh_orders');
+
+      // 🔊 Real-Time Soundbox Announcement: Order Amount & Item Count
+      notifySoundbox({
+        shopId: o.shopId,
+        amount: o.totalAmount,
+        itemCount: o.items ? o.items.length : 1,
+        totalQuantity: o.items ? o.items.reduce((sum, it) => sum + (Number(it.qty) || 1), 0) : 1,
+        orderId: `ORD-${shortId}`,
+        paymentMethod: o.paymentMethod || 'POP',
+      }).catch((e) => console.error("[Soundbox MQTT] Order placement notify error:", e.message));
+    });
   } catch (err) {
     if (coinRefund) {
       try { await User.findByIdAndUpdate(coinRefund.userId, { $inc: { coins: coinRefund.amount } }); }
@@ -4330,28 +4369,81 @@ app.patch("/shops/:id/location", requireShop, async (req, res) => {
 });
 const SHOP_PRODUCT_POPULATE_SELECT = 'name brand category subCategory section image mrp qnty emoji itemGroupId searchTags barcode isVeg';
 
-const getPopulatedShop = (shopId) =>
-  Shop.findById(shopId)
+const shopLeanMenuCache = new Map(); // shopId -> { data, expiresAt, inFlight }
+const invalidateShopLeanMenuCache = (shopId) => {
+  if (shopId) shopLeanMenuCache.delete(String(shopId));
+  else shopLeanMenuCache.clear();
+};
+
+const getPopulatedShop = (shopId) => {
+  invalidateShopLeanMenuCache(shopId);
+  return Shop.findById(shopId)
     .populate({ path: 'inventory.product', select: SHOP_PRODUCT_POPULATE_SELECT })
     .populate({ path: 'combos.productIds', select: SHOP_PRODUCT_POPULATE_SELECT })
     .lean();
+};
 
 app.get("/shops/:id/menu", async (req, res) => {
   try {
-    res.json(await getPopulatedShop(req.params.id));
+    res.json(await Shop.findById(req.params.id)
+      .populate({ path: 'inventory.product', select: SHOP_PRODUCT_POPULATE_SELECT })
+      .populate({ path: 'combos.productIds', select: SHOP_PRODUCT_POPULATE_SELECT })
+      .lean());
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
+// Fast checkout summary endpoint for Cart.jsx: returns shop info, UPI ID, open status,
+// and an unpopulated inventory array (product ID + inStock + sellingPrice) in <15 KB instead of 4.4 MB!
+app.get("/shops/:id/checkout-info", async (req, res) => {
+  try {
+    if (!mongoose.Types.ObjectId.isValid(req.params.id)) {
+      return res.status(400).json({ error: "Invalid shop id" });
+    }
+    const shop = await Shop.findById(req.params.id)
+      .select('name isOpen acceptsPreOrders isAcceptingOrders shopImage operatingHours fullAddress pincode upiId gst fssai inventory.product inventory.inStock inventory.sellingPrice')
+      .lean();
+    if (!shop) return res.status(404).json({ error: "Shop not found" });
+    res.json(shop);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // Slim variant for the customer feed/list views — strips description, ingredients,
 // manufacturer fields, nutrition, and related/substitute refs that the feed never renders.
 // ProductModal lazily refetches the full doc via GET /master-products/:id when opened.
 app.get("/shops/:id/menu/lean", async (req, res) => {
   try {
     res.set("Cache-Control", "public, max-age=60, stale-while-revalidate=120");
-    const shop = await Shop.findById(req.params.id)
-      .select('name isOpen acceptsPreOrders isAcceptingOrders shopImage operatingHours fullAddress pincode rating totalReviews inventoryMode inventory combos')
+    const sid = String(req.params.id || '');
+    const cached = shopLeanMenuCache.get(sid);
+    if (cached && cached.data && Date.now() < cached.expiresAt) {
+      return res.json(cached.data);
+    }
+    if (cached && cached.inFlight) {
+      const data = await cached.inFlight;
+      return res.json(data);
+    }
+
+    const promise = Shop.findById(sid)
+      .select('name isOpen acceptsPreOrders isAcceptingOrders shopImage operatingHours fullAddress pincode upiId rating totalReviews inventoryMode inventory combos')
       .populate({ path: 'inventory.product', select: SHOP_PRODUCT_POPULATE_SELECT })
       .populate({ path: 'combos.productIds', select: SHOP_PRODUCT_POPULATE_SELECT })
-      .lean();
+      .lean()
+      .then(doc => {
+        if (doc) {
+          shopLeanMenuCache.set(sid, { data: doc, expiresAt: Date.now() + 45 * 1000, inFlight: null });
+        } else {
+          shopLeanMenuCache.delete(sid);
+        }
+        return doc;
+      })
+      .catch(err => {
+        shopLeanMenuCache.delete(sid);
+        throw err;
+      });
+
+    shopLeanMenuCache.set(sid, { data: null, expiresAt: 0, inFlight: promise });
+    const shop = await promise;
     res.json(shop);
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
