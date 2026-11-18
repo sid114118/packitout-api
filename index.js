@@ -4327,8 +4327,18 @@ app.patch("/shops/:id/location", requireShop, async (req, res) => {
     res.json(updated);
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
+const SHOP_PRODUCT_POPULATE_SELECT = 'name brand category subCategory section image mrp qnty emoji itemGroupId searchTags barcode isVeg';
+
+const getPopulatedShop = (shopId) =>
+  Shop.findById(shopId)
+    .populate({ path: 'inventory.product', select: SHOP_PRODUCT_POPULATE_SELECT })
+    .populate({ path: 'combos.productIds', select: SHOP_PRODUCT_POPULATE_SELECT })
+    .lean();
+
 app.get("/shops/:id/menu", async (req, res) => {
-  try { res.json(await Shop.findById(req.params.id).populate('inventory.product').populate('combos.productIds')); } catch (err) { res.status(500).json({ error: err.message }); }
+  try {
+    res.json(await getPopulatedShop(req.params.id));
+  } catch (err) { res.status(500).json({ error: err.message }); }
 });
 // Slim variant for the customer feed/list views — strips description, ingredients,
 // manufacturer fields, nutrition, and related/substitute refs that the feed never renders.
@@ -4338,8 +4348,8 @@ app.get("/shops/:id/menu/lean", async (req, res) => {
     res.set("Cache-Control", "public, max-age=60, stale-while-revalidate=120");
     const shop = await Shop.findById(req.params.id)
       .select('name isOpen acceptsPreOrders isAcceptingOrders shopImage operatingHours fullAddress pincode rating totalReviews inventoryMode inventory combos')
-      .populate({ path: 'inventory.product', select: 'name brand category subCategory section image mrp qnty emoji itemGroupId searchTags barcode' })
-      .populate('combos.productIds')
+      .populate({ path: 'inventory.product', select: SHOP_PRODUCT_POPULATE_SELECT })
+      .populate({ path: 'combos.productIds', select: SHOP_PRODUCT_POPULATE_SELECT })
       .lean();
     res.json(shop);
   } catch (err) { res.status(500).json({ error: err.message }); }
@@ -4471,7 +4481,7 @@ app.post("/shops/:shopId/inventory", requireShop, async (req, res) => {
       }
       await Shop.updateOne({ _id: req.params.shopId }, { $push: { inventory: { product: productId, sellingPrice: priceVal, inStock: true, isFeatured: Boolean(isFeatured), featuredRank: featuredRank !== undefined ? Number(featuredRank) : 999 } } });
     }
-    res.json(await Shop.findById(req.params.shopId).populate('inventory.product').populate('combos.productIds'));
+    res.json(await getPopulatedShop(req.params.shopId));
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
@@ -4498,7 +4508,7 @@ app.post("/shops/:shopId/inventory/featured-ranks", requireShop, async (req, res
     if (Object.keys(updateData).length > 0) {
       await Shop.updateOne({ _id: req.params.shopId }, { $set: updateData });
     }
-    res.json(await Shop.findById(req.params.shopId).populate('inventory.product').populate('combos.productIds'));
+    res.json(await getPopulatedShop(req.params.shopId));
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
@@ -4511,7 +4521,7 @@ app.delete("/shops/:shopId/inventory/:productId", requireShop, async (req, res) 
       { _id: req.params.shopId },
       { $pull: { inventory: { product: req.params.productId } } }
     );
-    res.json(await Shop.findById(req.params.shopId).populate('inventory.product').populate('combos.productIds'));
+    res.json(await getPopulatedShop(req.params.shopId));
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
@@ -4580,7 +4590,7 @@ app.post("/shops/:shopId/barcode-link", requireShop, async (req, res) => {
       );
     }
 
-    const updatedShop = await Shop.findById(req.params.shopId).populate('inventory.product').populate('combos.productIds');
+    const updatedShop = await getPopulatedShop(req.params.shopId);
     res.json({ shop: updatedShop, product: masterProd });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -5180,9 +5190,7 @@ app.post("/shops/:shopId/pos-bills", requireShop, async (req, res) => {
       .populate("userId", "name phone coins")
       .populate("shopId", "name phone pincode fullAddress fssai gst upiId");
 
-    const updatedShop = await Shop.findById(req.params.shopId)
-      .populate("inventory.product")
-      .populate("combos.productIds");
+    const updatedShop = await getPopulatedShop(req.params.shopId);
 
     res.json({
       success: true,
@@ -5832,13 +5840,19 @@ app.get("/users/:userId/khata", requireUser, async (req, res) => {
 
     // ⚡ SELF-HEALING RECONCILER: Find ALL Orders representing Khata dues for this user
     const khataOrderFilter = {
-      $or: [
-        { paymentMethod: "KHATA" },
-        { khataAmount: { $gt: 0 } },
-      ],
-      $or: [
-        { userId: req.user._id },
-        ...(phoneVariantsList.length > 0 ? [{ customerPhone: { $in: phoneVariantsList } }] : []),
+      $and: [
+        {
+          $or: [
+            { paymentMethod: "KHATA" },
+            { khataAmount: { $gt: 0 } },
+          ],
+        },
+        {
+          $or: [
+            { userId: req.user._id },
+            ...(phoneVariantsList.length > 0 ? [{ customerPhone: { $in: phoneVariantsList } }] : []),
+          ],
+        },
       ],
       status: { $not: /cancel|reject/i },
     };
@@ -5997,13 +6011,19 @@ app.get("/users/:userId/khata", requireUser, async (req, res) => {
     let hasAnyKhata = enriched.length > 0;
     if (!hasAnyKhata) {
       const hasKhataOrder = await Order.exists({
-        $or: [
-          { paymentMethod: "KHATA" },
-          { khataAmount: { $gt: 0 } },
-        ],
-        $or: [
-          { userId: req.user._id },
-          ...(phoneVariantsList.length > 0 ? [{ customerPhone: { $in: phoneVariantsList } }] : []),
+        $and: [
+          {
+            $or: [
+              { paymentMethod: "KHATA" },
+              { khataAmount: { $gt: 0 } },
+            ],
+          },
+          {
+            $or: [
+              { userId: req.user._id },
+              ...(phoneVariantsList.length > 0 ? [{ customerPhone: { $in: phoneVariantsList } }] : []),
+            ],
+          },
         ],
       });
       if (hasKhataOrder) hasAnyKhata = true;
@@ -6194,7 +6214,7 @@ app.post("/shops/:shopId/combos", requireShop, async (req, res) => {
       { _id: req.params.shopId },
       { $push: { combos: { name, emoji, productIds, comboPrice: Number(comboPrice) || 0, isActive: true } } }
     );
-    res.json(await Shop.findById(req.params.shopId).populate('inventory.product').populate('combos.productIds'));
+    res.json(await getPopulatedShop(req.params.shopId));
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
@@ -6224,7 +6244,7 @@ app.put("/shops/:shopId/combos/:comboId", requireShop, async (req, res) => {
       { _id: req.params.shopId, "combos._id": comboObjectId },
       { $set: updateFields }
     );
-    res.json(await Shop.findById(req.params.shopId).populate('inventory.product').populate('combos.productIds'));
+    res.json(await getPopulatedShop(req.params.shopId));
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
@@ -6247,7 +6267,7 @@ app.patch("/shops/:shopId/combos/:comboId/toggle", requireShop, async (req, res)
       { _id: req.params.shopId, "combos._id": comboObjectId },
       { $set: { "combos.$.isActive": newActive } }
     );
-    res.json(await Shop.findById(req.params.shopId).populate('inventory.product').populate('combos.productIds'));
+    res.json(await getPopulatedShop(req.params.shopId));
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
@@ -6264,7 +6284,7 @@ app.delete("/shops/:shopId/combos/:comboId", requireShop, async (req, res) => {
       { _id: req.params.shopId },
       { $pull: { combos: { _id: comboObjectId } } }
     );
-    res.json(await Shop.findById(req.params.shopId).populate('inventory.product').populate('combos.productIds'));
+    res.json(await getPopulatedShop(req.params.shopId));
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 // Admin can edit a broader set of fields than the shop itself can — e.g.
@@ -6310,7 +6330,7 @@ app.post("/shops/:id/upload-image", requireShop, upload.single('shopImage'), asy
     });
     shop.shopImage = result.secure_url;
     await shop.save();
-    const populated = await Shop.findById(shop._id).populate('inventory.product');
+    const populated = await getPopulatedShop(shop._id);
     res.json(populated);
   } catch (err) {
     console.error("Shop image upload failed:", err);
@@ -6333,7 +6353,8 @@ app.patch("/shops/:id", requireShop, async (req, res) => {
       return res.status(403).json({ error: "Cannot modify another shop's profile" });
     }
     const updateData = pickFields(req.body || {}, SHOP_SELF_WRITABLE);
-    res.json(await Shop.findByIdAndUpdate(req.params.id, updateData, { new: true }).populate('inventory.product'));
+    await Shop.findByIdAndUpdate(req.params.id, updateData);
+    res.json(await getPopulatedShop(req.params.id));
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
