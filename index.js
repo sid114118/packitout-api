@@ -197,6 +197,13 @@ mongoose.connect(MONGO_URI)
     } catch (e) {
       console.error("⚠️ User.syncIndexes failed:", e.message);
     }
+    // ⚡ Compound index sync for orders: ensures { shopId: 1, createdAt: -1 } is built
+    try {
+      await mongoose.model("Order").syncIndexes();
+      console.log("✅ Order indexes in sync ({ shopId: 1, createdAt: -1 })");
+    } catch (e) {
+      console.error("⚠️ Order.syncIndexes failed:", e.message);
+    }
     // 🔧 Self-heal THE FAMILY MART (6aaf78a07234b919c3bd5665) if its inventory still references purged MasterProduct IDs
     try {
       const fmId = '6aaf78a07234b919c3bd5665';
@@ -338,7 +345,7 @@ masterProductSchema.index({ barcode: 1 });
 masterProductSchema.index({ name: 'text', brand: 'text', searchTags: 'text' });
 const MasterProduct = mongoose.model("MasterProduct", masterProductSchema);
 
-const SHOP_PRODUCT_POPULATE_SELECT = 'name brand category mrp qnty emoji image barcode isVeg';
+const SHOP_PRODUCT_POPULATE_SELECT = 'name brand category subCategory mrp qnty emoji image isVeg itemGroupId barcode';
 const SHOP_FEED_LEAN_PRODUCT_SELECT = 'name brand category mrp qnty emoji image isVeg';
 
 const shopLeanMenuCache = new Map(); // shopId -> { data, expiresAt, inFlight }
@@ -2469,7 +2476,7 @@ app.get("/orders/shop/:shopId", requireShop, async (req, res) => {
     if (req.shop._id.toString() !== req.params.shopId) {
       return res.status(403).json({ error: "Not your shop" });
     }
-    const limit = Math.min(500, Math.max(1, parseInt(req.query.limit, 10) || 200));
+    const limit = Math.min(500, Math.max(1, parseInt(req.query.limit, 10) || 50));
     const orders = await Order.find({ shopId: req.params.shopId })
       .populate('userId', 'name phone')
       // re-populate shopId so frontend code that reads order.shopId.name still works
@@ -2478,7 +2485,9 @@ app.get("/orders/shop/:shopId", requireShop, async (req, res) => {
       .limit(limit)
       .lean();
     res.json(orders);
-  } catch (err) { res.status(500).json({ error: "Failed to fetch shop orders" }); }
+  } catch (err) {
+    res.status(500).json({ error: "Failed to fetch shop orders" });
+  }
 });
 
 // Slim per-user feed for the customer feed's "Buy It Again" widget. The old
@@ -4503,7 +4512,7 @@ const getSlimShop = (shopId) => {
 // ⚡ FIX #2 — Slim inventory helper: populates ONLY inventory (no combos).
 // Used by inventory add/update/delete responses so the caller gets a fresh
 // populated list without the extra combos join.
-const INVENTORY_POPULATE_SELECT = 'name brand category mrp qnty emoji image barcode isVeg';
+const INVENTORY_POPULATE_SELECT = 'name brand category subCategory mrp qnty emoji image isVeg itemGroupId barcode';
 const getPopulatedInventory = (shopId) => {
   invalidateShopLeanMenuCache(shopId);
   return Shop.findById(shopId)
@@ -4525,8 +4534,8 @@ app.get("/shops/:id/menu", async (req, res) => {
     }
 
     const promise = Shop.findById(sid)
-      .populate({ path: 'inventory.product', select: SHOP_PRODUCT_POPULATE_SELECT })
-      .populate({ path: 'combos.productIds', select: SHOP_PRODUCT_POPULATE_SELECT })
+      .populate('inventory.product', 'name brand category subCategory mrp qnty emoji image isVeg itemGroupId barcode')
+      .populate('combos.productIds', 'name mrp image qnty')
       .lean()
       .then(doc => {
         if (doc) {
