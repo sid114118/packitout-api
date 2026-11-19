@@ -2391,6 +2391,9 @@ app.post("/orders", requireUser, async (req, res) => {
       }
 
       notifyShopSSE(String(o.shopId), 'refresh_orders');
+      if (o.userId) {
+        notifyUserSSE(String(o.userId), 'refresh_orders');
+      }
 
       // 🔊 Real-Time Soundbox Announcement: Order Amount & Item Count
       notifySoundbox({
