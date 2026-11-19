@@ -81,16 +81,16 @@ initClient();
 function publishMessage(topic, payload) {
   return new Promise((resolve) => {
     try {
-      if (!client) {
-        console.warn('[Soundbox MQTT] Client not initialized, skipping publish.');
+      if (!client || !isConnected) {
+        console.warn('[Soundbox MQTT] Client not connected, skipping publish.');
         return resolve(false);
       }
 
       const messageStr = JSON.stringify(payload);
       const publishTimeout = setTimeout(() => {
-        console.warn(`[Soundbox MQTT] Publish timeout (5s) on ${topic}`);
+        console.warn(`[Soundbox MQTT] Publish timeout (1.5s) on ${topic}`);
         resolve(false);
-      }, 5000);
+      }, 1500);
 
       client.publish(topic, messageStr, { qos: 1 }, (err) => {
         clearTimeout(publishTimeout);

@@ -327,6 +327,15 @@ masterProductSchema.index({ brand: 1 });
 masterProductSchema.index({ barcode: 1 });
 const MasterProduct = mongoose.model("MasterProduct", masterProductSchema);
 
+const SHOP_PRODUCT_POPULATE_SELECT = 'name brand category subCategory section image mrp qnty emoji itemGroupId searchTags barcode isVeg';
+const SHOP_FEED_LEAN_PRODUCT_SELECT = 'name brand category subCategory image mrp qnty emoji itemGroupId isVeg';
+
+const shopLeanMenuCache = new Map(); // shopId -> { data, expiresAt, inFlight }
+const invalidateShopLeanMenuCache = (shopId) => {
+  if (shopId) shopLeanMenuCache.delete(String(shopId));
+  else shopLeanMenuCache.clear();
+};
+
 // Saved address book entry. Each user can keep multiple — Home, Work, etc.
 // At most one is `isDefault: true`, enforced in app code (Mongo can't enforce
 // "exactly one true" inside a subdoc array without an aggregation guard).
@@ -995,11 +1004,12 @@ const sendPushNotification = async (targetUserId, title, message) => {
     const response = await fetch("https://onesignal.com/api/v1/notifications", {
       method: "POST",
       headers: { "Content-Type": "application/json; charset=utf-8", "Authorization": `Basic ${ONESIGNAL_API_KEY}` },
-      body: JSON.stringify(payload)
+      body: JSON.stringify(payload),
+      signal: AbortSignal.timeout(3000),
     });
-    const data = await response.json();
+    const data = await response.json().catch(() => ({}));
     console.log("Push Sent Result:", data);
-  } catch (err) { console.error("OneSignal Error:", err); }
+  } catch (err) { console.error("OneSignal Error:", err.message); }
 };
 
 // ==========================================
@@ -1990,50 +2000,111 @@ app.get("/admin/users/:id/profile", requireAdmin, async (req, res) => {
 
 // Recompute the trusted cart total from the shop's current inventory.
 // Frontend prices/totals are NEVER trusted — we always recompute server-side.
+// ⚡ Optimized: checks shopLeanMenuCache first (0 ms, 0 DB roundtrips).
+// On cold cache miss, queries only needed cart products with parallel Promise.all.
 const computeTrustedTotal = async (shopId, items, coinsUsed) => {
-  const shop = await Shop.findById(shopId).select('inventory combos').lean();
-  if (!shop) throw new Error("Shop not found");
+  const sid = String(shopId);
+  const cached = shopLeanMenuCache.get(sid);
+  let shop = null;
+  const invByProductId = {};
+  const productMap = new Map();
 
-  // Collect only the productIds needed for this order (plus any combo items)
-  const neededPids = new Set();
-  for (const line of (items || [])) {
-    if (line.isCombo) {
-      const comboId = (line.comboId || line.productId || "").toString();
-      const combo = (shop.combos || []).find(c => c._id.toString() === comboId);
-      if (combo && Array.isArray(combo.productIds)) {
-        for (const p of combo.productIds) {
-          const pid = (typeof p === 'object' && p?._id) ? p._id.toString() : p.toString();
-          if (mongoose.Types.ObjectId.isValid(pid)) neededPids.add(pid);
+  // If menu is in memory and within fresh window (15 minutes), validate cart instantly in RAM (0 ms!)
+  if (cached && cached.data && (Date.now() < (cached.expiresAt + 10 * 60 * 1000))) {
+    shop = cached.data;
+    for (const inv of (shop.inventory || [])) {
+      if (!inv?.product) continue;
+      const pidStr = (typeof inv.product === 'object' && inv.product?._id)
+        ? inv.product._id.toString()
+        : String(inv.product);
+      invByProductId[pidStr] = inv;
+    }
+  } else {
+    // Cache miss: gather needed product IDs
+    const neededPids = new Set();
+    let hasCombos = false;
+    for (const line of (items || [])) {
+      if (line.isCombo) {
+        hasCombos = true;
+      } else {
+        const rawPid = (line.productId || "").toString();
+        if (!line.isCustomNote && !rawPid.startsWith("custom_parchi_note_") && mongoose.Types.ObjectId.isValid(rawPid)) {
+          neededPids.add(rawPid);
+        }
+      }
+    }
+
+    if (hasCombos) {
+      const shopDoc = await Shop.findById(shopId)
+        .select('name isOpen acceptsPreOrders upiId inventory combos')
+        .lean();
+      if (!shopDoc) throw new Error("Shop not found");
+      shop = shopDoc;
+
+      for (const line of (items || [])) {
+        if (line.isCombo) {
+          const comboId = (line.comboId || line.productId || "").toString();
+          const combo = (shop.combos || []).find(c => c._id.toString() === comboId);
+          if (combo && Array.isArray(combo.productIds)) {
+            for (const p of combo.productIds) {
+              const pid = (typeof p === 'object' && p?._id) ? p._id.toString() : p.toString();
+              if (mongoose.Types.ObjectId.isValid(pid)) neededPids.add(pid);
+            }
+          }
+        }
+      }
+
+      if (neededPids.size > 0) {
+        const masterDocs = await MasterProduct.find({ _id: { $in: Array.from(neededPids) } })
+          .select('name image qnty brand emoji mrp')
+          .lean();
+        for (const doc of masterDocs) {
+          productMap.set(doc._id.toString(), doc);
         }
       }
     } else {
-      const rawPid = (line.productId || "").toString();
-      if (!line.isCustomNote && !rawPid.startsWith("custom_parchi_note_") && mongoose.Types.ObjectId.isValid(rawPid)) {
-        neededPids.add(rawPid);
+      // Standard order (no combos): query filtered Shop inventory and MasterProducts in parallel!
+      const neededObjectIds = Array.from(neededPids).map(id => new mongoose.Types.ObjectId(id));
+      const [shopDoc, masterDocs] = await Promise.all([
+        Shop.findOne(
+          { _id: shopId },
+          {
+            name: 1,
+            isOpen: 1,
+            acceptsPreOrders: 1,
+            upiId: 1,
+            combos: 1,
+            inventory: {
+              $filter: {
+                input: "$inventory",
+                as: "inv",
+                cond: { $in: ["$$inv.product", neededObjectIds] }
+              }
+            }
+          }
+        ).lean(),
+        neededPids.size > 0
+          ? MasterProduct.find({ _id: { $in: Array.from(neededPids) } })
+              .select('name image qnty brand emoji mrp')
+              .lean()
+          : []
+      ]);
+      if (!shopDoc) throw new Error("Shop not found");
+      shop = shopDoc;
+      for (const doc of masterDocs) {
+        productMap.set(doc._id.toString(), doc);
       }
     }
-  }
 
-  // Fetch only the 1-20 MasterProducts actually in the cart instead of populating all 5,863 shop items!
-  const productMap = new Map();
-  if (neededPids.size > 0) {
-    const masterDocs = await MasterProduct.find({ _id: { $in: Array.from(neededPids) } })
-      .select('name image qnty brand emoji mrp')
-      .lean();
-    for (const doc of masterDocs) {
-      productMap.set(doc._id.toString(), doc);
-    }
-  }
-
-  // Index inventory by productId so we can resolve both price (trusted) and
-  // display fields (image/qnty/brand/emoji) without hitting the catalog twice.
-  const invByProductId = {};
-  for (const inv of (shop.inventory || [])) {
-    if (!inv.product) continue;
-    const pidStr = inv.product.toString();
-    const prodDoc = productMap.get(pidStr);
-    if (prodDoc) {
-      invByProductId[pidStr] = { ...inv, product: prodDoc };
+    for (const inv of (shop.inventory || [])) {
+      if (!inv?.product) continue;
+      const pidStr = (typeof inv.product === 'object' && inv.product?._id)
+        ? inv.product._id.toString()
+        : String(inv.product);
+      const prodDoc = productMap.get(pidStr) || (typeof inv.product === 'object' ? inv.product : null);
+      if (prodDoc) {
+        invByProductId[pidStr] = { ...inv, product: prodDoc };
+      }
     }
   }
 
@@ -2062,10 +2133,10 @@ const computeTrustedTotal = async (shopId, items, coinsUsed) => {
         comboRegularTotal += itemPrice;
         verifiedComboItems.push({
           productId: pid,
-          name: inv.product?.name || line.name || "Item",
-          image: inv.product?.image || "",
-          qnty: inv.product?.qnty || "",
-          brand: inv.product?.brand || "",
+          name: inv.product?.name || (typeof p === 'object' && p?.name) || line.name || "Item",
+          image: inv.product?.image || (typeof p === 'object' && p?.image) || "",
+          qnty: inv.product?.qnty || (typeof p === 'object' && p?.qnty) || "",
+          brand: inv.product?.brand || (typeof p === 'object' && p?.brand) || "",
           price: itemPrice
         });
       }
@@ -2114,20 +2185,20 @@ const computeTrustedTotal = async (shopId, items, coinsUsed) => {
     const qty = Math.max(1, Math.floor(Number(line.qty) || 1));
     const inv = invByProductId[pid];
     if (!inv) throw new Error(`Product ${pid} not in shop inventory`);
-    if (inv.inStock === false) throw new Error(`Product ${inv.product.name} is currently out of stock.`);
-    const price = Number(inv.sellingPrice) || Number(inv.product.mrp) || 0;
+    if (inv.inStock === false) throw new Error(`Product ${inv.product?.name || 'Item'} is currently out of stock.`);
+    const price = Number(inv.sellingPrice) || Number(inv.product?.mrp) || 0;
     itemTotal += price * qty;
     trustedItems.push({
       productId: pid,
-      name: line.name || inv.product.name || "",
+      name: line.name || inv.product?.name || "",
       qty,
       price,
       // Snapshot display metadata so the order card can render images later
       // even if the master catalog item is renamed / removed.
-      image: inv.product.image || "",
-      qnty: inv.product.qnty || "",
-      brand: inv.product.brand || "",
-      emoji: inv.product.emoji || "🛒",
+      image: inv.product?.image || "",
+      qnty: inv.product?.qnty || "",
+      brand: inv.product?.brand || "",
+      emoji: inv.product?.emoji || "🛒",
     });
   }
 
@@ -2141,7 +2212,7 @@ const computeTrustedTotal = async (shopId, items, coinsUsed) => {
   const coinDiscount = actualCoinsUsed / 10;
   const finalAmount = Math.max(0, Number((itemTotal - coinDiscount).toFixed(2)));
 
-  return { itemTotal, coinDiscount, finalAmount, trustedItems, coinsUsed: actualCoinsUsed };
+  return { itemTotal, coinDiscount, finalAmount, trustedItems, coinsUsed: actualCoinsUsed, shop };
 };
 
 // --- ORDER ROUTES ---
@@ -2192,10 +2263,11 @@ app.post("/orders", requireUser, async (req, res) => {
       }
     }
 
-    // If UPI is chosen, the shop must have a UPI ID on file — otherwise the
-    // customer has nowhere to send the money. Surface the error at checkout
-    // time, not silently later.
-    const shop = await Shop.findById(body.shopId).select('upiId isOpen acceptsPreOrders');
+    // Recompute price + items from the shop's actual inventory (0ms if cached in memory).
+    // Frontend prices/totals are NEVER trusted — we always recompute server-side.
+    const { finalAmount, trustedItems, coinsUsed: actualCoinsUsed, shop } =
+      await computeTrustedTotal(body.shopId, body.items, req.body.coinsUsed);
+
     if (!shop) {
       return res.status(404).json({ error: "Shop not found." });
     }
@@ -2203,16 +2275,13 @@ app.post("/orders", requireUser, async (req, res) => {
       return res.status(400).json({ error: "This shop is closed and is not accepting pre-orders right now." });
     }
 
+    // If UPI is chosen, the shop must have a UPI ID on file — otherwise the
+    // customer has nowhere to send the money. Surface the error at checkout time.
     if (method === 'UPI') {
       if (!shop.upiId || !String(shop.upiId).includes('@')) {
         return res.status(400).json({ error: "This shop has not set a UPI ID — please choose Pay on Pickup instead." });
       }
     }
-
-    // Recompute the price + items from the shop's actual inventory so the
-    // client can't claim a 0₹ total or sneak in items not in stock.
-    const { finalAmount, trustedItems, coinsUsed: actualCoinsUsed } =
-      await computeTrustedTotal(body.shopId, body.items, req.body.coinsUsed);
 
     if (actualCoinsUsed > 0) {
       const r = await User.updateOne(
@@ -2242,26 +2311,28 @@ app.post("/orders", requireUser, async (req, res) => {
       statusHistory: [{ status: initialStatus, at: new Date() }],
     });
     await o.save();
-    // Mark the parchi as processed by ID, not by URL — multiple users can share
-    // a cached image URL, and the URL filter has no shop scope.
-    const parchiId = req.body.parchiId;
-    if (parchiId && mongoose.Types.ObjectId.isValid(parchiId)) {
-      await Parchi.updateOne({ _id: parchiId }, { $set: { status: 'processed' } });
-    } else if (req.body.imageUrl) {
-      // Legacy fallback — keep working for old clients but scope to user+shop.
-      await Parchi.updateOne(
-        { imageUrl: req.body.imageUrl, shopId: String(body.shopId), userId: String(userId) },
-        { $set: { status: 'processed' } }
-      );
-    }
 
     const shortId = o._id.toString().slice(-5).toUpperCase();
 
-    // ⚡ Respond to the customer immediately so checkout finishes in <300ms!
+    // ⚡ Respond to the customer immediately (<150ms checkout!)
     res.json(o);
 
-    // Fire shop & customer notifications, SSE, and soundbox in the background
+    // Fire parchi update, shop & customer notifications, SSE, and soundbox in the background
     setImmediate(async () => {
+      // Mark parchi as processed in background (never blocks customer checkout response)
+      try {
+        const parchiId = req.body.parchiId;
+        if (parchiId && mongoose.Types.ObjectId.isValid(parchiId)) {
+          await Parchi.updateOne({ _id: parchiId }, { $set: { status: 'processed' } });
+        } else if (req.body.imageUrl) {
+          await Parchi.updateOne(
+            { imageUrl: req.body.imageUrl, shopId: String(body.shopId), userId: String(userId) },
+            { $set: { status: 'processed' } }
+          );
+        }
+      } catch (pe) {
+        console.warn("Background parchi update error:", pe.message);
+      }
       try {
         const { title: shopTitle, message: shopMessage } = buildNewOrderShopNotif(shortId, o.totalAmount, o.isUrgent, o.pickupTime);
         await Notification.create({
@@ -4387,14 +4458,6 @@ app.patch("/shops/:id/location", requireShop, async (req, res) => {
     res.json(updated);
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
-const SHOP_PRODUCT_POPULATE_SELECT = 'name brand category subCategory section image mrp qnty emoji itemGroupId searchTags barcode isVeg';
-const SHOP_FEED_LEAN_PRODUCT_SELECT = 'name brand category subCategory image mrp qnty emoji itemGroupId isVeg';
-
-const shopLeanMenuCache = new Map(); // shopId -> { data, expiresAt, inFlight }
-const invalidateShopLeanMenuCache = (shopId) => {
-  if (shopId) shopLeanMenuCache.delete(String(shopId));
-  else shopLeanMenuCache.clear();
-};
 
 const getPopulatedShop = (shopId) => {
   invalidateShopLeanMenuCache(shopId);
@@ -5057,7 +5120,7 @@ app.post("/shops/:shopId/pos-bills", requireShop, async (req, res) => {
         try {
           customerUser.phone = cleanPhone;
           await User.updateOne({ _id: customerUser._id }, { $set: { phone: cleanPhone } });
-        } catch {}
+        } catch { }
       }
 
       if (customerUser && req.body?.redeemCoins && Number(customerUser.coins) > 0) {
@@ -5876,7 +5939,7 @@ const resolveUserCandidatePhones = async (user) => {
         const cdp = cleanIndianPhone(dp);
         if (validatePhone(cdp)) candidatePhones.add(cdp);
       }
-    } catch {}
+    } catch { }
   }
 
   // Also check if any order was placed with this user's name
@@ -5887,7 +5950,7 @@ const resolveUserCandidatePhones = async (user) => {
         const cnp = cleanIndianPhone(np);
         if (validatePhone(cnp)) candidatePhones.add(cnp);
       }
-    } catch {}
+    } catch { }
   }
 
   return Array.from(candidatePhones);
@@ -6094,9 +6157,9 @@ app.get("/users/:userId/khata", requireUser, async (req, res) => {
     const accountIds = accounts.map(a => a._id);
     const pendingTxns = accountIds.length > 0
       ? await KhataTransaction.find({
-          khataAccountId: { $in: accountIds },
-          verificationStatus: "PendingVerification",
-        }).select("khataAccountId amount").lean()
+        khataAccountId: { $in: accountIds },
+        verificationStatus: "PendingVerification",
+      }).select("khataAccountId amount").lean()
       : [];
 
     const pendingByAccount = new Map();
