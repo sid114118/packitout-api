@@ -502,8 +502,8 @@ const orderSchema = new mongoose.Schema({
   createdAt: { type: Date, default: Date.now }
 });
 orderSchema.index({ userId: 1, createdAt: -1 });
-orderSchema.index({ shopId: 1, createdAt: -1 });
 orderSchema.index({ shopId: 1, paymentMethod: 1, createdAt: 1 });
+orderSchema.index({ shopId: 1, createdAt: -1 });
 const Order = mongoose.model("Order", orderSchema);
 
 // 📒 STORE KHATA (UDHAAR / CREDIT LEDGER) SCHEMAS
@@ -4435,14 +4435,9 @@ const haversineKm = (lng1, lat1, lng2, lat2) => {
 app.get("/shops/all/:pincode", async (req, res) => {
   try {
     const pin = String(req.params.pincode || '').trim();
-    const shops = await Shop.find(
-      { $or: [{ pincode: pin }, { serviceablePincodes: pin }] },
-      {
-        name: 1, shopImage: 1, operatingHours: 1, fullAddress: 1, pincode: 1,
-        serviceablePincodes: 1, isOpen: 1, acceptsPreOrders: 1, isAcceptingOrders: 1,
-        rating: 1, totalReviews: 1, totalOrdersFulfilled: 1, location: 1,
-      }
-    ).lean();
+    const shops = await Shop.find({ $or: [{ pincode: pin }, { serviceablePincodes: pin }] })
+      .select('-inventory -password -sessionTokens -combos')
+      .lean();
 
     // Optional ?lat=&lng= from the customer. When present we attach a
     // distanceKm field and sort closest-first; shops without a stored
@@ -4524,35 +4519,15 @@ const getPopulatedInventory = (shopId) => {
 
 app.get("/shops/:id/menu", async (req, res) => {
   try {
-    const sid = String(req.params.id || '');
-    const cached = shopFullMenuCache.get(sid);
-    if (cached && cached.data && Date.now() < cached.expiresAt) {
-      return res.json(cached.data);
-    }
-    if (cached && cached.inFlight) {
-      return res.json(await cached.inFlight);
-    }
-
-    const promise = Shop.findById(sid)
+    res.set("Cache-Control", "public, max-age=60, stale-while-revalidate=120");
+    const shop = await Shop.findById(req.params.id)
       .populate('inventory.product', 'name brand category subCategory mrp qnty emoji image isVeg itemGroupId barcode')
       .populate('combos.productIds', 'name mrp image qnty')
-      .lean()
-      .then(doc => {
-        if (doc) {
-          shopFullMenuCache.set(sid, { data: doc, expiresAt: Date.now() + 5 * 60 * 1000, inFlight: null });
-        } else {
-          shopFullMenuCache.delete(sid);
-        }
-        return doc;
-      })
-      .catch(err => {
-        shopFullMenuCache.delete(sid);
-        throw err;
-      });
-
-    shopFullMenuCache.set(sid, { data: null, expiresAt: 0, inFlight: promise });
-    res.json(await promise);
-  } catch (err) { res.status(500).json({ error: err.message }); }
+      .lean();
+    res.json(shop);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
 });
 // Fast checkout summary endpoint for Cart.jsx: returns shop info, UPI ID, open status,
 // and an unpopulated inventory array (product ID + inStock + sellingPrice) in <15 KB instead of 4.4 MB!
@@ -6715,9 +6690,11 @@ const MASTER_PRODUCT_WRITABLE = [
 ];
 // In-memory cache for the full unfiltered master catalog (invalidated on any create/edit/delete/barcode-link)
 let masterCatalogCache = { data: null, expiresAt: 0, inFlight: null };
+let _masterCache = { data: null, at: 0 };
 const invalidateMasterCatalogCache = () => {
   masterCatalogCache.data = null;
   masterCatalogCache.expiresAt = 0;
+  _masterCache = { data: null, at: 0 };
 };
 
 // pickFields / normaliseSearchTags are hoisted near the top of the file so
@@ -6745,6 +6722,18 @@ app.post("/master-products", async (req, res, next) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
+async function getMasterCatalogCached() {
+  if (_masterCache.data && Date.now() - _masterCache.at < 5 * 60 * 1000) {
+    return _masterCache.data;
+  }
+  const list = await MasterProduct.find({})
+    .select("name brand category subCategory section mrp qnty emoji image isVeg itemGroupId barcode")
+    .sort({ name: 1 })
+    .lean();
+  _masterCache = { data: list, at: Date.now() };
+  return list;
+}
+
 // Slim, cached master catalog for feed & search. Detail fields (description, ingredients, nutrition)
 // are lazy-loaded on-demand via GET /master-products/:id when a user opens the ProductModal.
 app.get("/master-products", async (req, res) => {
@@ -6754,33 +6743,27 @@ app.get("/master-products", async (req, res) => {
     const categoryRaw = String(req.query.category || "").trim();
     const brandRaw = String(req.query.brand || "").trim();
     const hasPagination = req.query.page !== undefined || req.query.limit !== undefined;
-    const isUnfilteredFull = !qRaw && !categoryRaw && !brandRaw && !hasPagination;
 
-    const selectFields = "name brand category mrp qnty emoji image isVeg barcode";
-
-    if (isUnfilteredFull) {
-      if (masterCatalogCache.data && Date.now() < masterCatalogCache.expiresAt) {
-        return res.json(masterCatalogCache.data);
+    if (!qRaw && !categoryRaw && !brandRaw) {
+      const all = await getMasterCatalogCached();
+      if (hasPagination) {
+        const page = Math.max(1, parseInt(req.query.page, 10) || 1);
+        const limit = Math.min(200, Math.max(1, parseInt(req.query.limit, 10) || 50));
+        const skip = (page - 1) * limit;
+        const items = all.slice(skip, skip + limit);
+        return res.json({
+          items,
+          total: all.length,
+          page,
+          limit,
+          totalPages: Math.max(1, Math.ceil(all.length / limit)),
+          hasMore: skip + items.length < all.length,
+        });
       }
-      if (!masterCatalogCache.inFlight) {
-        masterCatalogCache.inFlight = MasterProduct.find({})
-          .select(selectFields)
-          .limit(200) // ⚡ Safe limit: 200 items loads in 15ms instead of 40 seconds!
-          .lean()
-          .then(docs => {
-            masterCatalogCache.data = docs;
-            masterCatalogCache.expiresAt = Date.now() + 10 * 60 * 1000; // ⚡ FIX #6 — 10 min TTL (was 2 min)
-            masterCatalogCache.inFlight = null;
-            return docs;
-          })
-          .catch(err => {
-            masterCatalogCache.inFlight = null;
-            throw err;
-          });
-      }
-      const products = await masterCatalogCache.inFlight;
-      return res.json(products);
+      return res.json(all);
     }
+
+    const selectFields = "name brand category subCategory section mrp qnty emoji image isVeg itemGroupId barcode";
 
     const filter = {};
     if (categoryRaw) {
