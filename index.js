@@ -4728,10 +4728,17 @@ app.post("/shops/:shopId/inventory", requireShop, async (req, res) => {
       }
       await Shop.updateOne({ _id: req.params.shopId }, { $push: { inventory: { product: productId, sellingPrice: priceVal, inStock: true, isFeatured: Boolean(isFeatured), featuredRank: featuredRank !== undefined ? Number(featuredRank) : 999 } } });
     }
-    // ⚡ FIX #5 — Return only inventory+combos (populated), not the entire shop.
-    // The old getPopulatedShop re-joined ALL products on every single price/stock
-    // change, which was the main cause of 2–5s delays in the Inventory tab.
-    res.json(await getPopulatedInventory(req.params.shopId));
+    // ⚡ FIX #5 — Return instant confirmation instead of re-populating 5,800+ items.
+    // Re-joining all products took 75s and froze the entire server on every click!
+    invalidateShopLeanMenuCache(req.params.shopId);
+    res.json({
+      success: true,
+      productId,
+      sellingPrice: priceVal,
+      inStock: inStock !== undefined ? Boolean(inStock) : true,
+      isFeatured: isFeatured !== undefined ? Boolean(isFeatured) : false,
+      featuredRank: featuredRank !== undefined ? Number(featuredRank) : undefined,
+    });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
@@ -4772,8 +4779,9 @@ app.delete("/shops/:shopId/inventory/:productId", requireShop, async (req, res) 
       { _id: req.params.shopId },
       { $pull: { inventory: { product: req.params.productId } } }
     );
-    // ⚡ FIX #5 — slim inventory response after remove
-    res.json(await getPopulatedInventory(req.params.shopId));
+    // ⚡ FIX #5 — Return instant confirmation instead of re-populating 5,800+ items
+    invalidateShopLeanMenuCache(req.params.shopId);
+    res.json({ success: true, removedProductId: req.params.productId });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
