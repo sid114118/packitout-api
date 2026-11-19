@@ -4438,9 +4438,10 @@ const haversineKm = (lng1, lat1, lng2, lat2) => {
 app.get("/shops/all/:pincode", async (req, res) => {
   try {
     const pin = String(req.params.pincode || '').trim();
-    const shops = await Shop.find({ $or: [{ pincode: pin }, { serviceablePincodes: pin }] })
-      .select('-inventory -password -sessionTokens -combos')
-      .lean();
+    const shops = await Shop.find(
+      { $or: [{ pincode: pin }, { serviceablePincodes: pin }] },
+      'name shopImage operatingHours fullAddress phone pincode serviceablePincodes isOpen acceptsPreOrders isAcceptingOrders rating totalReviews totalOrdersFulfilled location'
+    ).lean();
 
     // Optional ?lat=&lng= from the customer. When present we attach a
     // distanceKm field and sort closest-first; shops without a stored
@@ -4523,11 +4524,34 @@ const getPopulatedInventory = (shopId) => {
 app.get("/shops/:id/menu", async (req, res) => {
   try {
     res.set("Cache-Control", "public, max-age=60, stale-while-revalidate=120");
-    const shop = await Shop.findById(req.params.id)
+    const sid = String(req.params.id || '');
+    const cached = shopFullMenuCache.get(sid);
+    if (cached && cached.data && Date.now() < cached.expiresAt) {
+      return res.json(cached.data);
+    }
+    if (cached && cached.inFlight) {
+      return res.json(await cached.inFlight);
+    }
+
+    const promise = Shop.findById(sid)
       .populate('inventory.product', 'name brand category subCategory mrp qnty emoji image isVeg itemGroupId barcode')
       .populate('combos.productIds', 'name mrp image qnty')
-      .lean();
-    res.json(shop);
+      .lean()
+      .then(doc => {
+        if (doc) {
+          shopFullMenuCache.set(sid, { data: doc, expiresAt: Date.now() + 60 * 1000, inFlight: null });
+        } else {
+          shopFullMenuCache.delete(sid);
+        }
+        return doc;
+      })
+      .catch(err => {
+        shopFullMenuCache.delete(sid);
+        throw err;
+      });
+
+    shopFullMenuCache.set(sid, { data: null, expiresAt: 0, inFlight: promise });
+    res.json(await promise);
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -6693,11 +6717,11 @@ const MASTER_PRODUCT_WRITABLE = [
 ];
 // In-memory cache for the full unfiltered master catalog (invalidated on any create/edit/delete/barcode-link)
 let masterCatalogCache = { data: null, expiresAt: 0, inFlight: null };
-let _masterCache = { data: null, at: 0 };
+let _masterCache = { data: null, at: 0, inFlight: null };
 const invalidateMasterCatalogCache = () => {
   masterCatalogCache.data = null;
   masterCatalogCache.expiresAt = 0;
-  _masterCache = { data: null, at: 0 };
+  _masterCache = { data: null, at: 0, inFlight: null };
 };
 
 // pickFields / normaliseSearchTags are hoisted near the top of the file so
@@ -6729,12 +6753,24 @@ async function getMasterCatalogCached() {
   if (_masterCache.data && Date.now() - _masterCache.at < 5 * 60 * 1000) {
     return _masterCache.data;
   }
-  const list = await MasterProduct.find({})
+  if (_masterCache.inFlight) {
+    return _masterCache.inFlight;
+  }
+  _masterCache.inFlight = MasterProduct.find({})
     .select("name brand category subCategory section mrp qnty emoji image isVeg itemGroupId barcode")
     .sort({ name: 1 })
-    .lean();
-  _masterCache = { data: list, at: Date.now() };
-  return list;
+    .lean()
+    .then(list => {
+      _masterCache.data = list;
+      _masterCache.at = Date.now();
+      _masterCache.inFlight = null;
+      return list;
+    })
+    .catch(err => {
+      _masterCache.inFlight = null;
+      throw err;
+    });
+  return _masterCache.inFlight;
 }
 
 // Slim, cached master catalog for feed & search. Detail fields (description, ingredients, nutrition)
