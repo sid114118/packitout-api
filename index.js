@@ -459,6 +459,12 @@ const orderSchema = new mongoose.Schema({
   pickupTime: { type: Date, default: null },
   isUrgent: { type: Boolean, default: false },
   customerArrivedAt: { type: Date, default: null },
+  khataRequest: {
+    status: { type: String, enum: ['none', 'pending', 'accepted', 'declined', 'cancelled'], default: 'none' },
+    amount: { type: Number, default: 0 },
+    requestedAt: { type: Date, default: null },
+    respondedAt: { type: Date, default: null },
+  },
   adjustedDelta: { type: Number, default: 0 },
   unreadCountUser: { type: Number, default: 0 },
   unreadCountShop: { type: Number, default: 0 },
@@ -6469,6 +6475,286 @@ app.post("/users/:userId/khata/:accountId/claim-upi-payment", requireUser, async
 
     res.json({ success: true, transaction: tx });
   } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ============================================================================
+// 📒 ONLINE ORDER KHATA BILLING WORKFLOW (Shopkeeper Request <-> Customer Approve)
+// ============================================================================
+
+// 1. Shopkeeper sends Khata billing request to customer at counter pickup
+app.post("/orders/:id/khata-request", requireShop, async (req, res) => {
+  try {
+    if (!mongoose.isValidObjectId(req.params.id)) {
+      return res.status(400).json({ error: "Invalid order ID" });
+    }
+    const order = await Order.findById(req.params.id);
+    if (!order) return res.status(404).json({ error: "Order not found" });
+
+    if (order.shopId.toString() !== req.shop._id.toString()) {
+      return res.status(403).json({ error: "Not your order" });
+    }
+
+    if (order.status?.includes('❌') || order.status?.includes('Cancelled')) {
+      return res.status(400).json({ error: "Cannot bill a cancelled order to Khata." });
+    }
+
+    if (order.paymentStatus === 'Paid' && order.paymentMethod !== 'KHATA') {
+      return res.status(400).json({ error: "This order is already marked as Paid." });
+    }
+
+    if (order.khataRequest?.status === 'accepted') {
+      return res.status(400).json({ error: "This order has already been accepted and billed to Khata." });
+    }
+
+    const amt = round2(order.totalAmount || 0);
+    if (amt <= 0) {
+      return res.status(400).json({ error: "Invalid order amount for Khata billing." });
+    }
+
+    const now = new Date();
+    order.khataRequest = {
+      status: 'pending',
+      amount: amt,
+      requestedAt: now,
+      respondedAt: null,
+    };
+    await order.save();
+
+    const shortId = order._id.toString().slice(-5).toUpperCase();
+    const shopName = req.shop.name || "Shop";
+    const title = `📒 Khata Request from ${shopName} (#${shortId})`;
+    const msg = `${shopName} requested to bill ₹${amt} for Order #${shortId} to your Khata Book. Tap to approve or decline.`;
+
+    // Real-time SSE to customer and shop dashboard
+    if (order.userId) {
+      notifyUserSSE(String(order.userId), 'refresh_orders');
+      try {
+        await Notification.create({
+          userId: order.userId,
+          orderId: order._id,
+          type: 'khata',
+          title,
+          message: msg,
+        });
+        await sendPushNotification(order.userId, title, msg);
+      } catch (e) {
+        console.log('Khata request user push skipped:', e.message);
+      }
+    }
+    notifyShopSSE(String(order.shopId), 'refresh_orders');
+
+    res.json({ success: true, order });
+  } catch (err) {
+    console.error("khata-request error:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// 2. Shopkeeper cancels pending Khata billing request
+app.post("/orders/:id/khata-cancel", requireShop, async (req, res) => {
+  try {
+    if (!mongoose.isValidObjectId(req.params.id)) {
+      return res.status(400).json({ error: "Invalid order ID" });
+    }
+    const order = await Order.findById(req.params.id);
+    if (!order) return res.status(404).json({ error: "Order not found" });
+
+    if (order.shopId.toString() !== req.shop._id.toString()) {
+      return res.status(403).json({ error: "Not your order" });
+    }
+
+    if (order.khataRequest?.status !== 'pending') {
+      return res.status(400).json({ error: "No pending Khata request to cancel." });
+    }
+
+    order.khataRequest.status = 'cancelled';
+    order.khataRequest.respondedAt = new Date();
+    await order.save();
+
+    if (order.userId) {
+      notifyUserSSE(String(order.userId), 'refresh_orders');
+    }
+    notifyShopSSE(String(order.shopId), 'refresh_orders');
+
+    res.json({ success: true, order });
+  } catch (err) {
+    console.error("khata-cancel error:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// 3. Customer responds (accept / decline) to Khata billing request
+app.post("/orders/:id/khata-respond", requireUser, async (req, res) => {
+  try {
+    if (!mongoose.isValidObjectId(req.params.id)) {
+      return res.status(400).json({ error: "Invalid order ID" });
+    }
+    const order = await Order.findById(req.params.id);
+    if (!order) return res.status(404).json({ error: "Order not found" });
+
+    const orderUserId = (order.userId?._id || order.userId)?.toString();
+    if (orderUserId !== req.user._id.toString()) {
+      return res.status(403).json({ error: "Not your order" });
+    }
+
+    if (order.khataRequest?.status !== 'pending') {
+      return res.status(400).json({ error: `Khata request is not pending (status: ${order.khataRequest?.status || 'none'}).` });
+    }
+
+    const action = String(req.body?.action || '').toLowerCase();
+    const shortId = order._id.toString().slice(-5).toUpperCase();
+    const now = new Date();
+
+    if (action === 'decline') {
+      order.khataRequest.status = 'declined';
+      order.khataRequest.respondedAt = now;
+      if (!order.statusHistory) order.statusHistory = [];
+      order.statusHistory.push({ status: 'Khata Declined ❌', at: now });
+      await order.save();
+
+      notifyShopSSE(String(order.shopId), 'refresh_orders');
+      notifyUserSSE(String(req.user._id), 'refresh_orders');
+
+      const custName = req.user.name || "Customer";
+      const shopTitle = `❌ Khata Request Declined (#${shortId})`;
+      const shopMsg = `${custName} declined billing Order #${shortId} to Khata. Please collect via Cash or UPI at counter.`;
+      try {
+        await Notification.create({
+          shopId: order.shopId,
+          orderId: order._id,
+          type: 'order',
+          title: shopTitle,
+          message: shopMsg,
+        });
+        await sendPushNotification(order.shopId, shopTitle, shopMsg);
+      } catch (e) {
+        console.log('Khata decline notification skipped:', e.message);
+      }
+
+      return res.json({ success: true, status: 'declined', order });
+    }
+
+    if (action === 'accept') {
+      const customerUser = await User.findById(req.user._id);
+      const rawPhone = customerUser?.phone || order.customerPhone || '';
+      const cleanPhone = cleanIndianPhone(rawPhone);
+
+      if (!cleanPhone || cleanPhone.length < 10) {
+        return res.status(400).json({ error: "A valid 10-digit mobile number on your profile is required to use Khata." });
+      }
+
+      const amt = round2(order.totalAmount || order.khataRequest?.amount || 0);
+      if (amt <= 0) {
+        return res.status(400).json({ error: "Invalid order amount for Khata." });
+      }
+
+      // Check or create KhataAccount for this shop & customer phone
+      let account = await KhataAccount.findOne({ shopId: order.shopId, customerPhone: cleanPhone });
+      const prevBal = account ? round2(account.currentBalance) : 0;
+      const isFirstKhata = !account || round2(account.totalCreditGiven) === 0;
+      const newBal = round2(prevBal + amt);
+      const custName = req.user.name || order.customerName || account?.customerName || "Customer";
+
+      if (!account) {
+        account = await KhataAccount.create({
+          shopId: order.shopId,
+          userId: req.user._id,
+          customerPhone: cleanPhone,
+          customerName: custName,
+          currentBalance: newBal,
+          totalCreditGiven: amt,
+          totalSettled: 0,
+          creditLimit: 0,
+          lastTransactionAt: now,
+        });
+      } else {
+        account.userId = account.userId || req.user._id;
+        if (custName && custName !== "Customer") account.customerName = custName;
+        account.currentBalance = newBal;
+        account.totalCreditGiven = round2(account.totalCreditGiven + amt);
+        account.lastTransactionAt = now;
+        await account.save();
+      }
+
+      // Record KhataTransaction
+      const tx = await KhataTransaction.create({
+        khataAccountId: account._id,
+        shopId: order.shopId,
+        userId: req.user._id,
+        customerPhone: cleanPhone,
+        type: 'CREDIT_BILL',
+        amount: amt,
+        balanceBefore: prevBal,
+        balanceAfter: newBal,
+        orderId: order._id,
+        paymentMode: 'KHATA',
+        verificationStatus: 'Confirmed',
+        note: `Online Order #${shortId} (Billed to Khata)`,
+        createdBy: 'shop',
+        createdAt: now,
+      });
+
+      // Update Order
+      order.paymentMethod = 'KHATA';
+      order.paymentStatus = 'Paid';
+      order.khataAmount = amt;
+      order.khataSnapshot = {
+        synced: true,
+        isFirstKhata,
+        previousDue: prevBal,
+        paidNow: 0,
+        paidVia: 'NONE',
+        addedDue: amt,
+        newTotalDue: newBal,
+      };
+      order.khataRequest.status = 'accepted';
+      order.khataRequest.respondedAt = now;
+      if (!order.statusHistory) order.statusHistory = [];
+      order.statusHistory.push({ status: 'Billed to Khata 📒', at: now });
+      await order.save();
+
+      // Soundbox announcement (non-blocking)
+      try {
+        notifySoundbox({
+          shopId: String(order.shopId),
+          amount: amt,
+          orderId: `ORD-${shortId}`,
+          paymentMethod: 'KHATA',
+        });
+      } catch (e) {
+        console.log('Khata soundbox notification skipped:', e.message);
+      }
+
+      // Live SSE updates
+      notifyShopSSE(String(order.shopId), 'refresh_orders');
+      notifyShopSSE(String(order.shopId), 'refresh_khata');
+      notifyUserSSE(String(req.user._id), 'refresh_orders');
+      notifyUserSSE(String(req.user._id), 'refresh_khata');
+
+      // Push notification to shopkeeper
+      const shopTitle = `Khata Approved! (#${shortId}) ✅`;
+      const shopMsg = `${custName} approved adding ₹${amt} to Khata. Current total balance: ₹${newBal}.`;
+      try {
+        await Notification.create({
+          shopId: order.shopId,
+          orderId: order._id,
+          type: 'order',
+          title: shopTitle,
+          message: shopMsg,
+        });
+        await sendPushNotification(order.shopId, shopTitle, shopMsg);
+      } catch (e) {
+        console.log('Khata accept push notification skipped:', e.message);
+      }
+
+      return res.json({ success: true, status: 'accepted', order, account, transaction: tx });
+    }
+
+    return res.status(400).json({ error: "Invalid action. Use 'accept' or 'decline'." });
+  } catch (err) {
+    console.error("khata-respond error:", err);
     res.status(500).json({ error: err.message });
   }
 });
