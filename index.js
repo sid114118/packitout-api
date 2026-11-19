@@ -6819,6 +6819,7 @@ app.get("/master-products", async (req, res) => {
 
     const products = await MasterProduct.find(filter)
       .select(selectFields)
+      .limit(200) // ⚡ Safety cap
       .lean();
     res.json(products);
   } catch (err) {
