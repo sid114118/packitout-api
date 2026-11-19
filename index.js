@@ -4974,7 +4974,12 @@ const syncLegacyKhataOrdersForShop = async (shopId) => {
 
       const alreadyTx = await KhataTransaction.exists({ orderId: order._id });
       const principal = round2(Number(order.khataAmount) > 0 ? order.khataAmount : order.totalAmount);
-      const isAlreadyPaid = order.paymentStatus === "Paid";
+      const settledAmt = round2(Number(order.khataSettledAmount) || 0);
+      const isAlreadyPaid = (order.paymentStatus === "Paid" && order.paymentMethod !== "KHATA" && order.khataRequest?.status !== "accepted") || (settledAmt >= principal && principal > 0);
+      if (order.paymentMethod === "KHATA" && order.paymentStatus === "Paid" && settledAmt < principal) {
+        order.paymentStatus = settledAmt > 0 ? "PartiallyPaid" : "Unpaid";
+        order.khataSettledAmount = settledAmt;
+      }
       const custName = (order.customerName && order.customerName !== "Walk-in Customer")
         ? order.customerName
         : (order.userId?.name || "Customer");
@@ -6190,12 +6195,20 @@ app.get("/users/:userId/khata", requireUser, async (req, res) => {
         for (const ord of orders) {
           const shortId = String(ord._id).slice(-5).toUpperCase();
           const principal = round2(Number(ord.khataAmount) > 0 ? ord.khataAmount : ord.totalAmount);
-          const settledSoFar = round2(Number(ord.khataSettledAmount) || (ord.paymentStatus === "Paid" ? principal : 0));
+          const settledSoFar = round2(Number(ord.khataSettledAmount) || 0);
           const dueForOrder = Math.max(0, round2(principal - settledSoFar));
 
           runningCredit = round2(runningCredit + principal);
           runningSettled = round2(runningSettled + settledSoFar);
           runningDue = round2(runningDue + dueForOrder);
+
+          // Heal any Khata order that was mistakenly marked 'Paid' while its settled amount is 0
+          if (ord.paymentMethod === "KHATA" && ord.paymentStatus === "Paid" && settledSoFar < principal) {
+            await Order.updateOne(
+              { _id: ord._id },
+              { $set: { paymentStatus: settledSoFar > 0 ? "PartiallyPaid" : "Unpaid", khataAmount: principal, khataSettledAmount: settledSoFar } }
+            );
+          }
 
           const txExists = await KhataTransaction.exists({ orderId: ord._id });
           if (!txExists && principal > 0) {
@@ -6211,7 +6224,7 @@ app.get("/users/:userId/khata", requireUser, async (req, res) => {
               orderId: ord._id,
               paymentMode: "KHATA",
               verificationStatus: "Confirmed",
-              note: `Counter Bill #${shortId}`,
+              note: ord.orderSource === "ONLINE" ? `Online Order #${shortId} (Billed to Khata)` : `Counter Bill #${shortId}`,
               createdBy: "shop",
               createdAt: ord.createdAt || new Date(),
             });
@@ -6638,11 +6651,23 @@ app.post("/orders/:id/khata-respond", requireUser, async (req, res) => {
 
     if (action === 'accept') {
       const customerUser = await User.findById(req.user._id);
-      const rawPhone = customerUser?.phone || order.customerPhone || '';
+      let rawPhone = customerUser?.phone || order.customerPhone || '';
+      if (!rawPhone) {
+        const candidates = await resolveUserCandidatePhones(req.user);
+        if (candidates.length > 0) rawPhone = candidates[0];
+      }
       const cleanPhone = cleanIndianPhone(rawPhone);
 
       if (!cleanPhone || cleanPhone.length < 10) {
         return res.status(400).json({ error: "A valid 10-digit mobile number on your profile is required to use Khata." });
+      }
+
+      if (!customerUser.phone) {
+        customerUser.phone = cleanPhone;
+        await customerUser.save();
+      }
+      if (!order.customerPhone) {
+        order.customerPhone = cleanPhone;
       }
 
       const amt = round2(order.totalAmount || order.khataRequest?.amount || 0);
@@ -6670,7 +6695,7 @@ app.post("/orders/:id/khata-respond", requireUser, async (req, res) => {
           lastTransactionAt: now,
         });
       } else {
-        account.userId = account.userId || req.user._id;
+        account.userId = req.user._id;
         if (custName && custName !== "Customer") account.customerName = custName;
         account.currentBalance = newBal;
         account.totalCreditGiven = round2(account.totalCreditGiven + amt);
@@ -6698,8 +6723,11 @@ app.post("/orders/:id/khata-respond", requireUser, async (req, res) => {
 
       // Update Order
       order.paymentMethod = 'KHATA';
-      order.paymentStatus = 'Paid';
+      order.paymentStatus = 'Unpaid';
+      order.paidAmount = 0;
+      order.paidVia = 'NONE';
       order.khataAmount = amt;
+      order.khataSettledAmount = 0;
       order.khataSnapshot = {
         synced: true,
         isFirstKhata,
