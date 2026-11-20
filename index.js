@@ -171,7 +171,11 @@ app.use(cors({
 app.use(express.json({ limit: '1mb' }));
 
 const MONGO_URI = process.env.MONGO_URI;
-mongoose.connect(MONGO_URI)
+mongoose.connect(MONGO_URI, {
+  maxPoolSize: 15,
+  serverSelectionTimeoutMS: 5000,
+  socketTimeoutMS: 20000,
+})
   .then(async () => {
     console.log("✅ DB Connected");
 
@@ -203,26 +207,6 @@ mongoose.connect(MONGO_URI)
       console.log("✅ Order indexes in sync ({ shopId: 1, createdAt: -1 })");
     } catch (e) {
       console.error("⚠️ Order.syncIndexes failed:", e.message);
-    }
-    // 🔧 Self-heal THE FAMILY MART (6aaf78a07234b919c3bd5665) if its inventory still references purged MasterProduct IDs
-    try {
-      const fmId = '6aaf78a07234b919c3bd5665';
-      const fmShop = await mongoose.model("Shop").findById(fmId).select('inventory').populate({ path: 'inventory.product', select: '_id' }).lean();
-      if (fmShop && Array.isArray(fmShop.inventory) && fmShop.inventory.length > 0) {
-        const validCount = fmShop.inventory.filter(i => i && i.product && i.product._id).length;
-        if (validCount === 0) {
-          const relinkPath = require('path').join(__dirname, 'family_mart_relinked_inventory.json');
-          if (fs.existsSync(relinkPath)) {
-            const relinkedInv = JSON.parse(fs.readFileSync(relinkPath, 'utf8'));
-            if (Array.isArray(relinkedInv) && relinkedInv.length > 0) {
-              await mongoose.model("Shop").updateOne({ _id: fmId }, { $set: { inventory: relinkedInv } });
-              console.log(`✅ Re-linked THE FAMILY MART inventory (${relinkedInv.length} products restored)`);
-            }
-          }
-        }
-      }
-    } catch (e) {
-      console.error("⚠️ Family Mart inventory relink check failed:", e.message);
     }
   })
   .catch(err => console.log(err));
@@ -294,6 +278,7 @@ const shopSchema = new mongoose.Schema({
   }]
 });
 shopSchema.index({ pincode: 1 });
+shopSchema.index({ serviceablePincodes: 1 });
 shopSchema.index({ "sessionTokens.token": 1 });
 // 2dsphere index on the GeoJSON `location` so geo queries are fast. Shops set
 // this once via "Use my current location" in the dashboard; without it they
@@ -336,6 +321,7 @@ const masterProductSchema = new mongoose.Schema({
   relatedProducts: [{ type: mongoose.Schema.Types.ObjectId, ref: 'MasterProduct' }],
   substitutes: [{ type: mongoose.Schema.Types.ObjectId, ref: 'MasterProduct' }]
 });
+masterProductSchema.index({ name: 1 });
 masterProductSchema.index({ category: 1, name: 1 });
 masterProductSchema.index({ brand: 1 });
 masterProductSchema.index({ barcode: 1 });
@@ -411,6 +397,7 @@ const userSchema = new mongoose.Schema({
   },
 });
 userSchema.index({ "sessionTokens.token": 1 });
+userSchema.index({ "addresses.phone": 1 });
 const User = mongoose.model("User", userSchema);
 
 const orderSchema = new mongoose.Schema({
@@ -551,6 +538,7 @@ const khataTransactionSchema = new mongoose.Schema({
 });
 khataTransactionSchema.index({ khataAccountId: 1, createdAt: -1 });
 khataTransactionSchema.index({ shopId: 1, verificationStatus: 1, createdAt: -1 });
+khataTransactionSchema.index({ orderId: 1 });
 const KhataTransaction = mongoose.model("KhataTransaction", khataTransactionSchema);
 
 // 💬 In-App WhatsApp-Style "Shop Chat & Quick Replacement" Message Schema
@@ -813,7 +801,7 @@ const requireShop = async (req, res, next) => {
     // sessionTokens has select:false in the schema — must opt in explicitly.
     // ⚡ PERFORMANCE: Exclude heavy inventory & combos arrays so auth validation
     // doesn't load and deserialize megabytes of BSON on every single API call!
-    const shop = await Shop.findOne({ "sessionTokens.token": token }).select('-inventory -combos +sessionTokens');
+    const shop = await Shop.findOne({ "sessionTokens.token": token }).select('-inventory -combos +sessionTokens').lean();
     if (!shop) return res.status(401).json({ error: "Invalid or expired session" });
     req.shop = shop;
     next();
@@ -824,7 +812,7 @@ const requireUser = async (req, res, next) => {
   try {
     const token = extractBearer(req);
     if (!token) return res.status(401).json({ error: "Missing user session token" });
-    const user = await User.findOne({ "sessionTokens.token": token }).select('+sessionTokens');
+    const user = await User.findOne({ "sessionTokens.token": token }).select('+sessionTokens').lean();
     if (!user) return res.status(401).json({ error: "Invalid or expired session" });
     req.user = user;
     next();
@@ -1059,19 +1047,30 @@ const shopSSEClients = new Map();
 // a comment ping every 20 seconds. Without this, idle connections are silently
 // dropped by the proxy after 30-60s and the shop stops getting live orders.
 setInterval(() => {
-  shopSSEClients.forEach(clients => {
+  shopSSEClients.forEach((clients, shopId) => {
     for (const res of clients) {
-      res.write(': heartbeat\n\n');
+      try {
+        res.write(': heartbeat\n\n');
+      } catch {
+        clients.delete(res);
+      }
     }
+    if (clients.size === 0) shopSSEClients.delete(shopId);
   });
 }, 20000);
 
 const notifyShopSSE = (shopId, event) => {
-  const clients = shopSSEClients.get(String(shopId));
+  const sid = String(shopId);
+  const clients = shopSSEClients.get(sid);
   if (clients) {
     for (const res of clients) {
-      res.write(`event: ${event}\ndata: {}\n\n`);
+      try {
+        res.write(`event: ${event}\ndata: {}\n\n`);
+      } catch {
+        clients.delete(res);
+      }
     }
+    if (clients.size === 0) shopSSEClients.delete(sid);
   }
 };
 systemEvents.on('notify_shop', notifyShopSSE);
@@ -1080,7 +1079,7 @@ app.get("/shop-events/:shopId", async (req, res) => {
   try {
     const token = req.query.token;
     if (!token) return res.status(401).json({ error: "Missing token" });
-    const shop = await Shop.findOne({ "sessionTokens.token": token }).select('-inventory -combos +sessionTokens');
+    const shop = await Shop.findOne({ "sessionTokens.token": token }).select('_id').lean();
     if (!shop || shop._id.toString() !== req.params.shopId) {
       return res.status(403).json({ error: "Invalid session or not your shop" });
     }
@@ -1095,13 +1094,15 @@ app.get("/shop-events/:shopId", async (req, res) => {
     if (!shopSSEClients.has(shopId)) shopSSEClients.set(shopId, new Set());
     shopSSEClients.get(shopId).add(res);
 
-    req.on("close", () => {
+    const cleanup = () => {
       const clients = shopSSEClients.get(shopId);
       if (clients) {
         clients.delete(res);
         if (clients.size === 0) shopSSEClients.delete(shopId);
       }
-    });
+    };
+    req.on("close", cleanup);
+    res.on("error", cleanup);
   } catch (err) {
     res.status(500).end();
   }
@@ -1113,19 +1114,30 @@ app.get("/shop-events/:shopId", async (req, res) => {
 const userSSEClients = new Map();
 
 setInterval(() => {
-  userSSEClients.forEach(clients => {
+  userSSEClients.forEach((clients, userId) => {
     for (const res of clients) {
-      res.write(': heartbeat\n\n');
+      try {
+        res.write(': heartbeat\n\n');
+      } catch {
+        clients.delete(res);
+      }
     }
+    if (clients.size === 0) userSSEClients.delete(userId);
   });
 }, 20000);
 
 const notifyUserSSE = (userId, event) => {
-  const clients = userSSEClients.get(String(userId));
+  const uid = String(userId);
+  const clients = userSSEClients.get(uid);
   if (clients) {
     for (const res of clients) {
-      res.write(`event: ${event}\ndata: {}\n\n`);
+      try {
+        res.write(`event: ${event}\ndata: {}\n\n`);
+      } catch {
+        clients.delete(res);
+      }
     }
+    if (clients.size === 0) userSSEClients.delete(uid);
   }
 };
 systemEvents.on('notify_user', notifyUserSSE);
@@ -1134,7 +1146,7 @@ app.get("/user-events/:userId", async (req, res) => {
   try {
     const token = req.query.token;
     if (!token) return res.status(401).json({ error: "Missing token" });
-    const user = await User.findOne({ "sessionTokens.token": token }).select('+sessionTokens');
+    const user = await User.findOne({ "sessionTokens.token": token }).select('_id').lean();
     if (!user || user._id.toString() !== req.params.userId) {
       return res.status(403).json({ error: "Invalid session or not your account" });
     }
@@ -1149,13 +1161,15 @@ app.get("/user-events/:userId", async (req, res) => {
     if (!userSSEClients.has(userId)) userSSEClients.set(userId, new Set());
     userSSEClients.get(userId).add(res);
 
-    req.on("close", () => {
+    const cleanup = () => {
       const clients = userSSEClients.get(userId);
       if (clients) {
         clients.delete(res);
         if (clients.size === 0) userSSEClients.delete(userId);
       }
-    });
+    };
+    req.on("close", cleanup);
+    res.on("error", cleanup);
   } catch (err) {
     res.status(500).end();
   }
@@ -1692,7 +1706,7 @@ app.get("/parchis/:shopId", requireShop, async (req, res) => {
     if (req.shop._id.toString() !== req.params.shopId) {
       return res.status(403).json({ error: "Not your shop" });
     }
-    res.json(await Parchi.find({ shopId: req.params.shopId, status: 'pending' }).sort({ createdAt: -1 }));
+    res.json(await Parchi.find({ shopId: req.params.shopId, status: 'pending' }).sort({ createdAt: -1 }).limit(50).lean());
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 app.get("/parchis/user/:userId", requireUser, async (req, res) => {
@@ -2118,8 +2132,8 @@ const computeTrustedTotal = async (shopId, items, coinsUsed) => {
         ).lean(),
         neededPids.size > 0
           ? MasterProduct.find({ _id: { $in: Array.from(neededPids) } })
-              .select('name image qnty brand emoji mrp')
-              .lean()
+            .select('name image qnty brand emoji mrp')
+            .lean()
           : []
       ]);
       if (!shopDoc) throw new Error("Shop not found");
@@ -4446,7 +4460,7 @@ app.get("/shops/all/:pincode", async (req, res) => {
     const pin = String(req.params.pincode || '').trim();
     const shops = await Shop.find(
       { $or: [{ pincode: pin }, { serviceablePincodes: pin }] },
-      'name shopImage operatingHours fullAddress phone pincode serviceablePincodes isOpen acceptsPreOrders isAcceptingOrders rating totalReviews totalOrdersFulfilled location'
+      'name shopImage operatingHours fullAddress pincode serviceablePincodes isOpen acceptsPreOrders isAcceptingOrders rating totalReviews totalOrdersFulfilled location'
     ).lean();
 
     // Optional ?lat=&lng= from the customer. When present we attach a
@@ -4529,8 +4543,25 @@ const getPopulatedInventory = (shopId) => {
 
 app.get("/shops/:id/menu", async (req, res) => {
   try {
-    res.set("Cache-Control", "public, max-age=60, stale-while-revalidate=120");
     const sid = String(req.params.id || '');
+    if (!sid) return res.status(400).json({ error: "Invalid shop id" });
+
+    // 🔐 If authenticated as that exact shop owner, return full document (minus password & sessionTokens)
+    const token = extractBearer(req) || (typeof req.query.token === 'string' ? req.query.token : '');
+    if (token) {
+      const isOwner = await Shop.findOne({ _id: sid, "sessionTokens.token": token }).select('_id').lean();
+      if (isOwner) {
+        res.set("Cache-Control", "private, no-cache");
+        const fullShop = await Shop.findById(sid)
+          .select('-password -sessionTokens')
+          .populate('inventory.product', 'name brand category subCategory mrp qnty emoji image isVeg itemGroupId barcode')
+          .populate('combos.productIds', 'name mrp image qnty')
+          .lean();
+        return res.json(fullShop);
+      }
+    }
+
+    res.set("Cache-Control", "public, max-age=60, stale-while-revalidate=120");
     const cached = shopFullMenuCache.get(sid);
     if (cached && cached.data && Date.now() < cached.expiresAt) {
       return res.json(cached.data);
@@ -4539,7 +4570,10 @@ app.get("/shops/:id/menu", async (req, res) => {
       return res.json(await cached.inFlight);
     }
 
+    const PUBLIC_MENU_PROJECTION = 'name shopImage pincode serviceablePincodes fullAddress operatingHours isOpen acceptsPreOrders isAcceptingOrders rating totalReviews totalOrdersFulfilled location deliveryEta inventory combos';
+
     const promise = Shop.findById(sid)
+      .select(PUBLIC_MENU_PROJECTION)
       .populate('inventory.product', 'name brand category subCategory mrp qnty emoji image isVeg itemGroupId barcode')
       .populate('combos.productIds', 'name mrp image qnty')
       .lean()
