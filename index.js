@@ -4909,6 +4909,148 @@ app.post("/shops/:shopId/barcode-link", requireShop, async (req, res) => {
   }
 });
 
+// ⚖️ Add Variant / Pack Size to an existing MasterProduct
+// Allows any authenticated shop to add a different weight/pack size (e.g. 35g for ₹10)
+// by reusing the master product's photos, category, brand, description, and itemGroupId.
+app.post("/shops/:shopId/add-variant", requireShop, async (req, res) => {
+  try {
+    if (req.shop._id.toString() !== req.params.shopId) {
+      return res.status(403).json({ error: "Cannot edit another shop's inventory" });
+    }
+
+    const { baseProductId, qnty, mrp, sellingPrice, name, barcode } = req.body || {};
+
+    if (!baseProductId || !mongoose.isValidObjectId(baseProductId)) {
+      return res.status(400).json({ error: "Valid baseProductId is required." });
+    }
+    const cleanQnty = String(qnty || "").trim();
+    if (!cleanQnty) {
+      return res.status(400).json({ error: "Pack size / quantity is required (e.g. 35g, 500ml)." });
+    }
+    const priceVal = Number(sellingPrice);
+    if (!Number.isFinite(priceVal) || priceVal <= 0) {
+      return res.status(400).json({ error: "Valid sellingPrice is required." });
+    }
+    const mrpVal = (mrp !== undefined && Number.isFinite(Number(mrp)) && Number(mrp) > 0) ? Number(mrp) : priceVal;
+
+    const baseProduct = await MasterProduct.findById(baseProductId);
+    if (!baseProduct) {
+      return res.status(404).json({ error: "Base master product not found." });
+    }
+
+    // Ensure itemGroupId exists so both original and new variant are grouped together in customer app
+    let groupId = baseProduct.itemGroupId ? String(baseProduct.itemGroupId).trim() : "";
+    if (!groupId) {
+      const rawBrand = (!baseProduct.brand || String(baseProduct.brand).toLowerCase() === 'nan') ? '' : String(baseProduct.brand).toLowerCase().trim();
+      let baseClean = String(baseProduct.name || '').toLowerCase()
+        .replace(/\b\d+(\.\d+)?\s*(ml|l|ltr|litres?|liter|g|gm|gms|kg|kgs|pcs?|pieces?|pack|units?)\b/gi, '')
+        .replace(/[([{\-].*?[)\]}]/g, '')
+        .replace(/\b(pouch|tetra\s*pack|tetrapak|bottle|pet\s*bottle|carton|box|jar|can|tin|poly\s*pack)\b/gi, '')
+        .trim().replace(/[^a-z0-9]/g, '_').replace(/_+/g, '_').slice(0, 30);
+      groupId = 'GRP_' + (rawBrand ? (rawBrand.replace(/[^a-z0-9]/g, '_') + '_') : '') + (baseClean || baseProduct._id.toString().slice(-6)).toUpperCase();
+
+      baseProduct.itemGroupId = groupId;
+      await baseProduct.save();
+    }
+
+    // Check if variant with this itemGroupId and qnty already exists in MasterProduct
+    let variantProduct = await MasterProduct.findOne({
+      itemGroupId: groupId,
+      qnty: { $regex: new RegExp(`^${escapeRegex(cleanQnty)}$`, 'i') }
+    });
+
+    if (!variantProduct) {
+      // Determine variant name
+      let variantName = name ? String(name).trim() : "";
+      if (!variantName) {
+        if (baseProduct.qnty && baseProduct.name.toLowerCase().includes(baseProduct.qnty.toLowerCase())) {
+          variantName = baseProduct.name.replace(new RegExp(escapeRegex(baseProduct.qnty), 'i'), cleanQnty);
+        } else {
+          variantName = `${baseProduct.name} ${cleanQnty}`;
+        }
+      }
+
+      variantProduct = new MasterProduct({
+        name: variantName,
+        brand: baseProduct.brand,
+        category: baseProduct.category,
+        subCategory: baseProduct.subCategory,
+        section: baseProduct.section,
+        image: baseProduct.image,
+        emoji: baseProduct.emoji,
+        description: baseProduct.description,
+        ingredients: baseProduct.ingredients,
+        manufacturer: baseProduct.manufacturer,
+        manufactureraddress: baseProduct.manufactureraddress,
+        isVeg: baseProduct.isVeg,
+        energy: baseProduct.energy,
+        protein: baseProduct.protein,
+        carbs: baseProduct.carbs,
+        sugar: baseProduct.sugar,
+        fat: baseProduct.fat,
+        itemGroupId: groupId,
+        qnty: cleanQnty,
+        mrp: mrpVal,
+        barcode: barcode ? String(barcode).trim() : "",
+        searchTags: Array.isArray(baseProduct.searchTags) ? [...baseProduct.searchTags] : []
+      });
+      await variantProduct.save();
+      invalidateMasterCatalogCache();
+    } else {
+      if (barcode && !variantProduct.barcode) {
+        variantProduct.barcode = String(barcode).trim();
+        await variantProduct.save();
+        invalidateMasterCatalogCache();
+      }
+    }
+
+    // Upsert into shop inventory
+    const targetProdId = variantProduct._id.toString();
+    const shop = await Shop.findById(req.params.shopId);
+    const existingIndex = shop.inventory.findIndex(item => item.product && item.product.toString() === targetProdId);
+
+    if (existingIndex > -1) {
+      await Shop.updateOne(
+        { _id: req.params.shopId },
+        {
+          $set: {
+            [`inventory.${existingIndex}.sellingPrice`]: priceVal,
+            [`inventory.${existingIndex}.inStock`]: true,
+          }
+        }
+      );
+    } else {
+      await Shop.updateOne(
+        { _id: req.params.shopId },
+        {
+          $push: {
+            inventory: {
+              product: targetProdId,
+              sellingPrice: priceVal,
+              inStock: true,
+              isFeatured: false,
+              featuredRank: 999,
+            }
+          }
+        }
+      );
+    }
+
+    invalidateShopLeanMenuCache(req.params.shopId);
+    const updatedShop = await getPopulatedInventory(req.params.shopId);
+    res.json({
+      success: true,
+      shop: updatedShop,
+      product: variantProduct,
+      sellingPrice: priceVal,
+      inStock: true
+    });
+  } catch (err) {
+    console.error("add-variant error:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // ============================================================================
 // ⚡ FAST COUNTER POS BILLING + STORE KHATA LEDGER ENGINE
 // ============================================================================
