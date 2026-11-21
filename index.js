@@ -332,7 +332,7 @@ masterProductSchema.index({ name: 'text', brand: 'text', searchTags: 'text' });
 const MasterProduct = mongoose.model("MasterProduct", masterProductSchema);
 
 const SHOP_PRODUCT_POPULATE_SELECT = 'name brand category subCategory mrp qnty emoji image isVeg itemGroupId barcode';
-const SHOP_FEED_LEAN_PRODUCT_SELECT = 'name brand category mrp qnty emoji image isVeg';
+const SHOP_FEED_LEAN_PRODUCT_SELECT = 'name brand category subCategory mrp qnty emoji image isVeg itemGroupId';
 
 const shopLeanMenuCache = new Map(); // shopId -> { data, expiresAt, inFlight }
 const shopFullMenuCache = new Map(); // shopId -> { data, expiresAt, inFlight }
