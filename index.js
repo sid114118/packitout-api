@@ -717,6 +717,13 @@ const SharedBasket = mongoose.model("SharedBasket", sharedBasketSchema);
 // 🔐 AUTH VALIDATORS, RATE LIMIT, OTP HELPER
 // ==========================================
 const validatePhone = (phone) => /^[6-9]\d{9}$/.test(String(phone || "").trim());
+const cleanIndianPhone = (raw) => {
+  if (!raw) return "";
+  let digits = String(raw).replace(/\D/g, "");
+  if (digits.length === 12 && digits.startsWith("91")) digits = digits.slice(2);
+  else if (digits.length === 11 && digits.startsWith("0")) digits = digits.slice(1);
+  return digits.slice(-10);
+};
 const validatePincode = (pincode) => /^\d{6}$/.test(String(pincode || "").trim());
 const validatePassword = (password) => typeof password === 'string' && password.length >= 6;
 
@@ -4146,8 +4153,8 @@ app.post("/users/:id/phone", requireUser, async (req, res) => {
       return res.status(403).json({ error: "Cannot set phone for another user." });
     }
     const raw = String(req.body?.phone || "").trim();
-    const phone = raw.replace(/^\+?91/, '').replace(/\D/g, '');
-    if (!/^[6-9]\d{9}$/.test(phone)) {
+    const phone = cleanIndianPhone(raw);
+    if (!validatePhone(phone)) {
       return res.status(400).json({ error: "Enter a valid 10-digit Indian mobile number." });
     }
 
@@ -5056,13 +5063,7 @@ app.post("/shops/:shopId/add-variant", requireShop, async (req, res) => {
 // ============================================================================
 
 const round2 = (n) => Math.round((Number(n) || 0) * 100) / 100;
-const cleanIndianPhone = (raw) => {
-  if (!raw) return "";
-  let digits = String(raw).replace(/\D/g, "");
-  if (digits.length === 12 && digits.startsWith("91")) digits = digits.slice(2);
-  else if (digits.length === 11 && digits.startsWith("0")) digits = digits.slice(1);
-  return digits.slice(-10);
-};
+// cleanIndianPhone is hoisted to top near validatePhone
 
 const generateUniqueReferralCode = async (rawName) => {
   const base = String(rawName || "PACK").replace(/[^a-zA-Z]/g, '').substring(0, 4).toUpperCase() || "PACK";
