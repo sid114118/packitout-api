@@ -4660,6 +4660,65 @@ app.get("/shops/:id/menu/lean", async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
+// 🛒 SERVER-SIDE GROCERY SYNONYMS & STOP WORDS
+const BACKEND_GROCERY_SYNONYMS = {
+  'haldi': ['turmeric'],
+  'turmeric': ['haldi'],
+  'doodh': ['milk'],
+  'dudh': ['milk'],
+  'milk': ['doodh', 'dudh'],
+  'aata': ['atta', 'flour'],
+  'atta': ['aata', 'flour'],
+  'chawal': ['rice'],
+  'rice': ['chawal'],
+  'namak': ['salt'],
+  'salt': ['namak'],
+  'tel': ['oil'],
+  'oil': ['tel'],
+  'mirch': ['chilli', 'mirchi'],
+  'mirchi': ['chilli', 'mirch'],
+  'chilli': ['mirch', 'mirchi'],
+  'dhaniya': ['coriander'],
+  'jeera': ['cumin'],
+  'sabun': ['soap'],
+  'soap': ['sabun'],
+  'cheeni': ['sugar', 'chini'],
+  'chini': ['sugar', 'cheeni'],
+  'sugar': ['cheeni', 'chini'],
+  'anda': ['egg', 'eggs'],
+  'ande': ['egg', 'eggs'],
+  'egg': ['anda', 'ande'],
+  'eggs': ['anda', 'ande'],
+  'dahi': ['curd'],
+  'curd': ['dahi'],
+  'paneer': ['cottage cheese'],
+  'chai': ['tea'],
+  'tea': ['chai'],
+  'paani': ['water'],
+  'pani': ['water'],
+  'water': ['paani', 'pani'],
+  'biskut': ['biscuit'],
+  'biskit': ['biscuit'],
+  'biscuits': ['biscuit'],
+  'chips': ['chip'],
+  'magi': ['maggi'],
+  'noodles': ['noodle', 'maggi'],
+  'pyaz': ['onion'],
+  'aloo': ['potato'],
+  'tamatar': ['tomato'],
+  'surf': ['detergent'],
+  'detergent': ['surf', 'washing powder'],
+  'colgate': ['toothpaste'],
+  'toothpaste': ['colgate'],
+};
+
+const BACKEND_STOP_WORDS = new Set([
+  'of', 'and', 'the', 'in', 'for', 'with', 'to', 'at', 'by', 'from',
+  'pack', 'packet', 'pkt', 'pcs', 'piece', 'box', 'item',
+  'wala', 'wali', 'vale', 'wale', 'ka', 'ki', 'ke', 'ko', 'se', 'me', 'mein',
+  'rs', 'rupees', 'gram', 'gm', 'kg', 'ml', 'ltr'
+]);
+
 // 🚀 Server-side paginated search & category/brand filter for a shop's inventory (scales to 10,000+ items)
 app.get("/shops/:id/search", async (req, res) => {
   try {
@@ -4680,7 +4739,18 @@ app.get("/shops/:id/search", async (req, res) => {
       .lean();
     if (!shop) return res.status(404).json({ error: "Shop not found" });
 
-    const tokens = qRaw ? qRaw.split(/\s+/).filter(Boolean) : [];
+    const rawTokens = qRaw ? qRaw.replace(/[^a-z0-9\s]/g, ' ').split(/\s+/).filter(Boolean) : [];
+    const cleanTokens = rawTokens.filter(t => !BACKEND_STOP_WORDS.has(t));
+    const tokens = cleanTokens.length > 0 ? cleanTokens : rawTokens;
+
+    // Expand synonyms
+    const expandedTokens = new Set(tokens);
+    for (const t of tokens) {
+      if (BACKEND_GROCERY_SYNONYMS[t]) {
+        BACKEND_GROCERY_SYNONYMS[t].forEach(s => expandedTokens.add(s));
+      }
+    }
+
     const matched = [];
 
     for (const inv of (shop.inventory || [])) {
@@ -4702,8 +4772,16 @@ app.get("/shops/:id/search", async (req, res) => {
         const tagsStr = Array.isArray(p.searchTags) ? p.searchTags.join(" ").toLowerCase() : String(p.searchTags || "").toLowerCase();
         const haystack = `${nameLower} ${brandLower} ${catLower} ${subLower} ${barcodeStr} ${tagsStr}`;
 
-        const allMatched = tokens.every(tok => haystack.includes(tok));
-        if (!allMatched) continue;
+        // False positive guard: haldi should NOT match haldiram
+        if (tokens.includes('haldi') && !haystack.includes('turmeric') && !nameLower.includes('haldi') && !tagsStr.includes('haldi')) {
+          if (brandLower.includes('haldiram') || nameLower.includes('haldiram')) continue;
+        }
+
+        // Direct token match or synonym match
+        const directMatch = tokens.every(tok => haystack.includes(tok));
+        const synonymMatch = !directMatch && Array.from(expandedTokens).some(tok => haystack.includes(tok));
+
+        if (!directMatch && !synonymMatch) continue;
 
         if (barcodeStr && barcodeStr === qRaw) score += 200;
         if (nameLower === qRaw) score += 120;
@@ -4711,6 +4789,14 @@ app.get("/shops/:id/search", async (req, res) => {
         else if (nameLower.includes(qRaw)) score += 40;
         if (brandLower === qRaw || brandLower.startsWith(qRaw)) score += 30;
         if (tagsStr.includes(qRaw)) score += 20;
+
+        // Category intent boost
+        if (tokens.some(t => ['milk', 'doodh', 'curd', 'dahi', 'paneer', 'butter', 'egg', 'anda'].includes(t)) && catLower.includes('dairy')) {
+          score += 100;
+        }
+        if (tokens.some(t => ['atta', 'rice', 'dal', 'oil', 'haldi', 'turmeric', 'masala', 'salt', 'sugar'].includes(t)) && (catLower.includes('atta') || catLower.includes('dal') || catLower.includes('spices'))) {
+          score += 100;
+        }
       }
 
       if (inv.inStock !== false) score += 10;
