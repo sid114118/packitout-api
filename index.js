@@ -6776,6 +6776,12 @@ app.post("/orders/:id/khata-request", requireShop, async (req, res) => {
       return res.status(400).json({ error: "Cannot bill a cancelled order to Khata." });
     }
 
+    const statusLower = String(order.status || "").toLowerCase();
+    const isReadyOrArrived = statusLower.includes("ready") || statusLower.includes("collect") || statusLower.includes("arrived") || Boolean(order.customerArrivedAt);
+    if (!isReadyOrArrived) {
+      return res.status(400).json({ error: "Order must be marked as 'Ready to Collect' before requesting Khata billing." });
+    }
+
     if (order.paymentStatus === 'Paid' && order.paymentMethod !== 'KHATA') {
       return res.status(400).json({ error: "This order is already marked as Paid." });
     }
@@ -7895,6 +7901,47 @@ async function cancelOrderWithRefund(order, opts) {
   if (order.paymentStatus === 'Paid' && order.paymentMethod === 'UPI') {
     refundSet['refund.pending'] = true;
     refundSet['refund.attemptedAt'] = new Date();
+  }
+
+  // Khata reversal: if the order was billed to Store Khata, auto-reverse the ledger debt
+  if (order.paymentMethod === 'KHATA' && Number(order.khataAmount) > 0) {
+    try {
+      const cleanPhone = cleanIndianPhone(order.customerPhone || order.userId?.phone);
+      const shopIdObj = order.shopId?._id || order.shopId;
+      if (cleanPhone && shopIdObj) {
+        const acc = await KhataAccount.findOne({ shopId: shopIdObj, customerPhone: cleanPhone });
+        if (acc) {
+          const revAmt = round2(Number(order.khataAmount));
+          const prevBal = round2(acc.currentBalance);
+          const newBal = Math.max(0, round2(prevBal - revAmt));
+          acc.currentBalance = newBal;
+          acc.totalCreditGiven = Math.max(0, round2(acc.totalCreditGiven - revAmt));
+          acc.lastTransactionAt = new Date();
+          await acc.save();
+
+          await KhataTransaction.create({
+            khataAccountId: acc._id,
+            shopId: shopIdObj,
+            userId: acc.userId || null,
+            customerPhone: cleanPhone,
+            type: 'MANUAL_CREDIT',
+            amount: revAmt,
+            balanceBefore: prevBal,
+            balanceAfter: newBal,
+            orderId: order._id,
+            paymentMode: 'KHATA',
+            verificationStatus: 'Confirmed',
+            note: `Order #${shortId} Cancelled - Khata Reversed (-₹${revAmt})`,
+            createdBy: 'shop',
+            createdAt: new Date(),
+          });
+          notifyShopSSE(String(shopIdObj), 'refresh_khata');
+          if (acc.userId) notifyUserSSE(String(acc.userId), 'refresh_khata');
+        }
+      }
+    } catch (e) {
+      console.error('[cancel] Khata reversal failed:', e.message);
+    }
   }
 
   // statusHistory + refund flag piggyback on the local doc; status is already
