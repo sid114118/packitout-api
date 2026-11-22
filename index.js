@@ -5209,12 +5209,15 @@ const settleKhataOrdersFIFO = async (shopId, cleanPhone, userId, paymentAmount) 
   }
 };
 
+const KHATA_LAUNCH_DATE = new Date('2026-11-01T00:00:00.000Z');
+
 // Idempotently backfill pre-existing KHATA POS orders created before KhataAccount existed
 const syncLegacyKhataOrdersForShop = async (shopId) => {
   try {
     const unsynced = await Order.find({
       shopId,
       paymentMethod: "KHATA",
+      createdAt: { $gte: KHATA_LAUNCH_DATE },
       "khataSnapshot.synced": { $ne: true },
     })
       .sort({ createdAt: 1 })
@@ -5239,6 +5242,13 @@ const syncLegacyKhataOrdersForShop = async (shopId) => {
       const principal = round2(Number(order.khataAmount) > 0 ? order.khataAmount : order.totalAmount);
       const settledAmt = round2(Number(order.khataSettledAmount) || 0);
       const isAlreadyPaid = (order.paymentStatus === "Paid" && order.paymentMethod !== "KHATA" && order.khataRequest?.status !== "accepted") || (settledAmt >= principal && principal > 0);
+      
+      if (isAlreadyPaid) {
+        // Was already marked paid historically — mark synced and do NOT add to Khata credit
+        await Order.updateOne({ _id: order._id }, { $set: { "khataSnapshot.synced": true } });
+        continue;
+      }
+
       if (order.paymentMethod === "KHATA" && order.paymentStatus === "Paid" && settledAmt < principal) {
         order.paymentStatus = settledAmt > 0 ? "PartiallyPaid" : "Unpaid";
         order.khataSettledAmount = settledAmt;
@@ -5263,34 +5273,27 @@ const syncLegacyKhataOrdersForShop = async (shopId) => {
 
       const prevDue = round2(acc.currentBalance);
       const isFirst = Number(acc.totalCreditGiven || 0) === 0;
-      const addedDue = isAlreadyPaid ? 0 : principal;
-      const newDue = round2(prevDue + addedDue);
+      const newDue = round2(prevDue + principal);
 
       if (!alreadyTx && principal > 0) {
-        if (!isAlreadyPaid) {
-          await KhataTransaction.create({
-            khataAccountId: acc._id,
-            shopId,
-            userId: acc.userId || order.userId?._id || null,
-            customerPhone: phone,
-            type: "CREDIT_BILL",
-            amount: principal,
-            balanceBefore: prevDue,
-            balanceAfter: newDue,
-            orderId: order._id,
-            paymentMode: "KHATA",
-            verificationStatus: "Confirmed",
-            note: `Counter Bill #${shortId}`,
-            createdBy: "shop",
-            createdAt: order.createdAt || new Date(),
-          });
-          acc.currentBalance = newDue;
-          acc.totalCreditGiven = round2(acc.totalCreditGiven + principal);
-        } else {
-          // Was already marked paid historically — keep settled history accurate
-          acc.totalCreditGiven = round2(acc.totalCreditGiven + principal);
-          acc.totalSettled = round2(acc.totalSettled + principal);
-        }
+        await KhataTransaction.create({
+          khataAccountId: acc._id,
+          shopId,
+          userId: acc.userId || order.userId?._id || null,
+          customerPhone: phone,
+          type: "CREDIT_BILL",
+          amount: principal,
+          balanceBefore: prevDue,
+          balanceAfter: newDue,
+          orderId: order._id,
+          paymentMode: "KHATA",
+          verificationStatus: "Confirmed",
+          note: `Counter Bill #${shortId}`,
+          createdBy: "shop",
+          createdAt: order.createdAt || new Date(),
+        });
+        acc.currentBalance = newDue;
+        acc.totalCreditGiven = round2(acc.totalCreditGiven + principal);
         if (!acc.userId && order.userId?._id) acc.userId = order.userId._id;
         if (custName && (!acc.customerName || acc.customerName === "Customer" || acc.customerName === "Valued Customer")) {
           acc.customerName = custName;
@@ -5300,7 +5303,7 @@ const syncLegacyKhataOrdersForShop = async (shopId) => {
       }
 
       order.khataAmount = principal;
-      order.khataSettledAmount = isAlreadyPaid ? principal : 0;
+      order.khataSettledAmount = 0;
       order.khataSnapshot = {
         synced: true,
         isFirstKhata: isFirst,
@@ -5819,6 +5822,75 @@ app.get("/public/bill/:orderId", async (req, res) => {
 // 📒 STORE KHATA BOOK (UDHAAR / CREDIT LEDGER) ROUTES — SHOPKEEPER + CUSTOMER
 // ============================================================================
 
+// 📒 Self-healing ledger reconciler:
+// 1. Cleans up bogus historical transactions created from pre-November test orders
+// 2. Fixes double-counted settlements
+// 3. Enforces mathematically continuous running balance on transactions and syncs KhataAccount
+const reconcileKhataAccountLedger = async (accountDoc, shopId) => {
+  if (!accountDoc) return null;
+  const aid = accountDoc._id;
+  const targetShopId = shopId || accountDoc.shopId?._id || accountDoc.shopId;
+
+  // 1. Delete any transactions created from pre-November orders or with balanceBefore=0 and balanceAfter=0
+  await KhataTransaction.deleteMany({
+    khataAccountId: aid,
+    $or: [
+      { createdAt: { $lt: KHATA_LAUNCH_DATE } },
+      { type: "CREDIT_BILL", balanceBefore: 0, balanceAfter: 0 }
+    ]
+  });
+
+  // 2. Fetch legitimate transactions chronologically
+  const txs = await KhataTransaction.find({ khataAccountId: aid })
+    .sort({ createdAt: 1 })
+    .lean();
+
+  let runningBal = 0;
+  let totalCredit = 0;
+  let totalSettled = 0;
+
+  for (const t of txs) {
+    if (t.verificationStatus === 'Rejected') continue;
+    const isCredit = t.type === 'CREDIT_BILL' || t.type === 'MANUAL_CREDIT';
+    const amt = round2(Number(t.amount) || 0);
+    const bBefore = runningBal;
+    if (isCredit) {
+      totalCredit = round2(totalCredit + amt);
+      runningBal = round2(runningBal + amt);
+    } else {
+      totalSettled = round2(totalSettled + amt);
+      runningBal = Math.max(0, round2(runningBal - amt));
+    }
+
+    if (round2(t.balanceBefore) !== bBefore || round2(t.balanceAfter) !== runningBal) {
+      await KhataTransaction.updateOne(
+        { _id: t._id },
+        { $set: { balanceBefore: bBefore, balanceAfter: runningBal } }
+      );
+      t.balanceBefore = bBefore;
+      t.balanceAfter = runningBal;
+    }
+  }
+
+  // 3. Reconcile KhataAccount totals
+  accountDoc.currentBalance = runningBal;
+  accountDoc.totalCreditGiven = totalCredit;
+  accountDoc.totalSettled = totalSettled;
+
+  await KhataAccount.updateOne(
+    { _id: aid },
+    {
+      $set: {
+        currentBalance: runningBal,
+        totalCreditGiven: totalCredit,
+        totalSettled: totalSettled,
+      }
+    }
+  );
+
+  return accountDoc;
+};
+
 // Shopkeeper: List all Khata accounts, summary KPIs & pending UPI verifications
 app.get("/shops/:shopId/khata", requireShop, async (req, res) => {
   try {
@@ -5950,6 +6022,8 @@ app.get("/shops/:shopId/khata/:accountId", requireShop, async (req, res) => {
     }).populate("userId", "name phone coins").lean();
 
     if (!account) return res.status(404).json({ error: "Khata account not found" });
+
+    await reconcileKhataAccountLedger(account, req.params.shopId);
 
     const transactions = await KhataTransaction.find({
       khataAccountId: account._id,
@@ -6384,7 +6458,7 @@ app.get("/users/:userId/khata", requireUser, async (req, res) => {
       );
     }
 
-    // ⚡ SELF-HEALING RECONCILER: Find ALL Orders representing Khata dues for this user
+    // ⚡ SELF-HEALING RECONCILER: Find legitimate Khata orders created on or after launch date
     const khataOrderFilter = {
       $and: [
         {
@@ -6393,6 +6467,7 @@ app.get("/users/:userId/khata", requireUser, async (req, res) => {
             { khataAmount: { $gt: 0 } },
           ],
         },
+        { createdAt: { $gte: KHATA_LAUNCH_DATE } },
         {
           $or: [
             { userId: req.user._id },
@@ -6450,20 +6525,11 @@ app.get("/users/:userId/khata", requireUser, async (req, res) => {
           if (updated) await acc.save();
         }
 
-        // Reconcile transactions and current balance from live orders
-        let runningDue = 0;
-        let runningCredit = 0;
-        let runningSettled = 0;
-
+        // Ensure each legitimate order has a corresponding CREDIT_BILL transaction
         for (const ord of orders) {
           const shortId = String(ord._id).slice(-5).toUpperCase();
           const principal = round2(Number(ord.khataAmount) > 0 ? ord.khataAmount : ord.totalAmount);
           const settledSoFar = round2(Number(ord.khataSettledAmount) || 0);
-          const dueForOrder = Math.max(0, round2(principal - settledSoFar));
-
-          runningCredit = round2(runningCredit + principal);
-          runningSettled = round2(runningSettled + settledSoFar);
-          runningDue = round2(runningDue + dueForOrder);
 
           // Heal any Khata order that was mistakenly marked 'Paid' while its settled amount is 0
           if (ord.paymentMethod === "KHATA" && ord.paymentStatus === "Paid" && settledSoFar < principal) {
@@ -6483,7 +6549,7 @@ app.get("/users/:userId/khata", requireUser, async (req, res) => {
               type: "CREDIT_BILL",
               amount: principal,
               balanceBefore: 0,
-              balanceAfter: dueForOrder,
+              balanceAfter: principal,
               orderId: ord._id,
               paymentMode: "KHATA",
               verificationStatus: "Confirmed",
@@ -6494,22 +6560,8 @@ app.get("/users/:userId/khata", requireUser, async (req, res) => {
           }
         }
 
-        // Check if there are separate Jama payments
-        const paymentTxs = await KhataTransaction.find({
-          khataAccountId: acc._id,
-          type: { $in: ["PAYMENT_CASH", "PAYMENT_UPI"] },
-          verificationStatus: "Confirmed",
-        }).lean();
-        const totalPaidTxs = paymentTxs.reduce((s, t) => s + (Number(t.amount) || 0), 0);
-
-        const computedBalance = Math.max(0, round2(runningDue - totalPaidTxs));
-        if (round2(acc.currentBalance) !== computedBalance || round2(acc.totalCreditGiven) !== runningCredit) {
-          acc.currentBalance = computedBalance;
-          acc.totalCreditGiven = runningCredit;
-          acc.totalSettled = round2(runningSettled + totalPaidTxs);
-          acc.lastTransactionAt = orders[orders.length - 1].createdAt || new Date();
-          await acc.save();
-        }
+        // Reconcile mathematical running balance & totals cleanly
+        await reconcileKhataAccountLedger(acc, sid);
       }
     }
 
@@ -6634,6 +6686,8 @@ app.get("/users/:userId/khata/:accountId", requireUser, async (req, res) => {
       await KhataAccount.updateOne({ _id: account._id }, { $set: { userId: req.user._id } });
       await KhataTransaction.updateMany({ khataAccountId: account._id, userId: { $ne: req.user._id } }, { $set: { userId: req.user._id } });
     }
+
+    await reconcileKhataAccountLedger(account);
 
     const transactions = await KhataTransaction.find({ khataAccountId: account._id })
       .populate("orderId", "_id items totalAmount paidAmount paidVia khataAmount khataSettledAmount paymentStatus khataSnapshot orderSource createdAt customerName customerPhone")
