@@ -7386,6 +7386,121 @@ app.post("/master-products", async (req, res, next) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
+// ⚖️ Admin / Shop Add Variant to MasterProduct
+// Allows adding a different pack size/weight to an existing MasterProduct
+// Reuses category, brand, itemGroupId, description, nutrition, and optionally image
+app.post("/master-products/add-variant", async (req, res, next) => {
+  const adminToken = req.headers['x-admin-token'];
+  if (adminToken && process.env.ADMIN_TOKEN && adminToken === process.env.ADMIN_TOKEN) {
+    req.isAdmin = true;
+    return next();
+  }
+  return requireShop(req, res, next);
+}, async (req, res) => {
+  try {
+    if (!req.isAdmin && !req.shop?.canAddMasterProducts) {
+      return res.status(403).json({ error: "Permission denied to add master product variants." });
+    }
+
+    const { baseProductId, qnty, mrp, name, barcode, image } = req.body || {};
+
+    if (!baseProductId || !mongoose.isValidObjectId(baseProductId)) {
+      return res.status(400).json({ error: "Valid baseProductId is required." });
+    }
+    const cleanQnty = String(qnty || "").trim();
+    if (!cleanQnty) {
+      return res.status(400).json({ error: "Pack size / quantity is required (e.g. 500g, 1L, 250ml)." });
+    }
+    const mrpVal = Number(mrp);
+    if (!Number.isFinite(mrpVal) || mrpVal <= 0) {
+      return res.status(400).json({ error: "Valid MRP is required." });
+    }
+
+    const baseProduct = await MasterProduct.findById(baseProductId);
+    if (!baseProduct) {
+      return res.status(404).json({ error: "Base master product not found." });
+    }
+
+    // Ensure itemGroupId exists so both original and new variant are grouped together in customer app
+    let groupId = baseProduct.itemGroupId ? String(baseProduct.itemGroupId).trim() : "";
+    if (!groupId) {
+      const rawBrand = (!baseProduct.brand || String(baseProduct.brand).toLowerCase() === 'nan') ? '' : String(baseProduct.brand).toLowerCase().trim();
+      let baseClean = String(baseProduct.name || '').toLowerCase()
+        .replace(/\b\d+(\.\d+)?\s*(ml|l|ltr|litres?|liter|g|gm|gms|kg|kgs|pcs?|pieces?|pack|units?)\b/gi, '')
+        .replace(/[([{\-].*?[)\]}]/g, '')
+        .replace(/\b(pouch|tetra\s*pack|tetrapak|bottle|pet\s*bottle|carton|box|jar|can|tin|poly\s*pack)\b/gi, '')
+        .trim().replace(/[^a-z0-9]/g, '_').replace(/_+/g, '_').slice(0, 30);
+      groupId = 'GRP_' + (rawBrand ? (rawBrand.replace(/[^a-z0-9]/g, '_') + '_') : '') + (baseClean || baseProduct._id.toString().slice(-6)).toUpperCase();
+
+      baseProduct.itemGroupId = groupId;
+      await baseProduct.save();
+    }
+
+    // Check if variant with this itemGroupId and qnty already exists in MasterProduct
+    let variantProduct = await MasterProduct.findOne({
+      itemGroupId: groupId,
+      qnty: { $regex: new RegExp(`^${escapeRegex(cleanQnty)}$`, 'i') }
+    });
+
+    if (variantProduct) {
+      return res.status(409).json({
+        error: `A variant with pack size "${cleanQnty}" already exists in this group (${variantProduct.name}).`,
+        product: variantProduct
+      });
+    }
+
+    // Determine variant name
+    let variantName = name ? String(name).trim() : "";
+    if (!variantName) {
+      if (baseProduct.qnty && baseProduct.name.toLowerCase().includes(baseProduct.qnty.toLowerCase())) {
+        variantName = baseProduct.name.replace(new RegExp(escapeRegex(baseProduct.qnty), 'i'), cleanQnty);
+      } else {
+        variantName = `${baseProduct.name} ${cleanQnty}`.trim();
+      }
+    }
+
+    const finalImage = (image && String(image).trim()) ? String(image).trim() : baseProduct.image;
+
+    variantProduct = new MasterProduct({
+      name: variantName,
+      brand: baseProduct.brand,
+      category: baseProduct.category,
+      subCategory: baseProduct.subCategory,
+      section: baseProduct.section,
+      image: finalImage,
+      emoji: baseProduct.emoji,
+      description: baseProduct.description,
+      ingredients: baseProduct.ingredients,
+      manufacturer: baseProduct.manufacturer,
+      manufactureraddress: baseProduct.manufactureraddress,
+      isVeg: baseProduct.isVeg,
+      energy: baseProduct.energy,
+      protein: baseProduct.protein,
+      carbs: baseProduct.carbs,
+      sugar: baseProduct.sugar,
+      fat: baseProduct.fat,
+      itemGroupId: groupId,
+      qnty: cleanQnty,
+      mrp: mrpVal,
+      barcode: barcode ? String(barcode).trim() : "",
+      searchTags: Array.isArray(baseProduct.searchTags) ? [...baseProduct.searchTags] : [],
+      relatedProducts: Array.isArray(baseProduct.relatedProducts) ? [...baseProduct.relatedProducts] : [],
+      substitutes: Array.isArray(baseProduct.substitutes) ? [...baseProduct.substitutes] : []
+    });
+
+    await variantProduct.save();
+    invalidateMasterCatalogCache();
+
+    res.json({
+      success: true,
+      product: variantProduct
+    });
+  } catch (err) {
+    console.error("master-products/add-variant error:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 async function getMasterCatalogCached() {
   if (_masterCache.data && Date.now() - _masterCache.at < 5 * 60 * 1000) {
     return _masterCache.data;
